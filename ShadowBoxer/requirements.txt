@@ -1,0 +1,8 @@
+safetensors
+huggingface-hub
+Pillow
+pydantic
+numpy
+fastapi
+uvicorn
+python-multipart

@@ -1,0 +1,97 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InLinearBuffer {
+    vec4 lin_img[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutPlanarBuffer {
+    float out_planar[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint mode;
+} pc;
+
+float linear_to_srgb(float c) {
+    float v = max(c, 0.0);
+    if (v <= 0.0031308) {
+        return v * 12.92;
+    }
+    return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+
+    if (pc.mode == 2u) {
+        uint lat_w = pc.width / 16u;
+        uint lat_h = pc.height / 16u;
+        if (x >= lat_w || y >= lat_h) {
+            return;
+        }
+        float sum_a = 0.0;
+        float max_a = 0.0;
+        for (uint dy = 0u; dy < 16u; ++dy) {
+            uint row_base = (y * 16u + dy) * pc.width + x * 16u;
+            for (uint dx = 0u; dx < 16u; ++dx) {
+                float a = clamp(lin_img[row_base + dx].a, 0.0, 1.0);
+                sum_a += a;
+                max_a = max(max_a, a);
+            }
+        }
+        float avg = sum_a * (1.0 / 256.0);
+        if (avg > 0.01 && avg < 0.25 && max_a > 0.75) {
+            avg = 0.65 * avg + 0.35 * max_a;
+        }
+        out_planar[y * lat_w + x] = clamp(avg, 0.0, 1.0);
+        return;
+    }
+
+    if (x >= pc.width || y >= pc.height) {
+        return;
+    }
+
+    uint plane = pc.width * pc.height;
+    uint idx = y * pc.width + x;
+    vec4 lin = lin_img[idx];
+
+    float r = clamp(linear_to_srgb(lin.r), 0.0, 1.0);
+    float g = clamp(linear_to_srgb(lin.g), 0.0, 1.0);
+    float b = clamp(linear_to_srgb(lin.b), 0.0, 1.0);
+
+    if (pc.mode == 0u) {
+        out_planar[0u * plane + idx] = r * 2.0 - 1.0;
+        out_planar[1u * plane + idx] = g * 2.0 - 1.0;
+        out_planar[2u * plane + idx] = b * 2.0 - 1.0;
+    } else {
+        const vec3 mean = vec3(0.48145466, 0.4578275, 0.40821073);
+        const vec3 std_v = vec3(0.26862954, 0.26130258, 0.27577711);
+        vec3 norm_rgb = (vec3(r, g, b) - mean) / std_v;
+
+        uint grid_w = pc.width / 16u;
+        uint merge = 2u;
+        uint gh_m = (y / 16u) / merge;
+        uint m_y = (y / 16u) % merge;
+        uint py = y % 16u;
+
+        uint gw_m = (x / 16u) / merge;
+        uint m_x = (x / 16u) % merge;
+        uint px = x % 16u;
+
+        uint patch_idx = ((gh_m * (grid_w / merge) + gw_m) * merge + m_y) * merge + m_x;
+        uint spatial_offset = py * 16u + px;
+        uint patch_stride = 3u * 2u * 256u;
+        uint base_out = patch_idx * patch_stride;
+
+        out_planar[base_out + (0u * 2u + 0u) * 256u + spatial_offset] = norm_rgb.r;
+        out_planar[base_out + (0u * 2u + 1u) * 256u + spatial_offset] = norm_rgb.r;
+        out_planar[base_out + (1u * 2u + 0u) * 256u + spatial_offset] = norm_rgb.g;
+        out_planar[base_out + (1u * 2u + 1u) * 256u + spatial_offset] = norm_rgb.g;
+        out_planar[base_out + (2u * 2u + 0u) * 256u + spatial_offset] = norm_rgb.b;
+        out_planar[base_out + (2u * 2u + 1u) * 256u + spatial_offset] = norm_rgb.b;
+    }
+}

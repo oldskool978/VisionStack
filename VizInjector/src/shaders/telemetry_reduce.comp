@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InPlanarVae {
+    float vae_rgb[];
+};
+
+layout(std430, set = 0, binding = 1) buffer OutTelemetryBins {
+    uint hist_bins[256];
+    uint accum_stats[4];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+float load_luma(uint x, uint y) {
+    uint plane = pc.width * pc.height;
+    uint idx = y * pc.width + x;
+    float r = clamp(vae_rgb[0u * plane + idx] * 0.5 + 0.5, 0.0, 1.0);
+    float g = clamp(vae_rgb[1u * plane + idx] * 0.5 + 0.5, 0.0, 1.0);
+    float b = clamp(vae_rgb[2u * plane + idx] * 0.5 + 0.5, 0.0, 1.0);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) {
+        return;
+    }
+
+    float luma = load_luma(x, y);
+    uint bin = min(255u, uint(round(luma * 255.0)));
+    atomicAdd(hist_bins[bin], 1u);
+
+    uint luma_q = uint(round(luma * 1024.0));
+    uint luma_sq_q = uint(round(luma * luma * 1024.0));
+    atomicAdd(accum_stats[0], luma_q);
+    atomicAdd(accum_stats[1], luma_sq_q);
+
+    if (x >= 1u && x + 1u < pc.width && y >= 1u && y + 1u < pc.height) {
+        float lap = load_luma(x, y - 1u)
+                  + load_luma(x, y + 1u)
+                  + load_luma(x - 1u, y)
+                  + load_luma(x + 1u, y)
+                  - 4.0 * luma;
+        uint lap_sq_q = uint(round(lap * lap * 65536.0));
+        atomicAdd(accum_stats[2], lap_sq_q);
+        atomicAdd(accum_stats[3], 1u);
+    }
+}

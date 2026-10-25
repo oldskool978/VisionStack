@@ -1,0 +1,100 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InRawBuffer {
+    uint raw_rgba[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutLinearBuffer {
+    vec4 linear_rgba[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint deband_8bit;
+    uint seed;
+} pc;
+
+float srgb_to_linear(float c) {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+vec4 unpack_rgba8(uint packed_px) {
+    return vec4(
+        float((packed_px >> 0u) & 0xFFu) / 255.0,
+        float((packed_px >> 8u) & 0xFFu) / 255.0,
+        float((packed_px >> 16u) & 0xFFu) / 255.0,
+        float((packed_px >> 24u) & 0xFFu) / 255.0
+    );
+}
+
+float hash_tpdf(uvec2 p, uint ch, uint seed) {
+    uint n = p.x * 0x1F123BB5u + p.y * 0x05491333u + ch * 0x9E3779B9u + seed;
+    n = (n ^ 61u) ^ (n >> 16u);
+    n *= 9u;
+    n = n ^ (n >> 4u);
+    n *= 0x27D4EB2Du;
+    n = n ^ (n >> 15u);
+    uint n2 = n * 0x85EBCA6Bu + 0xC2B2AE35u;
+    n2 ^= (n2 >> 13u);
+    float u1 = float(n & 0xFFFFu) / 65535.0;
+    float u2 = float(n2 & 0xFFFFu) / 65535.0;
+    return (u1 - u2) * (0.5 / 255.0);
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) {
+        return;
+    }
+
+    uint idx = y * pc.width + x;
+    vec4 px = unpack_rgba8(raw_rgba[idx]);
+
+    if (px.a <= (1.0 / 255.0)) {
+        vec3 acc_rgb = vec3(0.0);
+        float acc_w = 0.0;
+        for (int dy = -2; dy <= 2; ++dy) {
+            int ny = clamp(int(y) + dy, 0, int(pc.height) - 1);
+            for (int dx = -2; dx <= 2; ++dx) {
+                int nx = clamp(int(x) + dx, 0, int(pc.width) - 1);
+                vec4 np = unpack_rgba8(raw_rgba[uint(ny) * pc.width + uint(nx)]);
+                if (np.a > (1.0 / 255.0)) {
+                    float w = np.a / float(max(1, abs(dx) + abs(dy)));
+                    acc_rgb += np.rgb * w;
+                    acc_w += w;
+                }
+            }
+        }
+        if (acc_w > 0.0) {
+            px.rgb = acc_rgb / acc_w;
+        }
+    }
+
+    if (pc.deband_8bit != 0u && px.a > (1.0 / 255.0)) {
+        uint rx = min(x + 1u, pc.width - 1u);
+        uint by = min(y + 1u, pc.height - 1u);
+        vec4 px_r = unpack_rgba8(raw_rgba[y * pc.width + rx]);
+        vec4 px_b = unpack_rgba8(raw_rgba[by * pc.width + x]);
+        float grad = max(length(px.rgb - px_r.rgb), length(px.rgb - px_b.rgb));
+        float gate = clamp(1.0 - (grad * 16.0), 0.0, 1.0);
+        if (gate > 0.0) {
+            px.r = clamp(px.r + hash_tpdf(uvec2(x, y), 0u, pc.seed) * gate, 0.0, 1.0);
+            px.g = clamp(px.g + hash_tpdf(uvec2(x, y), 1u, pc.seed) * gate, 0.0, 1.0);
+            px.b = clamp(px.b + hash_tpdf(uvec2(x, y), 2u, pc.seed) * gate, 0.0, 1.0);
+        }
+    }
+
+    vec3 lin = vec3(
+        srgb_to_linear(px.r),
+        srgb_to_linear(px.g),
+        srgb_to_linear(px.b)
+    );
+    linear_rgba[idx] = vec4(lin, px.a);
+}

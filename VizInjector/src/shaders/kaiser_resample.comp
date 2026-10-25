@@ -1,0 +1,137 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InBuffer {
+    vec4 src_img[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutBuffer {
+    vec4 dst_img[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer StartIdxBuffer {
+    int start_idx[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer WeightsBuffer {
+    float weights[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer SrcCenterBuffer {
+    float src_center[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint in_w;
+    uint in_h;
+    uint out_w;
+    uint out_h;
+    uint max_taps;
+    uint pass_dir;
+    uint is_identity;
+    float soft_knee_tau;
+    uint idx_offset;
+    uint weight_offset;
+} pc;
+
+float soft_knee_bound_1d(float v, float lo, float hi, float tau) {
+    float span = hi - lo;
+    float eff_tau = tau * span;
+    if (v > hi) {
+        if (eff_tau <= 1e-7) return hi;
+        float z = (v - hi) / eff_tau;
+        float t = (z >= 3.0) ? 1.0 : (z * (27.0 + z * z) / (27.0 + 9.0 * z * z));
+        return hi + eff_tau * t;
+    }
+    if (v < lo) {
+        if (eff_tau <= 1e-7) return lo;
+        float z = (lo - v) / eff_tau;
+        float t = (z >= 3.0) ? 1.0 : (z * (27.0 + z * z) / (27.0 + 9.0 * z * z));
+        return lo - eff_tau * t;
+    }
+    return v;
+}
+
+void main() {
+    uint dx = gl_GlobalInvocationID.x;
+    uint dy = gl_GlobalInvocationID.y;
+    if (dx >= pc.out_w || dy >= pc.out_h) {
+        return;
+    }
+
+    if (pc.is_identity != 0u) {
+        dst_img[dy * pc.out_w + dx] = src_img[dy * pc.in_w + dx];
+        return;
+    }
+
+    if (pc.pass_dir == 0u) {
+        float sc = src_center[pc.idx_offset + dx];
+        if (sc < -0.5) {
+            dst_img[dy * pc.out_w + dx] = vec4(0.0);
+            return;
+        }
+        int s0 = start_idx[pc.idx_offset + dx];
+        uint w_base = pc.weight_offset + dx * pc.max_taps;
+        uint row_off = dy * pc.in_w;
+
+        vec3 acc_rgb = vec3(0.0);
+        float acc_a = 0.0;
+        vec3 raw_rgb = vec3(0.0);
+
+        for (uint k = 0u; k < pc.max_taps; ++k) {
+            int sx = clamp(s0 + int(k), 0, int(pc.in_w) - 1);
+            vec4 p = src_img[row_off + uint(sx)];
+            float wk = weights[w_base + k];
+            float wa = wk * p.a;
+            acc_rgb += p.rgb * wa;
+            acc_a += wa;
+            raw_rgb += p.rgb * wk;
+        }
+
+        vec3 rgb = (acc_a > 1e-5) ? (acc_rgb / acc_a) : raw_rgb;
+        int n0 = clamp(int(floor(sc)), 0, int(pc.in_w) - 1);
+        int n1 = clamp(n0 + 1, 0, int(pc.in_w) - 1);
+        vec3 p0 = src_img[row_off + uint(n0)].rgb;
+        vec3 p1 = src_img[row_off + uint(n1)].rgb;
+
+        rgb.r = soft_knee_bound_1d(rgb.r, min(p0.r, p1.r), max(p0.r, p1.r), pc.soft_knee_tau);
+        rgb.g = soft_knee_bound_1d(rgb.g, min(p0.g, p1.g), max(p0.g, p1.g), pc.soft_knee_tau);
+        rgb.b = soft_knee_bound_1d(rgb.b, min(p0.b, p1.b), max(p0.b, p1.b), pc.soft_knee_tau);
+
+        dst_img[dy * pc.out_w + dx] = clamp(vec4(rgb, acc_a), 0.0, 1.0);
+    } else {
+        float sc = src_center[pc.idx_offset + dy];
+        if (sc < -0.5) {
+            dst_img[dy * pc.out_w + dx] = vec4(0.0);
+            return;
+        }
+        int s0 = start_idx[pc.idx_offset + dy];
+        uint w_base = pc.weight_offset + dy * pc.max_taps;
+
+        vec3 acc_rgb = vec3(0.0);
+        float acc_a = 0.0;
+        vec3 raw_rgb = vec3(0.0);
+
+        for (uint k = 0u; k < pc.max_taps; ++k) {
+            int sy = clamp(s0 + int(k), 0, int(pc.in_h) - 1);
+            vec4 p = src_img[uint(sy) * pc.in_w + dx];
+            float wk = weights[w_base + k];
+            float wa = wk * p.a;
+            acc_rgb += p.rgb * wa;
+            acc_a += wa;
+            raw_rgb += p.rgb * wk;
+        }
+
+        vec3 rgb = (acc_a > 1e-5) ? (acc_rgb / acc_a) : raw_rgb;
+        int n0 = clamp(int(floor(sc)), 0, int(pc.in_h) - 1);
+        int n1 = clamp(n0 + 1, 0, int(pc.in_h) - 1);
+        vec3 p0 = src_img[uint(n0) * pc.in_w + dx].rgb;
+        vec3 p1 = src_img[uint(n1) * pc.in_w + dx].rgb;
+
+        rgb.r = soft_knee_bound_1d(rgb.r, min(p0.r, p1.r), max(p0.r, p1.r), pc.soft_knee_tau);
+        rgb.g = soft_knee_bound_1d(rgb.g, min(p0.g, p1.g), max(p0.g, p1.g), pc.soft_knee_tau);
+        rgb.b = soft_knee_bound_1d(rgb.b, min(p0.b, p1.b), max(p0.b, p1.b), pc.soft_knee_tau);
+
+        dst_img[dy * pc.out_w + dx] = clamp(vec4(rgb, acc_a), 0.0, 1.0);
+    }
+}

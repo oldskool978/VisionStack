@@ -1,0 +1,2553 @@
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass
+import gc
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import random
+import shutil
+import struct
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+import warnings
+
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+sys.modules["torchvision"] = None
+sys.modules["torchvision.transforms"] = None
+sys.modules["torchvision.io"] = None
+
+
+def _resolve_cache_dir() -> Path:
+    env_hf = os.environ.get("HF_HOME")
+    if env_hf and env_hf.strip():
+        return Path(env_hf).resolve()
+    parent_cache = (ROOT_DIR.parent / ".hf_cache").resolve()
+    if parent_cache.exists():
+        return parent_cache
+    return (ROOT_DIR / ".hf_cache").resolve()
+
+
+os.environ.pop("TORCH_BLAS_PREFER_HIPBLASLT", None)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+CACHE_DIR = _resolve_cache_dir()
+MIOPEN_CACHE_DIR = CACHE_DIR / "miopen"
+MIOPEN_DB_DIR = MIOPEN_CACHE_DIR / "db"
+MIOPEN_KERNELS_DIR = MIOPEN_CACHE_DIR / "kernels"
+TMP_DIR = Path(os.environ.get("TMP") or (ROOT_DIR / "artifacts" / "tmp")).resolve()
+
+for _d in (CACHE_DIR, MIOPEN_DB_DIR, MIOPEN_KERNELS_DIR, TMP_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+os.environ["HF_HOME"] = str(CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(CACHE_DIR / "transformers")
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR / "hub")
+os.environ["TORCH_HOME"] = str(CACHE_DIR / "torch")
+os.environ["TORCH_EXTENSIONS_DIR"] = str(CACHE_DIR / "torch_extensions")
+os.environ["TRITON_CACHE_DIR"] = str(CACHE_DIR / "triton")
+os.environ["TMP"] = str(TMP_DIR)
+os.environ["TEMP"] = str(TMP_DIR)
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["MIOPEN_USER_DB_PATH"] = str(MIOPEN_DB_DIR)
+os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = str(MIOPEN_KERNELS_DIR)
+os.environ["MIOPEN_FIND_MODE"] = "2"
+os.environ["MIOPEN_LOG_LEVEL"] = "0"
+os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
+os.environ["AMD_LOG_LEVEL"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from torch.overrides import TorchFunctionMode
+from safetensors.torch import load_file as load_safetensors
+
+if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+    torch.backends.cuda.matmul.allow_tf32 = False
+if hasattr(torch.backends, "cudnn"):
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("highest")
+
+from models.modeling_moss import MOSSImageTransformer, validate_skip_layers
+from models.modeling_qwen35 import Qwen3_5Model
+from models.modeling_vae import Flux2AutoencoderKL
+from models.tokenizer import MOSSImageTokenizer
+from schema import (
+    GenerationRequest,
+    GenerationResponse,
+    SUPPORTED_MODELS,
+)
+
+try:
+    from vizinjector import (
+        ConditionedVisionBundle,
+        VIZJ_TIER_DUAL_LATENT,
+        VIZJ_TIER_VAE_LATENT,
+        VIZJ_TIER_WIRE_WEBP,
+        VizInjectorClient,
+        VizInjectorRequest,
+        subphase_radial_clamp as _viz_subphase_radial_clamp,
+    )
+
+    HAS_VIZINJECTOR = True
+except Exception:
+    ConditionedVisionBundle = Any
+    VIZJ_TIER_WIRE_WEBP = 0
+    VIZJ_TIER_VAE_LATENT = 1
+    VIZJ_TIER_DUAL_LATENT = 2
+    VizInjectorClient = None
+    VizInjectorRequest = None
+    _viz_subphase_radial_clamp = None
+    HAS_VIZINJECTOR = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+_SPLITMIX64_C1 = 0x9E3779B97F4A7C15
+_SPLITMIX64_C2 = 0xBF58476D1CE4E5B9
+_SPLITMIX64_C3 = 0x94D049BB133111EB
+_MASK64 = 0xFFFFFFFFFFFFFFFF
+_MASK63 = 0x7FFFFFFFFFFFFFFF
+
+_GENERATOR_CACHE: Dict[str, torch.Generator] = {}
+
+
+class _MetaWeightInitMode(TorchFunctionMode):
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = dict(kwargs) if kwargs is not None else {}
+        if (
+            func in (torch.empty, torch.zeros, torch.ones)
+            and kwargs.get("device") is None
+        ):
+            kwargs["device"] = torch.device("meta")
+        return func(*args, **kwargs)
+
+
+def _pin_cpu_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if t is None:
+        return None
+    with torch.inference_mode(False):
+        cpu_t = t.detach().to(device="cpu").clone().contiguous()
+        if torch.cuda.is_available():
+            try:
+                return cpu_t.pin_memory()
+            except Exception:
+                return cpu_t
+        return cpu_t
+
+
+def _probe_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(64)
+        if len(hdr) >= 24 and hdr[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", hdr[16:24])
+            if w > 0 and h > 0:
+                return int(w), int(h)
+        if len(hdr) >= 40 and hdr[:16] == b"VIZJ_CONTAINER01":
+            orig_w, orig_h, vae_w, vae_h = struct.unpack("<IIII", hdr[32:48])
+            if orig_w > 0 and orig_h > 0:
+                return int(orig_w), int(orig_h)
+            if vae_w > 0 and vae_h > 0:
+                return int(vae_w), int(vae_h)
+        with Image.open(path) as img:
+            return int(img.width), int(img.height)
+    except Exception:
+        return None
+
+
+def splitmix64(seed: int) -> int:
+    z = (seed + _SPLITMIX64_C1) & _MASK64
+    z = ((z ^ (z >> 30)) * _SPLITMIX64_C2) & _MASK64
+    z = ((z ^ (z >> 27)) * _SPLITMIX64_C3) & _MASK64
+    return z ^ (z >> 31)
+
+
+def derive_stage_keys(master_seed: int) -> Tuple[int, int, int]:
+    base = master_seed & _MASK64
+    k_init = splitmix64(base ^ 0x5A5A5A5A5A5A5A5A)
+    k_sde = splitmix64(base ^ 0xA5A5A5A5A5A5A5A5)
+    k_aux = splitmix64(base ^ 0x3C3C3C3C3C3C3C3C)
+    return k_init, k_sde, k_aux
+
+
+def derive_effective_seed(seed: int, stream_id: int = 0, offset: int = 0) -> int:
+    h = splitmix64((seed ^ (stream_id * _SPLITMIX64_C1)) & _MASK64)
+    h = splitmix64((h + offset + _SPLITMIX64_C2) & _MASK64)
+    return int(h & _MASK63)
+
+
+def philox_randn(
+    shape: Union[Tuple[int, ...], torch.Size],
+    seed: int,
+    stream_id: int = 0,
+    offset: int = 0,
+    device: Union[str, torch.device] = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    target_device = torch.device(device) if isinstance(device, str) else device
+    eff_seed = derive_effective_seed(seed, stream_id, offset)
+    dev_key = f"{target_device.type}:{target_device.index if target_device.index is not None else 0}"
+    gen = _GENERATOR_CACHE.get(dev_key)
+    if gen is None:
+        gen = torch.Generator(device=target_device)
+        _GENERATOR_CACHE[dev_key] = gen
+    gen.manual_seed(eff_seed)
+    return torch.randn(shape, generator=gen, device=target_device, dtype=dtype)
+
+
+def subphase_radial_clamp(
+    packed_latents: torch.Tensor, max_sigma: float = 4.5
+) -> torch.Tensor:
+    if packed_latents.ndim != 4 or packed_latents.shape[1] != 128:
+        return packed_latents
+    orig_dtype = packed_latents.dtype
+    b, _, h, w = packed_latents.shape
+    z = packed_latents.float().view(b, 32, 4, h, w)
+    rms = torch.sqrt(torch.mean(z * z, dim=2, keepdim=True) + 1e-8)
+    excess = torch.clamp(rms - max_sigma, min=0.0)
+    clamped_rms = max_sigma + excess * torch.rsqrt(1.0 + excess * excess)
+    scale = torch.where(rms > max_sigma, clamped_rms / rms, torch.ones_like(rms))
+    return (z * scale).view(b, 128, h, w).to(orig_dtype)
+
+
+def compute_moss_v2_sigmas(
+    num_inference_steps: int,
+    shift: float = 5.0,
+    training_shift: float = 1.0,
+    num_train_timesteps: int = 1000,
+) -> torch.Tensor:
+    if num_inference_steps < 1 or shift <= 0 or training_shift <= 0:
+        raise ValueError("Steps and shifts must be positive.")
+    total = int(num_train_timesteps)
+
+    def _grid(count: int, s: float) -> torch.Tensor:
+        lower = s / (total + s - 1.0)
+        values = torch.linspace(1.0, lower, count, dtype=torch.float32)
+        return s * values / (1.0 + (s - 1.0) * values)
+
+    sigmas = _grid(num_inference_steps, float(shift))
+    training = _grid(total, float(training_shift)).flip(0)
+    upper = torch.searchsorted(training, sigmas).clamp(max=total - 1)
+    lower = (upper - 1).clamp(min=0)
+    nearest = torch.where(
+        (sigmas - training[lower]).abs() <= (training[upper] - sigmas).abs(),
+        lower,
+        upper,
+    )
+    return torch.unique_consecutive(training[nearest])
+
+
+class MOSSImageScheduler:
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        shift: float = 5.0,
+        training_shift: float = 1.0,
+    ):
+        self.num_train_timesteps = int(num_train_timesteps)
+        self.shift = float(shift)
+        self.training_shift = float(training_shift)
+        self.timesteps: Optional[torch.Tensor] = None
+        self.sigmas: Optional[torch.Tensor] = None
+        self._step_index: Optional[int] = None
+
+    def reset(self) -> None:
+        self._step_index = 0
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int = 50,
+        device: Optional[Union[str, torch.device]] = None,
+        shift: Optional[float] = None,
+    ) -> None:
+        if shift is not None:
+            self.shift = float(shift)
+        target_device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
+        snapped = compute_moss_v2_sigmas(
+            num_inference_steps=num_inference_steps,
+            shift=self.shift,
+            training_shift=self.training_shift,
+            num_train_timesteps=self.num_train_timesteps,
+        ).to(device=target_device)
+        self.timesteps = snapped * float(self.num_train_timesteps)
+        self.sigmas = torch.cat(
+            [snapped, torch.zeros(1, device=target_device, dtype=torch.float32)]
+        )
+        self._step_index = 0
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+        return_dict: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor]]:
+        num_steps = len(self.timesteps)
+        if self._step_index is None or self._step_index >= num_steps:
+            self._step_index = 0
+        idx = self._step_index
+        dt = self.sigmas[idx + 1] - self.sigmas[idx]
+        prev_sample = sample.float() + dt * model_output.float()
+        self._step_index += 1
+        if self._step_index >= num_steps:
+            self._step_index = None
+        return (prev_sample,) if return_dict else prev_sample
+
+
+class BifurcatedFlowMatchScheduler:
+    def __init__(
+        self,
+        early_solver: str = "euler",
+        late_solver: str = "euler",
+        handoff_threshold: float = 0.35,
+        shift: float = 5.0,
+        training_shift: float = 1.0,
+        num_train_timesteps: int = 1000,
+        ipndm_max_order: int = 4,
+        eta: float = 0.0,
+        s_noise: float = 1.0,
+        use_v2_grid: bool = True,
+    ):
+        self.early_solver = str(early_solver).lower()
+        self.late_solver = str(late_solver).lower()
+        self.handoff_threshold = max(0.0, min(1.0, float(handoff_threshold)))
+        self.shift = float(shift)
+        self.training_shift = float(training_shift)
+        self.num_train_timesteps = int(num_train_timesteps)
+        self.ipndm_max_order = max(1, min(4, int(ipndm_max_order)))
+        self.eta = max(0.0, min(1.0, float(eta)))
+        self.s_noise = max(0.0, float(s_noise))
+        self.use_v2_grid = bool(use_v2_grid)
+
+        self.base_sigmas: Optional[torch.Tensor] = None
+        self.sigmas: Optional[torch.Tensor] = None
+        self.timesteps: Optional[torch.Tensor] = None
+        self._step_configs: List[Dict[str, Any]] = []
+        self._step_index: Optional[int] = None
+        self._k_star: int = 0
+        self._sample_anchor: Optional[torch.Tensor] = None
+        self._v0: Optional[torch.Tensor] = None
+        self._h: Optional[float] = None
+        self._history: List[torch.Tensor] = []
+        self._boundary_flushed: bool = False
+        self.has_corrector: bool = False
+        self._early_steps: int = 0
+        self._late_steps: int = 0
+
+    def reset(self) -> None:
+        self._step_index = 0
+        self._sample_anchor = None
+        self._v0 = None
+        self._h = None
+        self._history.clear()
+        self._boundary_flushed = False
+
+    @property
+    def current_is_early(self) -> bool:
+        if self._step_index is None or self._step_index >= len(self._step_configs):
+            return True
+        return bool(self._step_configs[self._step_index]["is_early"])
+
+    @property
+    def current_progress(self) -> float:
+        if self._step_index is None or not self._step_configs:
+            return 0.0
+        cfg = self._step_configs[min(self._step_index, len(self._step_configs) - 1)]
+        total_intervals = max(1, self._early_steps + self._late_steps)
+        return float(cfg["interval_idx"]) / float(total_intervals)
+
+    @staticmethod
+    def _compute_ab_weights(
+        h_n: float,
+        h_n_1: float,
+        h_n_2: float,
+        h_n_3: float,
+        order: int,
+    ) -> Tuple[float, float, float, float]:
+        if order <= 1 or abs(h_n_1) < 1e-12:
+            return (h_n, 0.0, 0.0, 0.0)
+        r1 = h_n / h_n_1
+        if order == 2 or abs(h_n_2) < 1e-12:
+            c0 = (2.0 + r1) / 2.0
+            c1 = -r1 / 2.0
+            return (h_n * c0, h_n * c1, 0.0, 0.0)
+        temp = (
+            1.0
+            - (h_n / (3.0 * (h_n + h_n_1)))
+            * ((h_n * (h_n + h_n_1)) / (h_n_1 * (h_n_1 + h_n_2)))
+        ) / 2.0
+        c0 = (2.0 + r1) / 2.0 + temp
+        c1 = -r1 / 2.0 - (1.0 + h_n_1 / h_n_2) * temp
+        c2 = temp * (h_n_1 / h_n_2)
+        if order == 3 or abs(h_n_3) < 1e-12:
+            return (h_n * c0, h_n * c1, h_n * c2, 0.0)
+        temp2 = (
+            (1.0 - h_n / (3.0 * (h_n + h_n_1))) / 2.0
+            + (1.0 - h_n / (2.0 * (h_n + h_n_1)))
+            * h_n
+            / (6.0 * (h_n + h_n_1 + h_n_2))
+        ) * (
+            (h_n * (h_n + h_n_1) * (h_n + h_n_1 + h_n_2))
+            / (h_n_1 * (h_n_1 + h_n_2) * (h_n_1 + h_n_2 + h_n_3))
+        )
+        c0_4 = c0 + temp2
+        c1_4 = c1 - (
+            1.0
+            + (h_n_1 / h_n_2)
+            + (h_n_1 * (h_n_1 + h_n_2)) / (h_n_2 * (h_n_2 + h_n_3))
+        ) * temp2
+        c2_4 = c2 + (
+            (h_n_1 / h_n_2)
+            + (h_n_1 * (h_n_1 + h_n_2)) / (h_n_2 * (h_n_2 + h_n_3))
+        ) * (1.0 + h_n_2 / h_n_3) * temp2
+        c3_4 = (
+            -temp2
+            * ((h_n_1 * (h_n_1 + h_n_2)) / (h_n_2 * (h_n_2 + h_n_3)))
+            * (h_n_1 / h_n_2)
+        )
+        return (h_n * c0_4, h_n * c1_4, h_n * c2_4, h_n * c3_4)
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int = 50,
+        device: Optional[Union[str, torch.device]] = None,
+        shift: Optional[float] = None,
+        handoff_threshold: Optional[float] = None,
+        start_step: int = 0,
+    ) -> None:
+        if shift is not None:
+            self.shift = float(shift)
+        if handoff_threshold is not None:
+            self.handoff_threshold = max(0.0, min(1.0, float(handoff_threshold)))
+
+        target_device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
+        if self.use_v2_grid:
+            snapped = compute_moss_v2_sigmas(
+                num_inference_steps=num_inference_steps,
+                shift=self.shift,
+                training_shift=self.training_shift,
+                num_train_timesteps=self.num_train_timesteps,
+            )
+            sigmas_np = snapped.numpy().astype(np.float64)
+        else:
+            raw = np.linspace(
+                1.0, 1.0 / num_inference_steps, num_inference_steps, dtype=np.float64
+            )
+            sigmas_np = self.shift * raw / (1.0 + (self.shift - 1.0) * raw)
+
+        if 0 < start_step < len(sigmas_np):
+            sigmas_np = sigmas_np[start_step:]
+
+        base_sigmas_np = np.append(sigmas_np, 0.0)
+        self.base_sigmas = torch.from_numpy(base_sigmas_np.astype(np.float32)).to(
+            device=target_device
+        )
+
+        active_steps = len(sigmas_np)
+        progress_vals = 1.0 - sigmas_np
+        if self.handoff_threshold >= 1.0:
+            k_star = active_steps
+        elif self.handoff_threshold <= 0.0:
+            k_star = 0
+        else:
+            cand = [
+                i
+                for i in range(active_steps)
+                if progress_vals[i] >= self.handoff_threshold
+            ]
+            k_star = cand[0] if cand else active_steps
+
+        self._k_star = k_star
+        self._early_steps = k_star
+        self._late_steps = active_steps - k_star
+
+        corrector_types = ("heun", "sde_gpu_pp", "multitree")
+        early_has_corrector = self.early_solver in corrector_types
+        late_has_corrector = self.late_solver in corrector_types
+
+        step_configs: List[Dict[str, Any]] = []
+        eval_timesteps: List[float] = []
+
+        for i in range(active_steps):
+            is_early = i < k_star
+            solver = self.early_solver if is_early else self.late_solver
+            s_curr = float(base_sigmas_np[i])
+            s_next = float(base_sigmas_np[i + 1])
+            dt = s_next - s_curr
+            interval_corrector = (
+                (early_has_corrector if is_early else late_has_corrector)
+                and (s_next > 0.0)
+            )
+            if interval_corrector:
+                t_pred = s_curr * self.num_train_timesteps
+                t_corr = s_next * self.num_train_timesteps
+                eval_timesteps.extend([t_pred, t_corr])
+                step_configs.append(
+                    {
+                        "mode": "predictor",
+                        "interval_idx": i,
+                        "is_early": is_early,
+                        "s_curr": s_curr,
+                        "s_next": s_next,
+                        "dt": dt,
+                        "timestep": t_pred,
+                        "solver": solver,
+                    }
+                )
+                step_configs.append(
+                    {
+                        "mode": "corrector",
+                        "interval_idx": i,
+                        "is_early": is_early,
+                        "s_curr": s_curr,
+                        "s_next": s_next,
+                        "dt": dt,
+                        "timestep": t_corr,
+                        "solver": solver,
+                    }
+                )
+            else:
+                t_step = s_curr * self.num_train_timesteps
+                eval_timesteps.append(t_step)
+                j = i if is_early else (i - k_star)
+                order = min(self.ipndm_max_order, j + 1)
+                h_n_1 = (
+                    float(base_sigmas_np[i] - base_sigmas_np[i - 1]) if j >= 1 else 0.0
+                )
+                h_n_2 = (
+                    float(base_sigmas_np[i - 1] - base_sigmas_np[i - 2])
+                    if j >= 2
+                    else 0.0
+                )
+                h_n_3 = (
+                    float(base_sigmas_np[i - 2] - base_sigmas_np[i - 3])
+                    if j >= 3
+                    else 0.0
+                )
+                weights = self._compute_ab_weights(dt, h_n_1, h_n_2, h_n_3, order)
+                step_configs.append(
+                    {
+                        "mode": "multistep",
+                        "interval_idx": i,
+                        "is_early": is_early,
+                        "s_curr": s_curr,
+                        "s_next": s_next,
+                        "dt": dt,
+                        "timestep": t_step,
+                        "solver": solver,
+                        "order": order,
+                        "weights": weights,
+                    }
+                )
+
+        self._step_configs = step_configs
+        self.timesteps = torch.tensor(
+            eval_timesteps, dtype=torch.float32, device=target_device
+        )
+        self.sigmas = self.base_sigmas
+        self.has_corrector = any(cfg["mode"] == "corrector" for cfg in step_configs)
+        self.reset()
+
+    def _push_history(self, v: torch.Tensor) -> None:
+        if len(self._history) >= self.ipndm_max_order - 1:
+            self._history.pop(0)
+        self._history.append(v.detach())
+
+    def _calc_sde_dispersion(
+        self,
+        ref_tensor: torch.Tensor,
+        v_tot: torch.Tensor,
+        s_curr: float,
+        s_next: float,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        if self.eta <= 0.0 or self.s_noise <= 0.0 or self.handoff_threshold <= 0.0:
+            return torch.zeros_like(ref_tensor)
+        progress = 1.0 - s_curr
+        if progress >= self.handoff_threshold or s_next <= 0.0:
+            return torch.zeros_like(ref_tensor)
+
+        envelope = max(
+            0.0,
+            min(1.0, (self.handoff_threshold - progress) / self.handoff_threshold),
+        )
+        dt_val = abs(s_next - s_curr)
+        renoise = self.eta * math.sqrt(max(dt_val, 1e-8)) * envelope * self.s_noise
+        if renoise <= 0.0:
+            return torch.zeros_like(ref_tensor)
+
+        gen_dev = generator.device.type if generator is not None else None
+        if generator is not None and gen_dev == ref_tensor.device.type:
+            noise = torch.randn(
+                ref_tensor.shape,
+                generator=generator,
+                device=ref_tensor.device,
+                dtype=torch.float32,
+            )
+        else:
+            noise = torch.randn(
+                ref_tensor.shape, device=ref_tensor.device, dtype=torch.float32
+            )
+
+        denom = max(s_curr, 1e-3)
+        score = -(ref_tensor - (1.0 - s_curr) * v_tot) / denom
+        drift_comp = 0.5 * (renoise**2) * score
+        return drift_comp + (noise * renoise)
+
+    def step(
+        self,
+        model_output: Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]],
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+        return_dict: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor]]:
+        num_passes = len(self._step_configs)
+        if self._step_index is None or self._step_index >= num_passes:
+            self.reset()
+
+        v = (
+            model_output[0].float()
+            if isinstance(model_output, (tuple, list))
+            else model_output.float()
+        )
+        sample_f32 = sample.float()
+
+        cfg = self._step_configs[self._step_index]
+        mode = cfg["mode"]
+        s_curr = cfg["s_curr"]
+        s_next = cfg["s_next"]
+        dt = cfg["dt"]
+        is_early = cfg["is_early"]
+        solver = cfg["solver"]
+
+        if not is_early and not self._boundary_flushed:
+            self._history.clear()
+            self._boundary_flushed = True
+
+        if mode == "predictor":
+            self._sample_anchor = sample_f32.clone()
+            self._v0 = v.detach()
+            self._h = dt
+            prev_sample = sample_f32 + dt * v
+        elif mode == "corrector":
+            sample_0 = (
+                self._sample_anchor if self._sample_anchor is not None else sample_f32
+            )
+            v0 = self._v0 if self._v0 is not None else v
+            h_dt = self._h if self._h is not None else dt
+            if solver in ("heun", "sde_gpu_pp", "multitree"):
+                dx = (h_dt / 2.0) * (v0 + v)
+            else:
+                dx = h_dt * v0
+            if is_early and self.eta > 0.0 and s_next > 0.0:
+                v_tot = 0.5 * (v0 + v)
+                disp = self._calc_sde_dispersion(
+                    sample_0, v_tot, s_curr, s_next, generator=generator
+                )
+                prev_sample = sample_0 + dx + disp
+            else:
+                prev_sample = sample_0 + dx
+            self._sample_anchor = None
+            self._v0 = None
+            self._h = None
+        else:
+            c0, c1, c2, c3 = cfg["weights"]
+            if solver in ("ipndm", "multitree"):
+                dx = c0 * v
+                if len(self._history) >= 1 and c1 != 0.0:
+                    dx = dx + c1 * self._history[-1]
+                if len(self._history) >= 2 and c2 != 0.0:
+                    dx = dx + c2 * self._history[-2]
+                if len(self._history) >= 3 and c3 != 0.0:
+                    dx = dx + c3 * self._history[-3]
+            else:
+                dx = dt * v
+
+            if is_early and self.eta > 0.0 and s_next > 0.0:
+                disp = self._calc_sde_dispersion(
+                    sample_f32, v, s_curr, s_next, generator=generator
+                )
+                prev_sample = sample_f32 + dx + disp
+            else:
+                prev_sample = sample_f32 + dx
+
+            if solver in ("ipndm", "multitree") and self.ipndm_max_order > 1:
+                self._push_history(v)
+
+        self._step_index += 1
+        if self._step_index >= num_passes:
+            self.reset()
+        return (prev_sample,) if return_dict else prev_sample
+
+
+class PromptEmbedCache:
+    def __init__(self, max_entries: int = 32):
+        self.max_entries = max_entries
+        self._cache: OrderedDict[Tuple[Any, ...], torch.Tensor] = OrderedDict()
+        self._last_tokens: Optional[List[int]] = None
+        self.hits: int = 0
+        self.pos_hits: int = 0
+        self.misses: int = 0
+        self.last_common_prefix_len: int = 0
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._last_tokens = None
+
+    def lookup(
+        self,
+        token_ids: Sequence[int],
+        device: torch.device,
+        is_negative: bool = False,
+        vision_signature: Tuple[Any, ...] = (),
+    ) -> Optional[torch.Tensor]:
+        tok_list = [int(x) for x in token_ids]
+        if not is_negative:
+            if self._last_tokens is not None:
+                self.last_common_prefix_len = MOSSImageTokenizer.find_common_prefix(
+                    self._last_tokens, tok_list
+                )
+            else:
+                self.last_common_prefix_len = 0
+            self._last_tokens = tok_list
+
+        key: Tuple[Any, ...] = (
+            (tuple(tok_list), vision_signature)
+            if vision_signature
+            else tuple(tok_list)
+        )
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self.hits += 1
+            if not is_negative:
+                self.pos_hits += 1
+            return self._cache[key].to(device=device, non_blocking=True)
+        self.misses += 1
+        return None
+
+    def insert(
+        self,
+        token_ids: Sequence[int],
+        hidden: torch.Tensor,
+        vision_signature: Tuple[Any, ...] = (),
+    ) -> None:
+        key: Tuple[Any, ...] = (
+            (tuple(int(x) for x in token_ids), vision_signature)
+            if vision_signature
+            else tuple(int(x) for x in token_ids)
+        )
+        pinned = _pin_cpu_tensor(hidden)
+        if pinned is not None:
+            self._cache[key] = pinned
+            self._cache.move_to_end(key)
+        while len(self._cache) > self.max_entries:
+            self._cache.popitem(last=False)
+
+
+@dataclass
+class CachedReferenceRecord:
+    packed_latents: Optional[torch.Tensor]
+    vit_embeds: Optional[torch.Tensor]
+    vit_patches: Optional[torch.Tensor]
+    grid_thw: Optional[torch.Tensor]
+    llm_tokens: int
+    latent_mask: Optional[torch.Tensor]
+    viz_meta: Optional[Any] = None
+    source_signature: Tuple[Any, ...] = ()
+
+
+class ReferenceVisionCache:
+    def __init__(self, max_entries: int = 32):
+        self.max_entries = max_entries
+        self._cache: OrderedDict[Tuple[Any, ...], CachedReferenceRecord] = OrderedDict()
+        self._vae_cache: OrderedDict[
+            Tuple[Any, ...],
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Any]],
+        ] = OrderedDict()
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._vae_cache.clear()
+
+    @staticmethod
+    def canonicalize_framing(
+        path: Path, target_w: int, target_h: int, framing_mode: str
+    ) -> str:
+        fm = str(framing_mode).lower()
+        if fm == "never_crop":
+            dims = _probe_image_dimensions(path)
+            if dims is not None:
+                src_w, src_h = dims
+                if src_w * target_h == src_h * target_w:
+                    return "inscribed"
+        return fm
+
+    @classmethod
+    def make_vae_key(
+        cls,
+        path: Path,
+        target_w: int,
+        target_h: int,
+        framing_mode: str,
+        input_role: str,
+        clamp_sigma: float,
+        mtf_boost: float = 0.08,
+        mask_feather_radius: float = 1.25,
+    ) -> Tuple[Any, ...]:
+        st = path.stat()
+        norm_fm = cls.canonicalize_framing(path, target_w, target_h, framing_mode)
+        eff_mtf = round(float(mtf_boost), 4) if input_role == "photo_ref" else 0.0
+        return (
+            str(path.resolve()),
+            int(st.st_mtime_ns),
+            int(st.st_size),
+            int(target_w),
+            int(target_h),
+            norm_fm,
+            str(input_role),
+            round(float(clamp_sigma), 4),
+            eff_mtf,
+            round(float(mask_feather_radius), 4),
+        )
+
+    @classmethod
+    def make_key(
+        cls,
+        path: Path,
+        target_w: int,
+        target_h: int,
+        framing_mode: str,
+        input_role: str,
+        edit_format: str,
+        max_vit_patches: int,
+        clamp_sigma: float,
+    ) -> Tuple[Any, ...]:
+        st = path.stat()
+        norm_fm = cls.canonicalize_framing(path, target_w, target_h, framing_mode)
+        return (
+            str(path.resolve()),
+            int(st.st_mtime_ns),
+            int(st.st_size),
+            int(target_w),
+            int(target_h),
+            norm_fm,
+            str(input_role),
+            str(edit_format),
+            int(max_vit_patches),
+            round(float(clamp_sigma), 4),
+        )
+
+    def lookup(self, key: Tuple[Any, ...]) -> Optional[CachedReferenceRecord]:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self.hits += 1
+            return self._cache[key]
+        self.misses += 1
+        return None
+
+    def lookup_vae(
+        self, vae_key: Tuple[Any, ...]
+    ) -> Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Any]]]:
+        if vae_key in self._vae_cache:
+            self._vae_cache.move_to_end(vae_key)
+            self.hits += 1
+            return self._vae_cache[vae_key]
+        return None
+
+    def insert(
+        self,
+        key: Tuple[Any, ...],
+        record: CachedReferenceRecord,
+        vae_key: Optional[Tuple[Any, ...]] = None,
+    ) -> CachedReferenceRecord:
+        pinned_rec = CachedReferenceRecord(
+            packed_latents=_pin_cpu_tensor(record.packed_latents),
+            vit_embeds=_pin_cpu_tensor(record.vit_embeds),
+            vit_patches=_pin_cpu_tensor(record.vit_patches),
+            grid_thw=_pin_cpu_tensor(record.grid_thw),
+            llm_tokens=int(record.llm_tokens),
+            latent_mask=_pin_cpu_tensor(record.latent_mask),
+            viz_meta=record.viz_meta,
+            source_signature=record.source_signature or key[:6],
+        )
+        self._cache[key] = pinned_rec
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.max_entries:
+            self._cache.popitem(last=False)
+
+        if vae_key is not None and pinned_rec.packed_latents is not None:
+            self._vae_cache[vae_key] = (
+                pinned_rec.packed_latents,
+                pinned_rec.latent_mask,
+                pinned_rec.viz_meta,
+            )
+            self._vae_cache.move_to_end(vae_key)
+            while len(self._vae_cache) > self.max_entries:
+                self._vae_cache.popitem(last=False)
+        return pinned_rec
+
+
+def _format_seconds(seconds: float) -> str:
+    s = max(0, int(seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+class EngineProgressReporter:
+    def __init__(self) -> None:
+        self.current_stage: Optional[str] = None
+        self.stage_start: float = time.perf_counter()
+        self.last_render: float = 0.0
+        self.render_interval: float = 0.08
+        self.last_count: int = 0
+        self.stage_durations: Dict[str, float] = {}
+
+    def start_stage(self, stage: str, total: int) -> None:
+        now = time.perf_counter()
+        if self.current_stage is not None and self.current_stage != stage:
+            self._finish_stage(now)
+        self.current_stage = stage
+        self.stage_start = now
+        self.last_render = 0.0
+        self.last_count = 0
+        self._render_bar(stage, 0, total, now)
+
+    def __call__(self, stage: str, current: int, total: int) -> None:
+        now = time.perf_counter()
+        if stage != self.current_stage:
+            if self.current_stage is not None:
+                self._finish_stage(now)
+            self.current_stage = stage
+            self.stage_start = now
+            self.last_render = 0.0
+            self.last_count = 0
+
+        self.last_count = current
+        is_final = current >= total
+        if not is_final and (now - self.last_render < self.render_interval):
+            return
+        self.last_render = now
+        self._render_bar(stage, current, total, now)
+
+        if is_final:
+            self._finish_stage(now)
+
+    def _render_bar(self, stage: str, current: int, total: int, now: float) -> None:
+        elapsed = max(now - self.stage_start, 1e-4)
+        pct = (current / max(total, 1)) * 100.0
+        rate = (current / elapsed) if (elapsed >= 0.05 and current >= 1) else 0.0
+        remaining_units = max(0, total - current)
+        eta = (remaining_units / rate) if rate > 0.0 else 0.0
+        time_str = f"[{_format_seconds(elapsed)}<{_format_seconds(eta)}"
+
+        if stage == "context":
+            prefix = "[1/3 Qwen3.5 Context]"
+            rate_str = f"{rate:5.1f} seq/s" if rate > 0 else "  --.- seq/s"
+            suffix = f" {pct:5.1f}% | {current:2d}/{total:2d} seq {time_str}, {rate_str}]"
+        elif stage == "dit":
+            prefix = "[2/3 MOSS-DiT Flow]"
+            rate_str = f"{rate:5.2f} stp/s" if rate > 0 else "  --.-- stp/s"
+            suffix = f" {pct:5.1f}% | {current:3d}/{total:3d} stp {time_str}, {rate_str}]"
+        elif stage == "vae":
+            prefix = "[3/3 Flux2-VAE FP32]"
+            rate_str = f"{rate:5.2f} img/s" if rate > 0 else "  --.-- img/s"
+            suffix = f" {pct:5.1f}% | {current:2d}/{total:2d} img {time_str}, {rate_str}]"
+        else:
+            prefix = f"[{stage.upper()}]"
+            suffix = f" {pct:5.1f}% | {current}/{total} {time_str}]"
+
+        cols = max(60, min(shutil.get_terminal_size((80, 20)).columns, 140))
+        avail = cols - len(prefix) - len(suffix) - 3
+        bar_len = max(8, min(avail, 30))
+        filled = min(bar_len, int(bar_len * current / max(total, 1)))
+        bar = "=" * filled + ">" if (filled < bar_len and current > 0) else "=" * filled
+        bar = bar.ljust(bar_len, " ")
+        line = f"\r{prefix} [{bar}]{suffix}"
+        sys.stdout.write(line.ljust(cols - 1)[: cols - 1])
+        sys.stdout.flush()
+
+    def _finish_stage(self, now: float) -> None:
+        elapsed = max(now - self.stage_start, 1e-4)
+        if self.current_stage is not None:
+            self.stage_durations[self.current_stage] = elapsed
+        stage_names = {
+            "context": "Qwen3.5 Hybrid Context",
+            "dit": "MOSS-DiT Flow Matching",
+            "vae": "Flux2-VAE FP32 Decode",
+        }
+        name = stage_names.get(
+            self.current_stage,
+            self.current_stage.upper() if self.current_stage else "Stage",
+        )
+        cols = max(60, min(shutil.get_terminal_size((80, 20)).columns, 140))
+        summary = f"\r[+] {name:<26} finalized in {elapsed:6.2f}s ({self.last_count} units)."
+        sys.stdout.write(summary.ljust(cols - 1)[: cols - 1] + "\n")
+        sys.stdout.flush()
+        self.current_stage = None
+
+    def close(self) -> None:
+        if self.current_stage is not None:
+            self._finish_stage(time.perf_counter())
+
+
+def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
+    direct_path = Path(repo_or_path)
+    if direct_path.exists():
+        return direct_path.resolve()
+
+    repo_str = str(repo_or_path).replace("\\", "/")
+    hub_candidates = [
+        CACHE_DIR / "hub",
+        CACHE_DIR,
+        ROOT_DIR.parent / ".hf_cache" / "hub",
+        ROOT_DIR / ".hf_cache" / "hub",
+    ]
+    repo_folder_name = "models--" + repo_str.replace("/", "--")
+    seen_dirs = set()
+    for hub_dir in hub_candidates:
+        resolved_hub = hub_dir.resolve()
+        if resolved_hub in seen_dirs or not resolved_hub.exists():
+            continue
+        seen_dirs.add(resolved_hub)
+        cand = resolved_hub / repo_folder_name / "snapshots"
+        if cand.exists():
+            snapshots = sorted(
+                [p for p in cand.iterdir() if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if snapshots:
+                return snapshots[0].resolve()
+
+    raise FileNotFoundError(
+        f"Cached snapshot not found for '{repo_or_path}' in {CACHE_DIR / 'hub'}. Run download_model.py first."
+    )
+
+
+def load_sharded_safetensors_into(
+    model_dir: Path,
+    target_module: torch.nn.Module,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> None:
+    with torch.inference_mode(False), torch.no_grad():
+        sf_files = sorted(set(model_dir.glob("*.safetensors")))
+        if not sf_files:
+            raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+
+        state_dict: Dict[str, torch.Tensor] = {}
+        for sf_path in sf_files:
+            raw = load_safetensors(str(sf_path), device="cpu")
+            for k, v in raw.items():
+                clean_key = k[6:] if k.startswith("model.") else k
+                if v.is_floating_point():
+                    if (
+                        clean_key.endswith("bands")
+                        or clean_key.endswith("inv_freq")
+                        or clean_key.startswith("bn.")
+                    ):
+                        state_dict[clean_key] = v.to(
+                            device=device, dtype=torch.float32
+                        )
+                    elif clean_key.endswith("A_log") or dtype is None:
+                        state_dict[clean_key] = v.to(device=device)
+                    elif v.dtype == torch.float32 and dtype != torch.float32:
+                        state_dict[clean_key] = v.to(device=device, dtype=dtype)
+                    else:
+                        state_dict[clean_key] = v.to(device=device)
+                else:
+                    state_dict[clean_key] = v.to(device=device)
+            del raw
+
+        target_module.load_state_dict(state_dict, strict=True, assign=True)
+        del state_dict
+        gc.collect()
+
+        for name, param in target_module.named_parameters():
+            if param.device != device:
+                if param.is_floating_point():
+                    if (
+                        name.endswith("A_log")
+                        or name.endswith("rope.bands")
+                        or dtype is None
+                    ):
+                        param.data = param.data.to(device=device)
+                    elif param.dtype == torch.float32 and dtype != torch.float32:
+                        param.data = param.data.to(device=device, dtype=dtype)
+                    else:
+                        param.data = param.data.to(device=device)
+                else:
+                    param.data = param.data.to(device=device)
+
+        for name, buf in target_module.named_buffers():
+            if buf.is_floating_point():
+                if (
+                    name.endswith("bands")
+                    or name.endswith("inv_freq")
+                    or dtype is None
+                ):
+                    if buf.device != device or buf.dtype != torch.float32:
+                        buf.data = buf.data.to(device=device, dtype=torch.float32)
+                elif buf.device != device:
+                    buf.data = buf.data.to(device=device)
+            elif buf.device != device:
+                buf.data = buf.data.to(device=device)
+
+
+def compute_image_telemetry(pil_img: Image.Image) -> Tuple[float, float, float, float]:
+    rgb = np.asarray(pil_img.convert("RGB"), dtype=np.float32) / 255.0
+    luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    mean_luma = float(np.mean(luma))
+    rms_contrast = float(np.std(luma))
+
+    luma_u8 = np.clip(np.round(luma * 255.0), 0, 255).astype(np.uint8)
+    hist = np.bincount(luma_u8.ravel(), minlength=256).astype(np.float64)
+    probs = hist[hist > 0] / float(luma_u8.size)
+    entropy = float(-np.sum(probs * np.log2(probs)))
+
+    if luma.shape[0] >= 3 and luma.shape[1] >= 3:
+        lap = (
+            luma[:-2, 1:-1]
+            + luma[2:, 1:-1]
+            + luma[1:-1, :-2]
+            + luma[1:-1, 2:]
+            - 4.0 * luma[1:-1, 1:-1]
+        )
+        sharpness = float(np.var(lap) * 1000.0)
+    else:
+        sharpness = 0.0
+    return mean_luma, rms_contrast, entropy, sharpness
+
+
+def load_image_tensor_16px(
+    image_path: Union[str, Path],
+    target_h: Optional[int] = None,
+    target_w: Optional[int] = None,
+) -> torch.Tensor:
+    img = Image.open(image_path).convert("RGB")
+    w_in, h_in = img.size
+    if target_h is not None and target_w is not None:
+        h_out = (target_h // 16) * 16
+        w_out = (target_w // 16) * 16
+    else:
+        scale = min(1.0, math.sqrt((1024.0 * 1024.0) / float(max(1, w_in * h_in))))
+        h_out = max(64, (int(round(h_in * scale)) // 16) * 16)
+        w_out = max(64, (int(round(w_in * scale)) // 16) * 16)
+    if (w_in, h_in) != (w_out, h_out):
+        img = img.resize((w_out, h_out), resample=Image.Resampling.BICUBIC)
+    arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+
+def pack_vision_patches_32px(
+    image_path: Union[str, Path], max_patches: int = 2304
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    img = Image.open(image_path).convert("RGB")
+    w_in, h_in = img.size
+    max_pixels = max_patches * 16 * 16
+    scale = min(1.0, math.sqrt(float(max_pixels) / float(max(1, w_in * h_in))))
+    h_vis = max(32, (int(round(h_in * scale)) // 32) * 32)
+    w_vis = max(32, (int(round(w_in * scale)) // 32) * 32)
+    if (w_in, h_in) != (w_vis, h_vis):
+        img = img.resize((w_vis, h_vis), resample=Image.Resampling.BICUBIC)
+
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+    std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+    normed = (arr - mean) / std
+    chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
+
+    grid_h = h_vis // 16
+    grid_w = w_vis // 16
+    merge = 2
+    patches = chw.unsqueeze(1).expand(3, 2, h_vis, w_vis)
+    patches = patches.view(
+        3, 2, grid_h // merge, merge, 16, grid_w // merge, merge, 16
+    )
+    patches = (
+        patches.permute(2, 5, 3, 6, 0, 1, 4, 7)
+        .contiguous()
+        .view(grid_h * grid_w, 3, 2, 16, 16)
+    )
+    grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+    llm_tokens = (grid_h * grid_w) // (merge * merge)
+    return patches, grid_thw, llm_tokens
+
+
+class MOSSImageEngine:
+    def __init__(
+        self,
+        model_variant: str = "sft",
+        repo_id: Optional[str] = None,
+        device: Union[str, torch.device] = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        vae_dtype: torch.dtype = torch.float32,
+        prefer_vulkan: bool = True,
+    ):
+        self.model_variant = model_variant.lower()
+        self.repo_id = repo_id or SUPPORTED_MODELS.get(
+            self.model_variant, SUPPORTED_MODELS["sft"]
+        )
+        self.device = torch.device(device) if isinstance(device, str) else device
+        self.dtype = dtype
+        self.vae_dtype = vae_dtype
+
+        self.tokenizer: Optional[MOSSImageTokenizer] = None
+        self.text_encoder: Optional[Qwen3_5Model] = None
+        self.transformer: Optional[MOSSImageTransformer] = None
+        self.vae: Optional[Flux2AutoencoderKL] = None
+        self.embed_cache = PromptEmbedCache(max_entries=32)
+        self.ref_cache = ReferenceVisionCache(max_entries=32)
+        self.vizinjector: Optional[Any] = None
+        if HAS_VIZINJECTOR and VizInjectorClient is not None:
+            try:
+                self.vizinjector = VizInjectorClient(prefer_vulkan=prefer_vulkan)
+            except Exception:
+                self.vizinjector = None
+        self._loaded_repo_id: Optional[str] = None
+        self._current_offload_state: Optional[bool] = None
+        self._warmed_up: bool = False
+
+    def __enter__(self) -> MOSSImageEngine:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.shutdown()
+
+    @property
+    def vizinjector_active(self) -> bool:
+        return self.vizinjector is not None
+
+    @property
+    def vizinjector_backend_name(self) -> str:
+        if self.vizinjector is None:
+            return "PyTorch Fallback"
+        return (
+            f"Vulkan ({self.vizinjector.backend_name})"
+            if self.vizinjector.vulkan_active
+            else "VizInjector C11 AVX2"
+        )
+
+    def _sync_device(self) -> None:
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def clear_runtime_caches(self) -> None:
+        self.embed_cache.clear()
+        self.ref_cache.clear()
+        if self.transformer is not None:
+            self.transformer.clear_caches()
+        if self.text_encoder is not None:
+            self.text_encoder.clear_caches()
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def prepare_for_exit(self) -> None:
+        try:
+            self._sync_device()
+        except Exception:
+            pass
+
+    def shutdown(self) -> None:
+        with torch.inference_mode(False), torch.no_grad():
+            try:
+                self._sync_device()
+            except Exception:
+                pass
+            if self.vizinjector is not None:
+                try:
+                    self.vizinjector.close()
+                except Exception:
+                    pass
+                self.vizinjector = None
+            if self.tokenizer is not None:
+                close_fn = getattr(self.tokenizer, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+                self.tokenizer = None
+            self.embed_cache.clear()
+            self.ref_cache.clear()
+            _GENERATOR_CACHE.clear()
+            if self.transformer is not None:
+                try:
+                    self.transformer.unfuse_lora()
+                    self.transformer.clear_caches()
+                except Exception:
+                    pass
+                self.transformer = None
+            if self.text_encoder is not None:
+                try:
+                    self.text_encoder.clear_caches()
+                except Exception:
+                    pass
+                self.text_encoder = None
+            self.vae = None
+            self._loaded_repo_id = None
+            self._current_offload_state = None
+            self._warmed_up = False
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    self._sync_device()
+                except Exception:
+                    pass
+
+    def list_available_models(self) -> List[Dict[str, object]]:
+        models_info = []
+        for variant, repo in SUPPORTED_MODELS.items():
+            try:
+                snap = resolve_model_path(repo)
+                manifest_file = snap / "conditioning_manifest.json"
+                cond_meta = (
+                    json.loads(manifest_file.read_text(encoding="utf-8"))
+                    if manifest_file.is_file()
+                    else {"precision": "native"}
+                )
+                models_info.append(
+                    {
+                        "variant": variant,
+                        "repo_id": repo,
+                        "cached": True,
+                        "snapshot_path": str(snap),
+                        "active": (self._loaded_repo_id == repo),
+                        "conditioning": cond_meta,
+                    }
+                )
+            except FileNotFoundError:
+                models_info.append(
+                    {
+                        "variant": variant,
+                        "repo_id": repo,
+                        "cached": False,
+                        "snapshot_path": None,
+                        "active": False,
+                        "conditioning": None,
+                    }
+                )
+        return models_info
+
+    def _init_or_swap_components(self, target_repo_id: str, cpu_offload: bool) -> None:
+        with torch.inference_mode(False), torch.no_grad():
+            if self.device.type == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA execution requested but no compatible GPU detected."
+                )
+
+            target_device = torch.device("cpu") if cpu_offload else self.device
+
+            if (
+                self.transformer is not None
+                and self.text_encoder is not None
+                and self.vae is not None
+            ):
+                if self._current_offload_state != cpu_offload:
+                    self.text_encoder.to(target_device)
+                    self.vae.to(target_device)
+                    if self._loaded_repo_id == target_repo_id:
+                        self.transformer.to(target_device)
+                        self.transformer.clear_transient_caches()
+                        self._current_offload_state = cpu_offload
+                        if torch.cuda.is_available():
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                        return
+                    self._current_offload_state = cpu_offload
+                elif self._loaded_repo_id == target_repo_id:
+                    return
+
+            root_path = resolve_model_path(target_repo_id)
+
+            if (
+                self.transformer is not None
+                and self.text_encoder is not None
+                and self.vae is not None
+                and self._loaded_repo_id != target_repo_id
+                and self._current_offload_state == cpu_offload
+            ):
+                t0 = time.perf_counter()
+                logging.info(
+                    "Executing DiT-only hot-swap: %s -> %s",
+                    self._loaded_repo_id,
+                    target_repo_id,
+                )
+                transformer_dir = root_path / "transformer"
+                del self.transformer
+                self.transformer = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                with _MetaWeightInitMode():
+                    self.transformer = MOSSImageTransformer.from_config_dir(
+                        transformer_dir
+                    )
+                load_sharded_safetensors_into(
+                    transformer_dir,
+                    self.transformer,
+                    device=target_device,
+                    dtype=self.dtype,
+                )
+                self.transformer.clear_caches()
+                self.transformer.eval().requires_grad_(False)
+                self._loaded_repo_id = target_repo_id
+                logging.info(
+                    "Hot-swap completed in %.2fs (Shared Qwen3.5 & Flux2-VAE retained).",
+                    time.perf_counter() - t0,
+                )
+                return
+
+            if self.transformer is not None:
+                del self.transformer, self.text_encoder, self.vae
+                self.transformer = None
+                self.text_encoder = None
+                self.vae = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            t_start = time.perf_counter()
+            tokenizer_dir = root_path / "tokenizer"
+            te_dir = root_path / "text_encoder"
+            transformer_dir = root_path / "transformer"
+            vae_dir = root_path / "vae"
+
+            logging.info(
+                "Loading Sovereign VizToken Qwen3.5 (SWISS5 AVX2) tokenizer from %s",
+                tokenizer_dir,
+            )
+            self.tokenizer = MOSSImageTokenizer(tokenizer_dir)
+
+            logging.info(
+                "Loading Sovereign Qwen3_5Model (24 Linear-Attn + 8 Full-Attn + 27-Layer ViT) from %s",
+                te_dir,
+            )
+            with _MetaWeightInitMode():
+                self.text_encoder = Qwen3_5Model.from_config_dir(te_dir)
+            load_sharded_safetensors_into(
+                te_dir, self.text_encoder, device=target_device, dtype=self.dtype
+            )
+            self.text_encoder.eval().requires_grad_(False)
+
+            logging.info(
+                "Loading Sovereign MOSSImageTransformer (42-Layer DiT) from %s",
+                transformer_dir,
+            )
+            with _MetaWeightInitMode():
+                self.transformer = MOSSImageTransformer.from_config_dir(
+                    transformer_dir
+                )
+            load_sharded_safetensors_into(
+                transformer_dir,
+                self.transformer,
+                device=target_device,
+                dtype=self.dtype,
+            )
+            self.transformer.eval().requires_grad_(False)
+
+            logging.info(
+                "Loading Sovereign Flux2AutoencoderKL (FP32) from %s", vae_dir
+            )
+            with _MetaWeightInitMode():
+                self.vae = Flux2AutoencoderKL.from_config_dir(vae_dir)
+            load_sharded_safetensors_into(
+                vae_dir, self.vae, device=target_device, dtype=self.vae_dtype
+            )
+            self.vae.eval().requires_grad_(False)
+
+            self._loaded_repo_id = target_repo_id
+            self._current_offload_state = cpu_offload
+            logging.info(
+                "MOSSImageEngine initialized (%s) in %.2fs.",
+                target_repo_id,
+                time.perf_counter() - t_start,
+            )
+
+    def _apply_or_revert_edit_lora(
+        self, edit_lora_path: Optional[str], edit_lora_scale: float
+    ) -> bool:
+        with torch.inference_mode(False), torch.no_grad():
+            if self.transformer is None:
+                return False
+            if (
+                not edit_lora_path
+                or not edit_lora_path.strip()
+                or abs(edit_lora_scale) < 1e-6
+            ):
+                self.transformer.unfuse_lora()
+                return False
+
+            raw_spec = edit_lora_path.strip()
+            resolved_lora: Optional[Path] = None
+            if raw_spec.lower() in ("auto", "moss_edit", "chinoll/moss-image-edit"):
+                try:
+                    resolved_lora = resolve_model_path("chinoll/Moss-Image-Edit")
+                except FileNotFoundError:
+                    resolved_lora = None
+            else:
+                p = Path(raw_spec)
+                if not p.is_absolute():
+                    p = (ROOT_DIR / p).resolve()
+                if p.exists():
+                    resolved_lora = p.resolve()
+                else:
+                    try:
+                        resolved_lora = resolve_model_path(raw_spec)
+                    except FileNotFoundError:
+                        resolved_lora = None
+
+            if resolved_lora is None:
+                logging.warning(
+                    "Requested Edit LoRA '%s' not found; skipping.", raw_spec
+                )
+                self.transformer.unfuse_lora()
+                return False
+
+            lora_tag_str = str(resolved_lora)
+            if self.transformer.is_lora_active(lora_tag_str, edit_lora_scale):
+                return True
+
+            sf_files = (
+                [resolved_lora]
+                if resolved_lora.is_file()
+                else sorted(resolved_lora.rglob("*.safetensors"))
+            )
+            if not sf_files:
+                self.transformer.unfuse_lora()
+                return False
+
+            lora_sd: Dict[str, torch.Tensor] = {}
+            for sf in sf_files:
+                lora_sd.update(load_safetensors(str(sf), device="cpu"))
+
+            fused = self.transformer.fuse_lora_state_dict(
+                lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
+            )
+            del lora_sd
+            return fused > 0
+
+    def _condition_single_reference(
+        self,
+        image_path: Path,
+        request: GenerationRequest,
+        role_override: Optional[str] = None,
+        target_w_override: Optional[int] = None,
+        target_h_override: Optional[int] = None,
+    ) -> Tuple[CachedReferenceRecord, bool]:
+        eff_role = role_override or request.input_role
+        eff_w = target_w_override if target_w_override is not None else request.width
+        eff_h = target_h_override if target_h_override is not None else request.height
+        cache_key = ReferenceVisionCache.make_key(
+            path=image_path,
+            target_w=eff_w,
+            target_h=eff_h,
+            framing_mode=request.framing_mode,
+            input_role=eff_role,
+            edit_format=request.edit_format,
+            max_vit_patches=request.max_vit_patches,
+            clamp_sigma=request.latent_clamp_sigma,
+        )
+        vae_key = ReferenceVisionCache.make_vae_key(
+            path=image_path,
+            target_w=eff_w,
+            target_h=eff_h,
+            framing_mode=request.framing_mode,
+            input_role=eff_role,
+            clamp_sigma=request.latent_clamp_sigma,
+            mtf_boost=request.mtf_boost,
+            mask_feather_radius=request.mask_feather_radius,
+        )
+
+        cached_vae_tuple: Optional[
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Any]]
+        ] = None
+        if request.use_reference_cache:
+            cached = self.ref_cache.lookup(cache_key)
+            if cached is not None:
+                return cached, True
+            cached_vae_tuple = self.ref_cache.lookup_vae(vae_key)
+
+        max_patches = (
+            min(request.max_vit_patches, 576)
+            if request.edit_format in ("ai_toolkit_isolated", "ai_toolkit_full")
+            else request.max_vit_patches
+        )
+        want_tier2_export = bool(
+            request.export_vizj_path
+            and int(request.export_vizj_tier) == VIZJ_TIER_DUAL_LATENT
+        )
+        need_vit = eff_role == "photo_ref" and (
+            request.edit_format != "moss_image_edit" or want_tier2_export
+        )
+
+        if (
+            cached_vae_tuple is not None
+            and not need_vit
+            and cached_vae_tuple[0] is not None
+        ):
+            rec = CachedReferenceRecord(
+                packed_latents=cached_vae_tuple[0],
+                vit_embeds=None,
+                vit_patches=None,
+                grid_thw=None,
+                llm_tokens=0,
+                latent_mask=cached_vae_tuple[1],
+                viz_meta=cached_vae_tuple[2],
+                source_signature=vae_key[:6],
+            )
+            if request.use_reference_cache:
+                rec = self.ref_cache.insert(cache_key, rec, vae_key=vae_key)
+            return rec, True
+
+        if self.vizinjector is not None and VizInjectorRequest is not None:
+            have_cached_vae = (
+                cached_vae_tuple is not None and cached_vae_tuple[0] is not None
+            )
+            viz_req = VizInjectorRequest(
+                target_width=eff_w,
+                target_height=eff_h,
+                max_vit_patches=max_patches,
+                framing_mode=request.framing_mode,
+                input_role=eff_role,
+                edit_format=request.edit_format,
+                emit_vae_branch=False if have_cached_vae else None,
+                emit_mask_branch=False if have_cached_vae else None,
+                emit_vit_branch=True if need_vit else None,
+                deband_8bit=request.deband_8bit,
+                prefer_vulkan=request.prefer_vulkan,
+                seed=int(request.seed or 42),
+                mtf_boost=request.mtf_boost,
+                soft_knee_tau=request.soft_knee_tau,
+                mask_feather_radius=request.mask_feather_radius,
+                latent_clamp_sigma=request.latent_clamp_sigma,
+            )
+            bundle = self.vizinjector.condition_image(image_path, viz_req)
+            if have_cached_vae:
+                packed_lat = cached_vae_tuple[0]
+                latent_mask = cached_vae_tuple[1]
+            else:
+                packed_lat = bundle.packed_latents
+                if packed_lat is None and bundle.vae_tensor is not None:
+                    raw_lat = self.vae.encode_to_packed_latents(bundle.vae_tensor)
+                    packed_lat = subphase_radial_clamp(
+                        raw_lat, max_sigma=request.latent_clamp_sigma
+                    )
+                latent_mask = bundle.latent_mask
+
+            vit_embeds = bundle.vit_embeds
+            if (
+                vit_embeds is None
+                and need_vit
+                and bundle.vit_patches is not None
+                and bundle.grid_thw is not None
+            ):
+                img_splits = self.text_encoder.get_image_features(
+                    bundle.vit_patches,
+                    bundle.grid_thw.to(
+                        device=self.text_encoder.visual.device, non_blocking=True
+                    ),
+                )
+                vit_embeds = torch.cat(img_splits, dim=0).detach()
+
+            rec = CachedReferenceRecord(
+                packed_latents=packed_lat,
+                vit_embeds=vit_embeds,
+                vit_patches=bundle.vit_patches,
+                grid_thw=bundle.grid_thw,
+                llm_tokens=int(bundle.llm_tokens) if need_vit else 0,
+                latent_mask=latent_mask,
+                viz_meta=bundle.meta,
+                source_signature=vae_key[:6],
+            )
+            was_hit = have_cached_vae
+        else:
+            if cached_vae_tuple is not None and cached_vae_tuple[0] is not None:
+                packed_lat = cached_vae_tuple[0]
+                was_hit = True
+            else:
+                img_t = load_image_tensor_16px(image_path, eff_h, eff_w)
+                raw_lat = self.vae.encode_to_packed_latents(img_t)
+                packed_lat = subphase_radial_clamp(
+                    raw_lat, max_sigma=request.latent_clamp_sigma
+                )
+                was_hit = False
+
+            vit_embeds = None
+            vit_patches = None
+            grid_thw = None
+            llm_tokens = 0
+            if need_vit:
+                vit_patches, grid_thw, llm_tokens = pack_vision_patches_32px(
+                    image_path, max_patches=max_patches
+                )
+                img_splits = self.text_encoder.get_image_features(
+                    vit_patches,
+                    grid_thw.to(
+                        device=self.text_encoder.visual.device, non_blocking=True
+                    ),
+                )
+                vit_embeds = torch.cat(img_splits, dim=0).detach()
+            rec = CachedReferenceRecord(
+                packed_latents=packed_lat,
+                vit_embeds=vit_embeds,
+                vit_patches=vit_patches,
+                grid_thw=grid_thw,
+                llm_tokens=llm_tokens,
+                latent_mask=None,
+                viz_meta=None,
+                source_signature=vae_key[:6],
+            )
+
+        if request.use_reference_cache:
+            rec = self.ref_cache.insert(cache_key, rec, vae_key=vae_key)
+        return rec, was_hit
+
+    @torch.inference_mode()
+    def encode_prompt(
+        self,
+        prompt: str,
+        max_sequence_length: int = 4096,
+        enable_thinking: bool = True,
+        device: Optional[torch.device] = None,
+        use_cache: bool = True,
+        is_negative: bool = False,
+        vision_reference_paths: Optional[Sequence[str]] = None,
+        prebuilt_vision_records: Optional[Sequence[CachedReferenceRecord]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        te_device = next(self.text_encoder.parameters()).device
+        out_device = device if device is not None else te_device
+
+        pixel_values: Optional[torch.Tensor] = None
+        image_grid_thw: Optional[torch.Tensor] = None
+        patch_counts: Optional[List[int]] = None
+        pre_vit_embeds: Optional[torch.Tensor] = None
+        vision_sig_list: List[Any] = []
+
+        if prebuilt_vision_records:
+            valid_recs = [
+                r
+                for r in prebuilt_vision_records
+                if r.llm_tokens > 0 and r.grid_thw is not None
+            ]
+            if valid_recs:
+                patch_counts = [int(r.llm_tokens) for r in valid_recs]
+                for r in valid_recs:
+                    vision_sig_list.append(
+                        (r.source_signature, int(r.llm_tokens))
+                    )
+                image_grid_thw = torch.cat(
+                    [r.grid_thw for r in valid_recs], dim=0
+                ).to(device=te_device, non_blocking=True)
+                if all(r.vit_embeds is not None for r in valid_recs):
+                    pre_vit_embeds = torch.cat(
+                        [r.vit_embeds for r in valid_recs], dim=0
+                    ).to(device=te_device, non_blocking=True)
+                elif all(r.vit_patches is not None for r in valid_recs):
+                    pixel_values = torch.cat(
+                        [r.vit_patches for r in valid_recs], dim=0
+                    ).to(device=te_device, non_blocking=True)
+        elif vision_reference_paths:
+            patch_tensors = []
+            grid_tensors = []
+            patch_counts = []
+            for p_str in vision_reference_paths:
+                p = Path(p_str)
+                if p.is_file():
+                    st = p.stat()
+                    patches, g_thw, n_llm = pack_vision_patches_32px(p)
+                    patch_tensors.append(patches)
+                    grid_tensors.append(g_thw)
+                    patch_counts.append(n_llm)
+                    vision_sig_list.append(
+                        (str(p.resolve()), int(st.st_mtime_ns), int(n_llm))
+                    )
+            if patch_tensors:
+                pixel_values = torch.cat(patch_tensors, dim=0).to(
+                    device=te_device, non_blocking=True
+                )
+                image_grid_thw = torch.cat(grid_tensors, dim=0).to(
+                    device=te_device, non_blocking=True
+                )
+
+        tok_list = self.tokenizer.encode_chat(
+            prompt=prompt,
+            enable_thinking=enable_thinking,
+            max_sequence_length=max_sequence_length,
+            image_patch_counts=patch_counts,
+        )
+        vision_signature = tuple(vision_sig_list)
+
+        if use_cache:
+            cached = self.embed_cache.lookup(
+                tok_list,
+                out_device,
+                is_negative=is_negative,
+                vision_signature=vision_signature,
+            )
+            if cached is not None:
+                mask = torch.ones(
+                    (1, cached.shape[1]), dtype=torch.bool, device=out_device
+                )
+                return cached, mask
+
+        input_ids = torch.tensor([tok_list], dtype=torch.long, device=te_device)
+        attention_mask = torch.ones_like(input_ids, device=te_device)
+
+        inputs_embeds: Optional[torch.Tensor] = None
+        if pre_vit_embeds is not None and image_grid_thw is not None:
+            base_embeds = self.text_encoder.get_input_embeddings()(input_ids)
+            image_mask = (
+                input_ids == self.text_encoder.config.image_token_id
+            ).unsqueeze(-1)
+            inputs_embeds = base_embeds.masked_scatter(
+                image_mask,
+                pre_vit_embeds.to(
+                    device=base_embeds.device,
+                    dtype=base_embeds.dtype,
+                    non_blocking=True,
+                ),
+            )
+
+        output = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        hidden = output.last_hidden_state
+
+        if use_cache:
+            self.embed_cache.insert(
+                tok_list, hidden, vision_signature=vision_signature
+            )
+
+        hidden_out = hidden.to(device=out_device, non_blocking=True)
+        mask_out = torch.ones(
+            (1, hidden_out.shape[1]), dtype=torch.bool, device=out_device
+        )
+        return hidden_out, mask_out
+
+    @staticmethod
+    def postprocess_to_pil(images: torch.Tensor) -> List[Image.Image]:
+        imgs = (images.float() * 0.5 + 0.5).clamp(0.0, 1.0)
+        imgs = (
+            imgs.permute(0, 2, 3, 1)
+            .mul(255.0)
+            .round()
+            .to(torch.uint8)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        return [Image.fromarray(arr) for arr in imgs]
+
+    @torch.inference_mode()
+    def warmup(self, height: int = 1024, width: int = 1024) -> float:
+        self._init_or_swap_components(self.repo_id, cpu_offload=False)
+        t0 = time.perf_counter()
+        exec_dev = self.device
+
+        sys.stdout.write(
+            "  [1/3] Warmup: Qwen3.5 Hybrid Gated-DeltaNet & Full-Attn Prefill...\n"
+        )
+        sys.stdout.flush()
+        dummy_ids = torch.tensor(
+            [[248045, 872, 198, 100, 248044, 198, 248045, 77091, 198]],
+            dtype=torch.long,
+            device=exec_dev,
+        )
+        dummy_out = self.text_encoder(
+            input_ids=dummy_ids,
+            attention_mask=torch.ones_like(dummy_ids, device=exec_dev),
+        )
+        self._sync_device()
+
+        sys.stdout.write(
+            f"  [2/3] Warmup: 42-Layer MOSS-DiT 4D-RoPE Velocity Field ({width}x{height})...\n"
+        )
+        sys.stdout.flush()
+        h_lat, w_lat = height // 16, width // 16
+        dummy_lat = torch.zeros(
+            (1, self.transformer.config.latent_channels, h_lat, w_lat),
+            device=exec_dev,
+            dtype=torch.float32,
+        )
+        dummy_mask = torch.ones(
+            (1, dummy_out.last_hidden_state.shape[1]),
+            device=exec_dev,
+            dtype=torch.bool,
+        )
+        _ = self.transformer(
+            dummy_lat,
+            torch.tensor([500.0], device=exec_dev),
+            dummy_out.last_hidden_state,
+            dummy_mask,
+        )
+        self.transformer.clear_caches()
+        self._sync_device()
+
+        sys.stdout.write(
+            f"  [3/3] Warmup: Flux2-VAE FP32 Unpatch & Decoder ({width}x{height})...\n"
+        )
+        sys.stdout.flush()
+        _ = self.vae.decode_packed_latents(dummy_lat)
+        self._sync_device()
+
+        del dummy_ids, dummy_out, dummy_lat, dummy_mask
+        if exec_dev.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        elapsed = time.perf_counter() - t0
+        self._warmed_up = True
+        sys.stdout.write(
+            f"  [+] MOSSImageEngine Warmup Completed in {elapsed:.2f}s.\n"
+        )
+        sys.stdout.flush()
+        return elapsed
+
+    @torch.inference_mode()
+    def synthesize(
+        self,
+        request: GenerationRequest,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    ) -> GenerationResponse:
+        request.validate()
+        target_repo = request.resolve_repo_id()
+        cpu_offload = bool(request.cpu_offload)
+        self._init_or_swap_components(target_repo, cpu_offload=cpu_offload)
+
+        if request.prepass_warmup and not self._warmed_up and not cpu_offload:
+            self.warmup(height=request.height, width=request.width)
+
+        lora_active = self._apply_or_revert_edit_lora(
+            request.edit_lora_path, request.edit_lora_scale
+        )
+
+        reporter: Optional[EngineProgressReporter] = None
+        if progress_callback is None:
+            reporter = EngineProgressReporter()
+            effective_cb = reporter
+        else:
+            effective_cb = progress_callback
+
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+        start_time = time.perf_counter()
+
+        explicit_seed = (
+            request.seed
+            if (request.seed is not None and request.seed >= 0)
+            else random.randint(100000, 99999999)
+        )
+        random.seed(explicit_seed)
+        np.random.seed(explicit_seed % (2**32))
+        torch.manual_seed(explicit_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(explicit_seed)
+
+        init_latents: Optional[torch.Tensor] = None
+        inpaint_mask_tensor: Optional[torch.Tensor] = None
+        ref_latents_list: List[torch.Tensor] = []
+        ref_records_for_prompt: List[CachedReferenceRecord] = []
+        any_ref_cache_hit = False
+        exported_vizj_str: Optional[str] = None
+
+        has_init = bool(
+            request.init_image_path and Path(request.init_image_path).is_file()
+        )
+        has_control = bool(
+            request.control_image_path and Path(request.control_image_path).is_file()
+        )
+        valid_ref_paths = [
+            Path(p) for p in request.reference_image_paths if Path(p).is_file()
+        ]
+
+        if has_init or has_control or valid_ref_paths:
+            if cpu_offload:
+                self.vae.to(self.device)
+                self.text_encoder.to(self.device)
+
+            if has_init:
+                init_p = Path(request.init_image_path)
+                init_rec, hit = self._condition_single_reference(
+                    init_p,
+                    request,
+                    role_override="photo_ref",
+                    target_w_override=request.width,
+                    target_h_override=request.height,
+                )
+                any_ref_cache_hit = any_ref_cache_hit or hit
+                init_latents = init_rec.packed_latents
+
+                if (
+                    request.inpaint_mask_path
+                    and Path(request.inpaint_mask_path).is_file()
+                ):
+                    mask_p = Path(request.inpaint_mask_path)
+                    if self.vizinjector is not None and VizInjectorRequest is not None:
+                        m_req = VizInjectorRequest(
+                            target_width=request.width,
+                            target_height=request.height,
+                            framing_mode=request.framing_mode,
+                            input_role="inpaint_mask",
+                            mask_feather_radius=request.mask_feather_radius,
+                            prefer_vulkan=request.prefer_vulkan,
+                        )
+                        m_bundle = self.vizinjector.condition_image(mask_p, m_req)
+                        if m_bundle.latent_mask is not None:
+                            inpaint_mask_tensor = m_bundle.latent_mask.to(
+                                device=self.device, non_blocking=True
+                            )
+                    if inpaint_mask_tensor is None:
+                        m_img = Image.open(mask_p).convert("L")
+                        m_img = m_img.resize(
+                            (request.width // 16, request.height // 16),
+                            resample=Image.Resampling.BILINEAR,
+                        )
+                        m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
+                        inpaint_mask_tensor = (
+                            torch.from_numpy(m_arr)
+                            .unsqueeze(0)
+                            .unsqueeze(0)
+                            .to(device=self.device, non_blocking=True)
+                        )
+                elif init_rec.latent_mask is not None:
+                    if float(torch.min(init_rec.latent_mask).item()) < 0.99:
+                        inpaint_mask_tensor = init_rec.latent_mask.to(
+                            device=self.device, non_blocking=True
+                        )
+
+            if has_control:
+                ctrl_p = Path(request.control_image_path)
+                ctrl_role = (
+                    request.input_role
+                    if request.input_role in ("color_map", "depth_map")
+                    else "color_map"
+                )
+                ctrl_rec, hit = self._condition_single_reference(
+                    ctrl_p,
+                    request,
+                    role_override=ctrl_role,
+                    target_w_override=request.width,
+                    target_h_override=request.height,
+                )
+                any_ref_cache_hit = any_ref_cache_hit or hit
+                if ctrl_rec.packed_latents is not None:
+                    ref_latents_list.append(
+                        ctrl_rec.packed_latents.to(
+                            device=self.device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        )
+                    )
+
+            for r_path in valid_ref_paths:
+                r_rec, hit = self._condition_single_reference(
+                    r_path,
+                    request,
+                    role_override=request.input_role,
+                )
+                any_ref_cache_hit = any_ref_cache_hit or hit
+                if r_rec.packed_latents is not None:
+                    ref_latents_list.append(
+                        r_rec.packed_latents.to(
+                            device=self.device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        )
+                    )
+                if (
+                    r_rec.llm_tokens > 0
+                    and request.edit_format != "moss_image_edit"
+                ):
+                    ref_records_for_prompt.append(r_rec)
+
+                if (
+                    request.export_vizj_path
+                    and self.vizinjector is not None
+                    and r_rec.viz_meta is not None
+                ):
+                    b_exp = ConditionedVisionBundle(
+                        vae_tensor=None,
+                        vit_patches=r_rec.vit_patches,
+                        grid_thw=r_rec.grid_thw,
+                        llm_tokens=int(r_rec.llm_tokens),
+                        latent_mask=r_rec.latent_mask,
+                        packed_latents=r_rec.packed_latents,
+                        vit_embeds=r_rec.vit_embeds,
+                        wire_vizj_bytes=None,
+                        meta=r_rec.viz_meta,
+                    )
+                    exp_dest = Path(request.export_vizj_path)
+                    if not exp_dest.is_absolute():
+                        exp_dest = ROOT_DIR / exp_dest
+                    self.vizinjector.save_vizj(
+                        b_exp,
+                        dest_path=exp_dest,
+                        tier=int(request.export_vizj_tier),
+                        use_bf16=True,
+                    )
+                    exported_vizj_str = str(exp_dest)
+
+            if cpu_offload:
+                self.vae.to("cpu")
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+        effective_prompt = request.compile_effective_prompt()
+        pos_hits_before = self.embed_cache.pos_hits
+        early_cfg = float(request.early_cfg)
+        late_cfg = float(request.late_cfg)
+        any_cfg = (abs(early_cfg - 1.0) > 1e-5) or (abs(late_cfg - 1.0) > 1e-5)
+        ctx_total = 2 if any_cfg else 1
+
+        if cpu_offload:
+            self.text_encoder.to(self.device)
+
+        if reporter is not None:
+            reporter.start_stage("context", ctx_total)
+
+        pos_embeds, pos_mask = self.encode_prompt(
+            effective_prompt,
+            max_sequence_length=request.max_sequence_length,
+            enable_thinking=request.enable_thinking,
+            device=self.device,
+            is_negative=False,
+            prebuilt_vision_records=ref_records_for_prompt,
+        )
+        cache_hit = self.embed_cache.pos_hits > pos_hits_before
+        common_prefix_len = self.embed_cache.last_common_prefix_len
+        self._sync_device()
+        effective_cb("context", 1, ctx_total)
+
+        neg_embeds, neg_mask = None, None
+        if any_cfg:
+            neg_embeds, neg_mask = self.encode_prompt(
+                request.negative_prompt or "",
+                max_sequence_length=request.max_sequence_length,
+                enable_thinking=request.enable_thinking,
+                device=self.device,
+                is_negative=True,
+            )
+            self._sync_device()
+            effective_cb("context", 2, ctx_total)
+
+        del ref_records_for_prompt
+
+        if cpu_offload:
+            self.text_encoder.to("cpu")
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        if cpu_offload:
+            self.transformer.to(self.device)
+
+        depth = len(self.transformer.layers)
+        uncond_skip_set = validate_skip_layers(
+            request.uncond_skip_layers, depth, "uncond_skip_layers"
+        )
+        slg_skip_set = validate_skip_layers(request.slg_layers, depth, "slg_layers")
+
+        num_imgs = request.num_images_per_prompt
+        if num_imgs == 1:
+            positive = pos_embeds
+            positive_mask = pos_mask
+            negative = neg_embeds
+            negative_mask = neg_mask
+        else:
+            positive = pos_embeds.repeat_interleave(num_imgs, dim=0)
+            positive_mask = pos_mask.repeat_interleave(num_imgs, dim=0)
+            negative = (
+                neg_embeds.repeat_interleave(num_imgs, dim=0)
+                if neg_embeds is not None
+                else None
+            )
+            negative_mask = (
+                neg_mask.repeat_interleave(num_imgs, dim=0)
+                if neg_mask is not None
+                else None
+            )
+        del pos_embeds, pos_mask, neg_embeds, neg_mask
+
+        shape = (
+            num_imgs,
+            self.transformer.config.latent_channels,
+            request.height // 16,
+            request.width // 16,
+        )
+        k_init, k_sde, _ = derive_stage_keys(explicit_seed)
+        noise = philox_randn(
+            shape=shape,
+            seed=k_init,
+            stream_id=0x01,
+            offset=0,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        clean_init_latents: Optional[torch.Tensor] = None
+        if init_latents is not None:
+            clean_init_latents = init_latents.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
+            if clean_init_latents.shape[-2:] != shape[-2:]:
+                clean_init_latents = F.interpolate(
+                    clean_init_latents,
+                    size=shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        del init_latents
+
+        if (
+            inpaint_mask_tensor is not None
+            and inpaint_mask_tensor.shape[-2:] != shape[-2:]
+        ):
+            inpaint_mask_tensor = F.interpolate(
+                inpaint_mask_tensor.float(),
+                size=shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        start_step = 0
+        if clean_init_latents is not None and 0.0 < request.denoise_strength < 1.0:
+            start_step = max(
+                0,
+                min(
+                    request.num_inference_steps - 1,
+                    int(
+                        round(
+                            request.num_inference_steps
+                            * (1.0 - request.denoise_strength)
+                        )
+                    ),
+                ),
+            )
+
+        use_bifurcated = (
+            request.early_solver != "euler"
+            or request.late_solver != "euler"
+            or abs(early_cfg - late_cfg) > 1e-5
+            or request.eta > 0.0
+            or not request.use_v2_grid
+            or start_step > 0
+        )
+
+        if use_bifurcated:
+            active_scheduler: Union[MOSSImageScheduler, BifurcatedFlowMatchScheduler] = (
+                BifurcatedFlowMatchScheduler(
+                    early_solver=request.early_solver,
+                    late_solver=request.late_solver,
+                    handoff_threshold=request.handoff_threshold,
+                    shift=request.shift,
+                    eta=request.eta,
+                    s_noise=request.s_noise,
+                    use_v2_grid=request.use_v2_grid,
+                )
+            )
+            active_scheduler.set_timesteps(
+                num_inference_steps=request.num_inference_steps,
+                device=self.device,
+                start_step=start_step,
+            )
+        else:
+            active_scheduler = MOSSImageScheduler(shift=request.shift)
+            active_scheduler.set_timesteps(
+                num_inference_steps=request.num_inference_steps,
+                device=self.device,
+            )
+
+        if clean_init_latents is not None and start_step > 0:
+            sigma_0 = float(active_scheduler.sigmas[0].item())
+            latents = (1.0 - sigma_0) * clean_init_latents + sigma_0 * noise
+        else:
+            latents = noise
+
+        sde_gen = torch.Generator(device=self.device).manual_seed(k_sde & _MASK63)
+        timesteps = active_scheduler.timesteps
+        num_passes = len(timesteps)
+        total_nfe = 0
+        active_ref_latents = ref_latents_list if ref_latents_list else None
+        ref_zero_t = request.effective_reference_zero_timestep
+        ref_iso_kv = request.effective_reference_isolated_kv
+
+        use_cuda_events = self.device.type == "cuda" and torch.cuda.is_available()
+        step_events = (
+            [torch.cuda.Event(), torch.cuda.Event()] if use_cuda_events else []
+        )
+
+        if reporter is not None:
+            reporter.start_stage("dit", num_passes)
+        dit_t0 = time.perf_counter()
+
+        prediction: Optional[torch.Tensor] = None
+        conditional: Optional[torch.Tensor] = None
+        uncond: Optional[torch.Tensor] = None
+        skipped: Optional[torch.Tensor] = None
+
+        for pass_index, timestep in enumerate(timesteps):
+            if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
+                is_early = active_scheduler.current_is_early
+                step_frac = active_scheduler.current_progress
+            else:
+                is_early = True
+                step_frac = pass_index / float(max(1, num_passes))
+
+            current_cfg = early_cfg if is_early else late_cfg
+            do_step_cfg = abs(current_cfg - 1.0) > 1e-5
+            skip_active = request.slg_start <= step_frac < request.slg_stop
+
+            prediction = self.transformer(
+                latents,
+                timestep,
+                positive,
+                positive_mask,
+                reference_latents=active_ref_latents,
+                reference_zero_timestep=ref_zero_t,
+                reference_isolated_kv=ref_iso_kv,
+            ).sample.float()
+            conditional = prediction
+            total_nfe += 1
+
+            if do_step_cfg and negative is not None:
+                skip_kwargs = (
+                    {"skip_layers": uncond_skip_set}
+                    if (uncond_skip_set and skip_active)
+                    else {}
+                )
+                uncond = self.transformer(
+                    latents,
+                    timestep,
+                    negative,
+                    negative_mask,
+                    reference_latents=active_ref_latents,
+                    reference_zero_timestep=ref_zero_t,
+                    reference_isolated_kv=ref_iso_kv,
+                    **skip_kwargs,
+                ).sample.float()
+                prediction = uncond + current_cfg * (prediction - uncond)
+                total_nfe += 1
+
+            if slg_skip_set and request.slg_scale > 0.0 and skip_active:
+                skipped = self.transformer(
+                    latents,
+                    timestep,
+                    positive,
+                    positive_mask,
+                    skip_layers=slg_skip_set,
+                    reference_latents=active_ref_latents,
+                    reference_zero_timestep=ref_zero_t,
+                    reference_isolated_kv=ref_iso_kv,
+                ).sample.float()
+                if not do_step_cfg:
+                    prediction = skipped
+                prediction = prediction + request.slg_scale * (conditional - skipped)
+                total_nfe += 1
+
+            latents = active_scheduler.step(
+                prediction, timestep, latents, generator=sde_gen, return_dict=False
+            )
+
+            if inpaint_mask_tensor is not None and clean_init_latents is not None:
+                next_sigma = (
+                    float(
+                        active_scheduler.sigmas[
+                            min(pass_index + 1, len(active_scheduler.sigmas) - 1)
+                        ].item()
+                    )
+                    if not isinstance(active_scheduler, BifurcatedFlowMatchScheduler)
+                    else float(
+                        active_scheduler._step_configs[
+                            min(pass_index, num_passes - 1)
+                        ]["s_next"]
+                    )
+                )
+                noised_bg = (1.0 - next_sigma) * clean_init_latents + next_sigma * noise
+                latents = (
+                    inpaint_mask_tensor * latents
+                    + (1.0 - inpaint_mask_tensor) * noised_bg
+                )
+
+            if use_cuda_events:
+                curr_ev = step_events[pass_index & 1]
+                curr_ev.record()
+                if pass_index > 0:
+                    step_events[(pass_index - 1) & 1].synchronize()
+                    effective_cb("dit", pass_index, num_passes)
+                if pass_index == num_passes - 1:
+                    curr_ev.synchronize()
+                    effective_cb("dit", num_passes, num_passes)
+            else:
+                effective_cb("dit", pass_index + 1, num_passes)
+
+        dit_elapsed = time.perf_counter() - dit_t0
+
+        self.transformer.clear_transient_caches()
+        del (
+            positive,
+            positive_mask,
+            negative,
+            negative_mask,
+            active_ref_latents,
+            ref_latents_list,
+            prediction,
+            conditional,
+            uncond,
+            skipped,
+            clean_init_latents,
+            inpaint_mask_tensor,
+            noise,
+        )
+
+        if cpu_offload:
+            self.transformer.to("cpu")
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+            self.vae.to(self.device)
+
+        if reporter is not None:
+            reporter.start_stage("vae", num_imgs)
+
+        decoded_tensor = self.vae.decode_packed_latents(latents)
+        del latents
+        self._sync_device()
+
+        if self.vizinjector is not None:
+            pil_images, viz_telems = self.vizinjector.postprocess_to_pil(
+                decoded_tensor, apply_bayer_dither=request.apply_bayer_dither
+            )
+            mean_luma = viz_telems[0].mean_luminance
+            rms_contrast = viz_telems[0].rms_contrast
+            entropy = viz_telems[0].shannon_entropy_bits
+            sharpness = viz_telems[0].laplacian_sharpness
+        else:
+            pil_images = self.postprocess_to_pil(decoded_tensor)
+            mean_luma, rms_contrast, entropy, sharpness = compute_image_telemetry(
+                pil_images[0]
+            )
+        del decoded_tensor
+        effective_cb("vae", len(pil_images), len(pil_images))
+
+        if cpu_offload:
+            self.vae.to("cpu")
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        if reporter is not None:
+            reporter.close()
+
+        elapsed = time.perf_counter() - start_time
+        peak_vram_gb = 0.0
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            peak_vram_gb = torch.cuda.max_memory_allocated(self.device) / (1024**3)
+
+        out_path = Path(request.output_path)
+        if not out_path.is_absolute():
+            out_path = ROOT_DIR / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pil_images[0].save(str(out_path))
+
+        extra_paths: List[str] = []
+        for idx, extra_img in enumerate(pil_images[1:], start=2):
+            ep = out_path.with_name(f"{out_path.stem}_{idx}{out_path.suffix}")
+            extra_img.save(str(ep))
+            extra_paths.append(str(ep))
+
+        if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
+            early_steps = active_scheduler._early_steps
+            late_steps = active_scheduler._late_steps
+        else:
+            early_steps = len(active_scheduler.timesteps)
+            late_steps = 0
+
+        step_ms = (dit_elapsed * 1000.0) / float(max(1, early_steps + late_steps))
+
+        return GenerationResponse(
+            output_path=str(out_path),
+            additional_paths=extra_paths,
+            exported_vizj_path=exported_vizj_str,
+            model_variant_used=request.model_variant,
+            repo_id_used=target_repo,
+            width=request.width,
+            height=request.height,
+            seed_used=explicit_seed,
+            generation_time_seconds=elapsed,
+            step_latency_ms=step_ms,
+            peak_vram_gb=peak_vram_gb,
+            cpu_offload_active=cpu_offload,
+            num_inference_steps_used=request.num_inference_steps,
+            total_nfe=total_nfe,
+            shift_used=request.shift,
+            use_v2_grid_used=request.use_v2_grid,
+            early_solver_used=request.early_solver,
+            late_solver_used=request.late_solver,
+            handoff_threshold_used=request.handoff_threshold,
+            early_steps=early_steps,
+            late_steps=late_steps,
+            early_cfg_used=early_cfg,
+            late_cfg_used=late_cfg,
+            uncond_skip_layers_used=list(request.uncond_skip_layers or []),
+            slg_layers_used=list(request.slg_layers or []),
+            slg_scale_used=request.slg_scale,
+            eta_used=request.eta,
+            s_noise_used=request.s_noise,
+            enable_thinking_used=request.enable_thinking,
+            viztoken_active=True,
+            tiktalkin_active=True,
+            vizinjector_active=self.vizinjector_active,
+            vizinjector_backend=self.vizinjector_backend_name,
+            prompt_cache_hit=cache_hit,
+            reference_cache_hit=any_ref_cache_hit,
+            common_prefix_tokens=common_prefix_len,
+            edit_format_used=request.edit_format,
+            framing_mode_used=request.framing_mode,
+            input_role_used=request.input_role,
+            reference_zero_timestep_used=ref_zero_t,
+            reference_isolated_kv_used=ref_iso_kv,
+            edit_lora_active=lora_active,
+            effective_prompt=effective_prompt,
+            mean_luminance=mean_luma,
+            rms_contrast=rms_contrast,
+            shannon_entropy_bits=entropy,
+            laplacian_sharpness=sharpness,
+        )
