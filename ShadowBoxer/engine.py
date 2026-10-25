@@ -356,8 +356,7 @@ class WDDMMemoryGuard:
     def recalibrate_baseline(self) -> None:
         if self.active:
             _, shr_used = self._read_pdh_counters()
-            if self.shared_baseline_gb <= 0.0 or shr_used < self.shared_baseline_gb:
-                self.shared_baseline_gb = shr_used
+            self.shared_baseline_gb = shr_used
 
     def poll(self) -> WDDMMemorySnapshot:
         pt_alloc_bytes = 0
@@ -374,7 +373,7 @@ class WDDMMemoryGuard:
             ded_used, shr_used = self._read_pdh_counters()
             ded_avail = max(0.0, self.dedicated_total_gb - ded_used)
             shr_delta = max(0.0, shr_used - self.shared_baseline_gb)
-            is_spilling = shr_delta > 0.05 or ded_avail < 1.25
+            is_spilling = shr_delta > 0.25 or ded_avail < 1.25
             return WDDMMemorySnapshot(
                 dedicated_total_gb=self.dedicated_total_gb,
                 dedicated_used_gb=ded_used,
@@ -552,7 +551,7 @@ def build_box_aperture_mask(
         ly1 = uy1 * h_lat
         lx0 = ux0 * w_lat
         lx1 = ux1 * w_lat
-        dy = torch.maximum(torch.maximum(ly0 - yy, yy - ly1), torch.zeros_like(yy))
+        dy = torch.maximum(torch.maximum(ly0 - yy, yy - lx0 * 0.0 - ly1), torch.zeros_like(yy))
         dx = torch.maximum(torch.maximum(lx0 - xx, xx - lx1), torch.zeros_like(xx))
         dist = torch.sqrt(dy * dy + dx * dx)
         box_m = 0.5 * (1.0 + torch.cos(math.pi * (dist / feather).clamp(0.0, 1.0)))
@@ -762,59 +761,76 @@ class BifurcatedFlowMatchScheduler:
         if self._step_index is None or not self._step_configs:
             return 0.0
         cfg = self._step_configs[min(self._step_index, len(self._step_configs) - 1)]
-        total_intervals = max(1, self._early_steps + self._late_steps)
-        return float(cfg["interval_idx"]) / float(total_intervals)
+        return float(max(0.0, min(1.0, 1.0 - float(cfg["s_curr"]))))
 
     @staticmethod
+    def _lagrange_ab_weights_for_order(
+        h_n: float,
+        nodes: Sequence[float],
+        m: int,
+    ) -> Tuple[float, float, float, float]:
+        if m <= 1:
+            return (h_n, 0.0, 0.0, 0.0)
+        active_nodes = nodes[:m]
+        for a in range(m):
+            for b in range(a + 1, m):
+                if abs(active_nodes[a] - active_nodes[b]) < 1e-12:
+                    return (h_n, 0.0, 0.0, 0.0)
+
+        def _eval_basis(k: int, x: float) -> float:
+            xk = active_nodes[k]
+            num = 1.0
+            den = 1.0
+            for j in range(m):
+                if j != k:
+                    xj = active_nodes[j]
+                    num *= x - xj
+                    den *= xk - xj
+            return num / den
+
+        mid = 0.5 * h_n
+        scale = h_n / 6.0
+        w = [0.0, 0.0, 0.0, 0.0]
+        for k in range(m):
+            f0 = 1.0 if k == 0 else 0.0
+            f_mid = _eval_basis(k, mid)
+            f_end = _eval_basis(k, h_n)
+            w[k] = scale * (f0 + 4.0 * f_mid + f_end)
+        return (w[0], w[1], w[2], w[3])
+
+    @classmethod
     def _compute_ab_weights(
+        cls,
         h_n: float,
         h_n_1: float,
         h_n_2: float,
         h_n_3: float,
         order: int,
     ) -> Tuple[float, float, float, float]:
-        if order <= 1 or abs(h_n_1) < 1e-12:
+        if order <= 1 or abs(h_n) < 1e-12 or abs(h_n_1) < 1e-12:
             return (h_n, 0.0, 0.0, 0.0)
-        r1 = h_n / h_n_1
-        if order == 2 or abs(h_n_2) < 1e-12:
-            c0 = (2.0 + r1) / 2.0
-            c1 = -r1 / 2.0
-            return (h_n * c0, h_n * c1, 0.0, 0.0)
-        temp = (
-            1.0
-            - (h_n / (3.0 * (h_n + h_n_1)))
-            * ((h_n * (h_n + h_n_1)) / (h_n_1 * (h_n_1 + h_n_2)))
-        ) / 2.0
-        c0 = (2.0 + r1) / 2.0 + temp
-        c1 = -r1 / 2.0 - (1.0 + h_n_1 / h_n_2) * temp
-        c2 = temp * (h_n_1 / h_n_2)
-        if order == 3 or abs(h_n_3) < 1e-12:
-            return (h_n * c0, h_n * c1, h_n * c2, 0.0)
-        temp2 = (
-            (1.0 - h_n / (3.0 * (h_n + h_n_1))) / 2.0
-            + (1.0 - h_n / (2.0 * (h_n + h_n_1)))
-            * h_n
-            / (6.0 * (h_n + h_n_1 + h_n_2))
-        ) * (
-            (h_n * (h_n + h_n_1) * (h_n + h_n_1 + h_n_2))
-            / (h_n_1 * (h_n_1 + h_n_2) * (h_n_1 + h_n_2 + h_n_3))
-        )
-        c0_4 = c0 + temp2
-        c1_4 = c1 - (
-            1.0
-            + (h_n_1 / h_n_2)
-            + (h_n_1 * (h_n_1 + h_n_2)) / (h_n_2 * (h_n_2 + h_n_3))
-        ) * temp2
-        c2_4 = c2 + (
-            (h_n_1 / h_n_2)
-            + (h_n_1 * (h_n_1 + h_n_2)) / (h_n_2 * (h_n_2 + h_n_3))
-        ) * (1.0 + h_n_2 / h_n_3) * temp2
-        c3_4 = (
-            -temp2
-            * ((h_n_1 * (h_n_1 + h_n_2)) / (h_n_2 * (h_n_2 + h_n_3)))
-            * (h_n_1 / h_n_2)
-        )
-        return (h_n * c0_4, h_n * c1_4, h_n * c2_4, h_n * c3_4)
+
+        max_m = min(int(order), 4)
+        if max_m >= 2 and abs(h_n_1) < 1e-12:
+            max_m = 1
+        if max_m >= 3 and abs(h_n_2) < 1e-12:
+            max_m = 2
+        if max_m >= 4 and abs(h_n_3) < 1e-12:
+            max_m = 3
+
+        x0 = 0.0
+        x1 = -h_n_1
+        x2 = -(h_n_1 + h_n_2)
+        x3 = -(h_n_1 + h_n_2 + h_n_3)
+        nodes = (x0, x1, x2, x3)
+
+        abs_h = abs(h_n)
+        for m in range(max_m, 1, -1):
+            cand = cls._lagrange_ab_weights_for_order(h_n, nodes, m)
+            l1_sum = abs(cand[0]) + abs(cand[1]) + abs(cand[2]) + abs(cand[3])
+            if l1_sum <= 2.15 * abs_h + 1e-12:
+                return cand
+        return (h_n, 0.0, 0.0, 0.0)
 
     def set_timesteps(
         self,
@@ -860,11 +876,10 @@ class BifurcatedFlowMatchScheduler:
         elif self.handoff_threshold <= 0.0:
             k_star = 0
         else:
-            denom = float(max(1, active_steps))
             cand = [
                 i
                 for i in range(active_steps)
-                if (float(i) / denom) >= self.handoff_threshold - 1e-9
+                if (1.0 - float(base_sigmas_np[i])) >= self.handoff_threshold - 1e-7
             ]
             k_star = cand[0] if cand else active_steps
 
@@ -983,7 +998,11 @@ class BifurcatedFlowMatchScheduler:
             min(1.0, (self.handoff_threshold - progress) / self.handoff_threshold),
         )
         dt_val = abs(s_next - s_curr)
-        renoise = self.eta * math.sqrt(max(dt_val, 1e-8)) * envelope * self.s_noise
+        max_rho = 0.5 * s_next
+        renoise = min(
+            max_rho,
+            self.eta * s_next * math.sqrt(max(dt_val, 1e-8)) * envelope * self.s_noise,
+        )
         if renoise <= 0.0:
             return torch.zeros_like(ref_tensor)
 
@@ -1000,10 +1019,11 @@ class BifurcatedFlowMatchScheduler:
                 ref_tensor.shape, device=ref_tensor.device, dtype=torch.float32
             )
 
-        denom = max(s_curr, 1e-3)
-        score = -(ref_tensor - (1.0 - s_curr) * v_tot) / denom
-        drift_comp = 0.5 * (renoise**2) * score
-        return drift_comp + (noise * renoise)
+        eps_hat = ref_tensor + (1.0 - s_curr) * v_tot
+        attenuation = (
+            math.sqrt(max(0.0, s_next * s_next - renoise * renoise)) - s_next
+        )
+        return (attenuation * eps_hat) + (noise * renoise)
 
     def step(
         self,
@@ -2896,7 +2916,9 @@ class MOSSImageEngine:
                 step_frac = active_scheduler.current_progress
             else:
                 is_early = True
-                step_frac = pass_index / float(max(1, num_passes))
+                step_frac = 1.0 - float(
+                    active_scheduler.sigmas[min(pass_index, num_passes - 1)].item()
+                )
 
             current_cfg = early_cfg if is_early else late_cfg
             do_step_cfg = abs(current_cfg - 1.0) > 1e-5

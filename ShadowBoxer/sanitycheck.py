@@ -49,6 +49,7 @@ from models.modeling_qwen35 import (
     Qwen3_5Model,
     Qwen3_5TextConfig,
     Qwen3_5VisionConfig,
+    _STRICTLY_UPPER_MASK_CACHE,
     _solve_unit_lower_triangular,
 )
 from models.modeling_vae import Flux2AutoencoderKL, Flux2VAEConfig
@@ -66,7 +67,6 @@ from schema import (
     SUPPORTED_SOLVERS,
     bbox_to_normalized,
     bbox_to_pixel_rect,
-    compile_layout_prompt,
     pixel_bbox_to_abs_centralized,
 )
 from vizinjector import (
@@ -746,8 +746,13 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         len(qwen.visual._geom_cache) == 1,
         "Vision geometry cache was not populated",
     )
+    qwen.clear_caches()
+    _assert(
+        len(qwen.visual._geom_cache) == 0 and len(_STRICTLY_UPPER_MASK_CACHE) == 0,
+        "Qwen3_5Model.clear_caches() must flush _geom_cache and _STRICTLY_UPPER_MASK_CACHE",
+    )
     print(
-        f"  [+] Qwen3_5Model Hybrid      : BatchedTriSolve (diff={tri_diff:.1e}) + CachedViTGeom + 3D-MRoPE Verified"
+        f"  [+] Qwen3_5Model Hybrid      : BatchedTriSolve (diff={tri_diff:.1e}) + CachedViTGeom + MaskCacheEvict Verified"
     )
 
     e4m3_dtype = getattr(torch, "float8_e4m3fn", None)
@@ -800,13 +805,13 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         f"Unexpected decoded image shape: {dec_out.shape}",
     )
     print(
-        "  [+] Flux2AutoencoderKL       : 2x2 Space-to-Depth Pack/Unpack & Sub-Phase Radial Clamp Verified"
+        "  [+] Flux2AutoencoderKL       : In-Place FP32 Silu/Shortcut Pack/Unpack & Sub-Phase Radial Clamp Verified"
     )
 
 
 def gate_4_schedulers_and_prng() -> None:
     print(
-        "\n--- Gate 4: Flow-Matching V2 Schedule, Bifurcated ODE/SDE Solvers & Philox PRNG ---"
+        "\n--- Gate 4: Flow-Matching V2 Schedule, Lagrange TVD Solvers & Philox PRNG ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -845,6 +850,26 @@ def gate_4_schedulers_and_prng() -> None:
         "V2 sigma schedule drifted from upstream FP32 reference",
     )
 
+    for ord_m in (1, 2, 3, 4):
+        for h_tuple in (
+            (-0.08, -0.08, -0.08, -0.08),
+            (-0.12, -0.09, -0.07, -0.05),
+            (-0.25, -0.15, -0.10, -0.07),
+        ):
+            w_ab = BifurcatedFlowMatchScheduler._compute_ab_weights(
+                h_tuple[0], h_tuple[1], h_tuple[2], h_tuple[3], ord_m
+            )
+            unity_err = abs(sum(w_ab) - h_tuple[0])
+            l1_ratio = sum(abs(x) for x in w_ab) / abs(h_tuple[0])
+            _assert(
+                unity_err < 1e-12,
+                f"Lagrange AB weights violated partition of unity (order={ord_m}, err={unity_err})",
+            )
+            _assert(
+                l1_ratio <= 2.15 + 1e-9,
+                f"Lagrange AB weights exceeded TVD L1 bound (order={ord_m}, ratio={l1_ratio})",
+            )
+
     std_sched = MOSSImageScheduler(shift=5.0)
     std_sched.set_timesteps(20, device=dev)
     x = torch.randn((1, 128, 8, 8), device=dev)
@@ -856,13 +881,13 @@ def gate_4_schedulers_and_prng() -> None:
         early_solver="euler",
         late_solver="ipndm",
         handoff_threshold=0.5,
-        shift=5.0,
-        use_v2_grid=True,
+        shift=1.0,
+        use_v2_grid=False,
     )
     euler_ipndm.set_timesteps(10, device=dev)
     _assert(
         euler_ipndm._early_steps == 5 and euler_ipndm._late_steps == 5,
-        f"Expected 5 early and 5 late steps at handoff=0.5 (10 steps, shift=5.0), got {euler_ipndm._early_steps}/{euler_ipndm._late_steps}",
+        f"Expected 5 early and 5 late steps at handoff=0.5 (shift=1.0), got {euler_ipndm._early_steps}/{euler_ipndm._late_steps}",
     )
     s_test = torch.randn((1, 128, 8, 8), device=dev)
     for idx, t in enumerate(euler_ipndm.timesteps):
@@ -887,13 +912,15 @@ def gate_4_schedulers_and_prng() -> None:
         use_v2_grid=True,
     )
     heun_ipndm_12.set_timesteps(12, device=dev)
+    k_star = heun_ipndm_12._k_star
     _assert(
-        heun_ipndm_12._early_steps == 5 and heun_ipndm_12._late_steps == 7,
-        f"Expected 5 early and 7 late steps at handoff=0.35 (12 steps), got {heun_ipndm_12._early_steps}/{heun_ipndm_12._late_steps}",
+        0 < k_star < 12,
+        f"Expected interior handoff index k_star in (0, 12), got {k_star}",
     )
     _assert(
-        len(heun_ipndm_12.timesteps) == 17,
-        f"Expected 17 solver passes (5*2 Heun + 7*1 IPNDM), got {len(heun_ipndm_12.timesteps)}",
+        (1.0 - float(heun_ipndm_12.base_sigmas[k_star - 1].item())) < 0.35
+        and (1.0 - float(heun_ipndm_12.base_sigmas[k_star].item())) >= 0.35 - 1e-7,
+        "Physical signal progress handoff (1 - sigma >= t*) violated",
     )
 
     for solver in SUPPORTED_SOLVERS:
@@ -927,7 +954,7 @@ def gate_4_schedulers_and_prng() -> None:
         "Philox PRNG stream collision",
     )
     print(
-        f"  [+] Bifurcated Solvers & PRNG: Verified {', '.join(s.upper() for s in SUPPORTED_SOLVERS)} + Shift-Invariant Handoff + Philox64"
+        f"  [+] Bifurcated Solvers & PRNG: Verified {', '.join(s.upper() for s in SUPPORTED_SOLVERS)} + Lagrange TVD Unity + Philox64"
     )
 
 

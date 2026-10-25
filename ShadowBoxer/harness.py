@@ -32,13 +32,25 @@ from schema import (
 )
 
 DEFAULT_CONFIG_PATH = ROOT_DIR / "default.json"
-TEST_INPUTS_DIR = ROOT_DIR / "artifacts" / "test_inputs"
-PERMUTATIONS_OUT_DIR = ROOT_DIR / "artifacts" / "permutations"
+ARTIFACTS_DIR = ROOT_DIR / "artifacts"
+TEST_INPUTS_DIR = ARTIFACTS_DIR / "test_inputs"
+PERMUTATIONS_OUT_DIR = ARTIFACTS_DIR / "permutations"
+SWEEPS_DIR = ARTIFACTS_DIR / "sweeps"
+
+BASELINE_DEFAULTS: Dict[str, Any] = dict(
+    getattr(schema, "BASELINE_ENGINE_DEFAULTS", {})
+)
 
 DEFAULT_POSITIVE_PROMPT = (
     "A wide view of a sleek brushed-steel refrigerator beside a warm walnut kitchen counter "
     "with a ceramic bowl of fresh citrus fruit. A small yellow sticky note on the refrigerator "
     'door is handwritten in crisp black marker: "Remember to test SFT & Base permutations @ 1024x1024"'
+)
+
+DEFAULT_LAYOUT_SUMMARY = (
+    "A wide view of a sleek brushed-steel refrigerator beside a warm walnut "
+    "kitchen counter with a ceramic bowl of fresh citrus fruit and a handwritten "
+    "yellow sticky note on the door."
 )
 
 DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = getattr(
@@ -52,19 +64,28 @@ DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = getattr(
                 "category": "refrigerator",
                 "caption": "A sleek brushed-steel refrigerator door with a small yellow sticky note",
                 "bbox": [32, 48, 992, 592],
+                "enabled": True,
             },
             {
                 "category": "text",
                 "text": "Remember to test SFT & Base permutations @ 1024x1024",
                 "bbox": [288, 144, 544, 480],
+                "enabled": True,
             },
             {
                 "category": "bowl",
                 "caption": "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
                 "bbox": [592, 608, 976, 976],
+                "enabled": True,
             },
         ],
     ),
+)
+
+SUPPORTED_PROMPT_MODES: Tuple[str, ...] = getattr(
+    schema,
+    "SUPPORTED_PROMPT_MODES",
+    ("natural", "layout_json"),
 )
 
 SUPPORTED_EDIT_FORMATS: Tuple[str, ...] = getattr(
@@ -79,10 +100,12 @@ SUPPORTED_EDIT_FORMATS: Tuple[str, ...] = getattr(
     ),
 )
 
-SUPPORTED_FRAMING_MODES: Tuple[str, ...] = getattr(
-    schema,
-    "SUPPORTED_FRAMING_MODES",
-    ("inscribed", "cover_crop", "never_crop"),
+SUPPORTED_FRAMING_MODES: Tuple[str, ...] = (
+    "inscribed",
+    "cover_crop",
+    "contain",
+    "stretch",
+    "never_crop",
 )
 
 SUPPORTED_INPUT_ROLES: Tuple[str, ...] = getattr(
@@ -147,41 +170,56 @@ def _graceful_exit(engine: Optional[MOSSImageEngine], code: int = 0) -> None:
 
 
 def build_default_request() -> GenerationRequest:
-    kwargs = _normalize_request_kwargs(
-        {
-            "prompt": DEFAULT_POSITIVE_PROMPT,
-            "negative_prompt": "",
-            "model_variant": "sft",
-            "prompt_mode": "natural",
-            "layout_items": [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
-            "layout_coords_are_pixels": True,
-            "enable_thinking": True,
-            "width": 1024,
-            "height": 1024,
-            "num_inference_steps": 50,
-            "shift": 5.0,
-            "use_v2_grid": True,
-            "early_solver": "euler",
-            "late_solver": "euler",
-            "handoff_threshold": 0.35,
-            "early_cfg": 3.0,
-            "late_cfg": 3.0,
-            "uncond_skip_layers": [24],
-            "slg_layers": [],
-            "slg_scale": 0.0,
-            "slg_start": 0.05,
-            "slg_stop": 0.60,
-            "eta": 0.0,
-            "s_noise": 1.0,
-            "seed": 42,
-            "output_path": "output_moss_master.png",
-            "cpu_offload": False,
-            "prefer_vulkan": True,
-            "use_reference_cache": True,
-            "prepass_warmup": True,
-        }
-    )
-    return GenerationRequest(**kwargs)
+    d = BASELINE_DEFAULTS
+    raw_kwargs: Dict[str, Any] = {
+        "prompt": str(d.get("prompt", DEFAULT_POSITIVE_PROMPT)),
+        "negative_prompt": str(d.get("negative_prompt", "")),
+        "model_variant": str(d.get("model_variant", "sft")),
+        "prompt_mode": str(d.get("prompt_mode", "natural")),
+        "layout_summary": str(d.get("layout_summary", DEFAULT_LAYOUT_SUMMARY)),
+        "layout_items": [dict(b) for b in d.get("layout_items", DEFAULT_LAYOUT_ITEMS)],
+        "layout_coords_are_pixels": bool(d.get("layout_coords_are_pixels", True)),
+        "enable_thinking": bool(d.get("enable_thinking", True)),
+        "width": int(d.get("width", 1024)),
+        "height": int(d.get("height", 1024)),
+        "num_inference_steps": int(d.get("num_inference_steps", 50)),
+        "shift": float(d.get("shift", 5.0)),
+        "use_v2_grid": bool(d.get("use_v2_grid", True)),
+        "early_solver": str(d.get("early_solver", "euler")),
+        "late_solver": str(d.get("late_solver", "euler")),
+        "handoff_threshold": float(d.get("handoff_threshold", 0.35)),
+        "early_cfg": float(d.get("early_cfg", 3.0)),
+        "late_cfg": float(d.get("late_cfg", 3.0)),
+        "uncond_skip_layers": list(d.get("uncond_skip_layers", [24])),
+        "slg_layers": list(d.get("slg_layers", [])),
+        "slg_scale": float(d.get("slg_scale", 0.0)),
+        "slg_start": float(d.get("slg_start", 0.05)),
+        "slg_stop": float(d.get("slg_stop", 0.60)),
+        "eta": float(d.get("eta", 0.0)),
+        "s_noise": float(d.get("s_noise", 1.0)),
+        "seed": int(d.get("seed", 42)),
+        "num_images_per_prompt": int(d.get("num_images_per_prompt", 1)),
+        "max_sequence_length": int(d.get("max_sequence_length", 4096)),
+        "output_path": str(d.get("output_path", "output_moss_master.png")),
+        "cpu_offload": bool(d.get("cpu_offload", False)),
+        "prepass_warmup": bool(d.get("prepass_warmup", True)),
+        "denoise_strength": float(d.get("denoise_strength", 1.0)),
+        "edit_format": str(d.get("edit_format", "standard")),
+        "framing_mode": str(d.get("framing_mode", "inscribed")),
+        "input_role": str(d.get("input_role", "photo_ref")),
+        "max_vit_patches": int(d.get("max_vit_patches", 2304)),
+        "deband_8bit": bool(d.get("deband_8bit", True)),
+        "prefer_vulkan": bool(d.get("prefer_vulkan", True)),
+        "mtf_boost": float(d.get("mtf_boost", 0.08)),
+        "soft_knee_tau": float(d.get("soft_knee_tau", 0.015)),
+        "mask_feather_radius": float(d.get("mask_feather_radius", 1.25)),
+        "latent_clamp_sigma": float(d.get("latent_clamp_sigma", 4.5)),
+        "apply_bayer_dither": bool(d.get("apply_bayer_dither", True)),
+        "use_reference_cache": bool(d.get("use_reference_cache", True)),
+        "edit_lora_path": d.get("edit_lora_path", None),
+        "edit_lora_scale": float(d.get("edit_lora_scale", 1.0)),
+    }
+    return GenerationRequest(**_normalize_request_kwargs(raw_kwargs))
 
 
 def request_to_dict(req: GenerationRequest) -> Dict[str, Any]:
@@ -195,7 +233,9 @@ def request_to_dict(req: GenerationRequest) -> Dict[str, Any]:
 
 
 def request_from_dict(data: Dict[str, Any]) -> GenerationRequest:
-    norm_data = _normalize_request_kwargs(data)
+    merged = request_to_dict(build_default_request())
+    merged.update(_normalize_request_kwargs(data))
+    norm_data = _normalize_request_kwargs(merged)
     if hasattr(GenerationRequest, "from_dict") and callable(
         getattr(GenerationRequest, "from_dict")
     ):
@@ -210,9 +250,10 @@ def request_from_dict(data: Dict[str, Any]) -> GenerationRequest:
 def _clone_request(req: GenerationRequest, **updates: Any) -> GenerationRequest:
     norm_updates = _normalize_request_kwargs(updates)
     if hasattr(req, "model_copy") and callable(req.model_copy):
-        cloned = req.model_copy(update=norm_updates, deep=True)
-        return cloned
+        return req.model_copy(update=norm_updates, deep=True)
     merged = request_to_dict(req)
+    if "layout_items" in merged and isinstance(merged["layout_items"], list):
+        merged["layout_items"] = [dict(x) for x in merged["layout_items"]]
     merged.update(norm_updates)
     return request_from_dict(merged)
 
@@ -224,7 +265,9 @@ def load_or_create_initial_request(
     if target.is_file():
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
-            return request_from_dict(raw), f"Loaded: {target.name}"
+            req = request_from_dict(raw)
+            req.validate()
+            return req, f"Loaded: {target.name}"
         except Exception as e:
             print(f"[!] Warning: Failed to parse {target}: {e}. Using baseline.")
     return build_default_request(), "Discovered Optimal Baseline"
@@ -233,6 +276,10 @@ def load_or_create_initial_request(
 def save_request_json(req: GenerationRequest, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(request_to_dict(req), indent=2), encoding="utf-8")
+
+
+load_request_from_json = lambda path: load_or_create_initial_request(path)[0]
+save_request_to_json = save_request_json
 
 
 def _truncate(text: str, max_len: int = 68) -> str:
@@ -272,7 +319,7 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
 
     print("\n" + "=" * 92)
     print("               SHADOWBOXER: OPENMOSS ARCHITECTURAL EXPLORATION HARNESS")
-    print(f"                              [{banner_tag}]")
+    print(f"                             [{banner_tag}]")
     print("=" * 92)
     print(" --- MODEL & PROMPT CONDITIONING ---")
     print(f" [M]  Active Model Variant:   {req.model_variant.upper()} ({repo_str})")
@@ -331,6 +378,11 @@ def render_telemetry_report(
     vram_mode = "CPU OFFLOAD" if resp.cpu_offload_active else "RESIDENT VRAM"
     sched_str = "MOSS V2 NEAREST-GRID" if resp.use_v2_grid_used else "CONTINUOUS SHIFT"
     lat_h, lat_w = resp.height // 16, resp.width // 16
+    tok_name = (
+        "SOVEREIGN VIZTOKEN (C11 AVX2 SWISS5)"
+        if resp.viztoken_active
+        else "FALLBACK TOKENIZER"
+    )
 
     print("\n" + "=" * 92)
     print("                          SHADOWBOXER: OPENMOSS TELEMETRY REPORT")
@@ -359,7 +411,7 @@ def render_telemetry_report(
                 f"(Avail: {hw.dedicated_avail_gb:.2f} GB) | Shared Spill Delta: +{hw.shared_delta_gb:.2f} GB"
             )
     print(
-        f"Tokenizer Engine:       SOVEREIGN VIZTOKEN (C11 AVX2 SWISS5) | Prompt Cache Hit: {resp.prompt_cache_hit} (Shared Prefix: {resp.common_prefix_tokens} tok)"
+        f"Tokenizer Engine:       {tok_name} | Prompt Cache Hit: {resp.prompt_cache_hit} (Shared Prefix: {resp.common_prefix_tokens} tok)"
     )
     print(
         f"Vision Conditioner:     {resp.vizinjector_backend} | Ref Cache Hit: {resp.reference_cache_hit}"
@@ -396,6 +448,12 @@ def render_telemetry_report(
     print("Effective Prompt:")
     print(resp.effective_prompt)
     print("=" * 92 + "\n")
+
+
+def print_telemetry_report(
+    engine: MOSSImageEngine, resp: GenerationResponse
+) -> None:
+    render_telemetry_report(resp, engine=engine)
 
 
 def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
@@ -459,39 +517,67 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
         "init": p_init,
         "mask": p_mask,
         "control": p_ctrl,
+        "ref_subject_a": p_ref_a,
+        "ref_subject_b": p_ref_b,
+        "init_canvas": p_init,
+        "inpaint_mask": p_mask,
+        "control_color_map": p_ctrl,
     }
 
 
+stage_deterministic_test_inputs = stage_test_input_files
+
+
 def _parse_int_list(raw: str) -> List[int]:
-    s = raw.strip()
-    if not s or s.lower() in ("none", "[]", "clear"):
+    s = raw.strip().strip("[]")
+    if not s or s.lower() in ("none", "off", "empty", "clear"):
         return []
-    parts = [p.strip() for p in s.replace("[", "").replace("]", "").split(",") if p.strip()]
-    return [int(p) for p in parts]
+    out: List[int] = []
+    for part in s.replace(";", ",").split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            bounds = tok.split("-", 1)
+            for idx in range(int(bounds[0].strip()), int(bounds[1].strip()) + 1):
+                out.append(idx)
+        else:
+            out.append(int(tok))
+    return sorted(set(out))
 
 
 def run_permutation_suite(
     engine: MOSSImageEngine,
-    base_req: GenerationRequest,
+    base_req: Optional[GenerationRequest] = None,
     steps_override: Optional[int] = None,
     width_override: Optional[int] = None,
     height_override: Optional[int] = None,
+    steps: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     staged = stage_test_input_files()
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    w = width_override or base_req.width
-    h = height_override or base_req.height
-    steps = steps_override or min(base_req.num_inference_steps, 12)
+    active_base = base_req if base_req is not None else build_default_request()
+    w = width_override or active_base.width
+    h = height_override or active_base.height
+    eff_steps = (
+        steps_override
+        if steps_override is not None
+        else (
+            steps
+            if steps is not None
+            else min(active_base.num_inference_steps, 12)
+        )
+    )
 
     models_info = {m["variant"]: m["cached"] for m in engine.list_available_models()}
     has_base = bool(models_info.get("base", False))
 
     base_clean = _clone_request(
-        base_req,
+        active_base,
         width=w,
         height=h,
-        num_inference_steps=steps,
+        num_inference_steps=eff_steps,
         init_image_path=None,
         inpaint_mask_path=None,
         control_image_path=None,
@@ -502,7 +588,8 @@ def run_permutation_suite(
         input_role="photo_ref",
         edit_lora_path=None,
         edit_lora_scale=0.0,
-        layout_items=_get_layout_items(base_req) or [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
+        layout_items=_get_layout_items(active_base)
+        or [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
     )
 
     vectors: List[Tuple[str, GenerationRequest]] = [
@@ -531,6 +618,8 @@ def run_permutation_suite(
                 early_solver="heun",
                 late_solver="ipndm",
                 handoff_threshold=0.35,
+                early_cfg=3.2,
+                late_cfg=2.8,
                 output_path=str(PERMUTATIONS_OUT_DIR / "v03_bifurcated_heun_ipndm.png"),
             ),
         ),
@@ -540,11 +629,13 @@ def run_permutation_suite(
                 base_clean,
                 early_solver="sde_gpu_pp",
                 late_solver="ipndm",
-                handoff_threshold=0.40,
+                handoff_threshold=0.35,
                 eta=0.12,
                 s_noise=1.0,
-                slg_layers=[22],
-                slg_scale=1.25,
+                slg_layers=[24],
+                slg_scale=0.50,
+                slg_start=0.20,
+                slg_stop=0.70,
                 output_path=str(PERMUTATIONS_OUT_DIR / "v04_sde_slg.png"),
             ),
         ),
@@ -605,7 +696,9 @@ def run_permutation_suite(
             ),
         ),
         (
-            "V10_Base_Foundation_HotSwap" if has_base else "V10_Tier2_VIZJ_ZeroCopy_Reload",
+            "V10_Base_Foundation_HotSwap"
+            if has_base
+            else "V10_Tier2_VIZJ_ZeroCopy_Reload",
             _clone_request(
                 base_clean,
                 model_variant="base" if has_base else "sft",
@@ -624,7 +717,7 @@ def run_permutation_suite(
     t_suite = time.perf_counter()
     print("\n" + "=" * 92)
     print(
-        f"     EXECUTING 10-VECTOR ARCHITECTURAL PERMUTATION SUITE ({w}x{h} @ {steps} steps)"
+        f"     EXECUTING 10-VECTOR ARCHITECTURAL PERMUTATION SUITE ({w}x{h} @ {eff_steps} steps)"
     )
     print("=" * 92)
 
@@ -641,8 +734,11 @@ def run_permutation_suite(
             "step_ms": round(resp.step_latency_ms, 2),
             "peak_vram_gb": round(resp.peak_vram_gb, 3),
             "wddm_dedicated_gb": round(hw.dedicated_used_gb, 3),
+            "wddm_dedicated_avail_gb": round(hw.dedicated_avail_gb, 3),
             "wddm_shared_delta_gb": round(hw.shared_delta_gb, 3),
             "nfe": resp.total_nfe,
+            "early_steps": resp.early_steps,
+            "late_steps": resp.late_steps,
             "prompt_cache_hit": resp.prompt_cache_hit,
             "ref_cache_hit": resp.reference_cache_hit,
             "shared_prefix_tokens": resp.common_prefix_tokens,
@@ -659,6 +755,9 @@ def run_permutation_suite(
             f"Entropy={resp.shannon_entropy_bits:5.2f}b | Pfx={resp.common_prefix_tokens}tok"
         )
 
+    if engine._loaded_repo_id != SUPPORTED_MODELS["sft"]:
+        engine._init_or_swap_components(SUPPORTED_MODELS["sft"], cpu_offload=False)
+
     manifest_path = PERMUTATIONS_OUT_DIR / "permutation_telemetry.json"
     manifest_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print("\n" + "-" * 92)
@@ -671,7 +770,9 @@ def run_permutation_suite(
 
 
 def run_custom_sweep(engine: MOSSImageEngine, base_req: GenerationRequest) -> None:
-    raw_shifts = input("Enter comma-separated Shift values (Default: 3.0,5.0,7.0): ").strip()
+    raw_shifts = input(
+        "Enter comma-separated Shift values (Default: 3.0,5.0,7.0): "
+    ).strip()
     shifts = (
         [float(x.strip()) for x in raw_shifts.split(",") if x.strip()]
         if raw_shifts
@@ -684,14 +785,13 @@ def run_custom_sweep(engine: MOSSImageEngine, base_req: GenerationRequest) -> No
         else [2.5, 3.5]
     )
 
-    sweep_dir = ROOT_DIR / "artifacts" / "sweeps"
-    sweep_dir.mkdir(parents=True, exist_ok=True)
+    SWEEPS_DIR.mkdir(parents=True, exist_ok=True)
     total = len(shifts) * len(cfgs)
     idx = 0
     for s_val in shifts:
         for c_val in cfgs:
             idx += 1
-            out_file = sweep_dir / f"sweep_shift{s_val:.1f}_cfg{c_val:.1f}.png"
+            out_file = SWEEPS_DIR / f"sweep_shift{s_val:.1f}_cfg{c_val:.1f}.png"
             print(
                 f"\n>>> [Sweep {idx}/{total}] Shift={s_val:.2f} | CFG={c_val:.2f} -> {out_file.name}"
             )
@@ -867,9 +967,9 @@ def interactive_loop(
                     req.slg_layers = _parse_int_list(sl_in)
                 if req.slg_layers:
                     sc_in = input(
-                        f"SLG Scale (Current: {req.slg_scale:.2f}, Suggested: 1.25): "
+                        f"SLG Scale (Current: {req.slg_scale:.2f}, Suggested: 0.50): "
                     ).strip()
-                    req.slg_scale = float(sc_in) if sc_in else 1.25
+                    req.slg_scale = float(sc_in) if sc_in else 0.50
                 else:
                     req.slg_scale = 0.0
             elif cmd == "11":
@@ -1019,9 +1119,18 @@ def main() -> None:
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--generate", action="store_true")
     parser.add_argument("--test_permutations", action="store_true")
+    parser.add_argument("--perm_steps", type=int, default=None)
     parser.add_argument("--stage_inputs", action="store_true")
+    parser.add_argument("--warmup", action="store_true")
     parser.add_argument("--prompt", type=str, default=None)
-    parser.add_argument("--model_variant", type=str, choices=["sft", "base"], default=None)
+    parser.add_argument(
+        "--model_variant",
+        "--variant",
+        dest="model_variant",
+        type=str,
+        choices=list(SUPPORTED_MODELS.keys()),
+        default=None,
+    )
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--steps", type=int, default=None)
@@ -1031,6 +1140,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg_path = Path(args.config) if args.config else None
+    if cfg_path is not None and not cfg_path.is_absolute():
+        cfg_path = ROOT_DIR / cfg_path
     req, banner_tag = load_or_create_initial_request(cfg_path)
 
     if args.prompt is not None:
@@ -1062,12 +1173,19 @@ def main() -> None:
         prefer_vulkan=req.prefer_vulkan,
     )
 
+    if args.warmup:
+        engine._init_or_swap_components(req.resolve_repo_id(), cpu_offload=False)
+        engine.warmup(height=req.height, width=req.width)
+
     if args.test_permutations:
         try:
+            eff_perm_steps = (
+                args.perm_steps if args.perm_steps is not None else args.steps
+            )
             run_permutation_suite(
                 engine,
                 req,
-                steps_override=args.steps,
+                steps_override=eff_perm_steps,
                 width_override=args.width,
                 height_override=args.height,
             )
