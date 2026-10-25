@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -67,6 +68,8 @@ from schema import (
     SUPPORTED_SOLVERS,
     bbox_to_normalized,
     bbox_to_pixel_rect,
+    get_active_engine_defaults,
+    has_custom_default_preset,
     pixel_bbox_to_abs_centralized,
 )
 from vizinjector import (
@@ -960,7 +963,7 @@ def gate_4_schedulers_and_prng() -> None:
 
 def gate_5_refinery_schema_and_snapshots() -> None:
     print(
-        "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Zero-Copy Audit & Spatio-Visual Graph ---"
+        "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _assert(
@@ -1064,14 +1067,64 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
 
     _assert(
-        BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"] == [24],
-        f"Expected baseline uncond_skip_layers=[24], got {BASELINE_ENGINE_DEFAULTS['uncond_skip_layers']}",
+        BASELINE_ENGINE_DEFAULTS["early_solver"] == "heun"
+        and BASELINE_ENGINE_DEFAULTS["late_solver"] == "ipndm"
+        and abs(float(BASELINE_ENGINE_DEFAULTS["early_cfg"]) - 3.2) < 1e-6
+        and abs(float(BASELINE_ENGINE_DEFAULTS["late_cfg"]) - 2.8) < 1e-6
+        and BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"] == [24],
+        f"Expected V03 Heun->IPNDM baseline defaults, got {BASELINE_ENGINE_DEFAULTS}",
     )
-    harness_def_req = build_default_request()
-    _assert(
-        harness_def_req.uncond_skip_layers == [24],
-        f"Expected harness build_default_request().uncond_skip_layers == [24], got {harness_def_req.uncond_skip_layers}",
-    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_preset = Path(tmpdir) / "default.json"
+        prev_env = os.environ.get("SHADOWBOXER_DEFAULT_JSON")
+        try:
+            os.environ["SHADOWBOXER_DEFAULT_JSON"] = str(tmp_preset / "nonexistent.json")
+            base_def = get_active_engine_defaults()
+            _assert(
+                not has_custom_default_preset()
+                and base_def["early_solver"] == "heun"
+                and base_def["late_solver"] == "ipndm",
+                "Expected hardcoded V03 defaults when default.json is absent",
+            )
+            harness_def_req = build_default_request()
+            _assert(
+                harness_def_req.early_solver == "heun"
+                and harness_def_req.late_solver == "ipndm"
+                and abs(harness_def_req.early_cfg - 3.2) < 1e-6
+                and abs(harness_def_req.late_cfg - 2.8) < 1e-6
+                and harness_def_req.uncond_skip_layers == [24],
+                f"build_default_request() did not match V03 baseline: {harness_def_req}",
+            )
+
+            os.environ["SHADOWBOXER_DEFAULT_JSON"] = str(tmp_preset)
+            custom_req = GenerationRequest(
+                prompt="Preset hot-reload test",
+                early_solver="sde_gpu_pp",
+                late_solver="ipndm",
+                early_cfg=3.5,
+                late_cfg=2.5,
+                uncond_skip_layers=[22, 24],
+            )
+            custom_req.save_preset(tmp_preset)
+            _assert(
+                has_custom_default_preset(),
+                "has_custom_default_preset() failed to detect saved default.json",
+            )
+            reloaded_req = GenerationRequest(prompt="Inherited preset test")
+            _assert(
+                reloaded_req.early_solver == "sde_gpu_pp"
+                and abs(reloaded_req.early_cfg - 3.5) < 1e-6
+                and reloaded_req.uncond_skip_layers == [22, 24],
+                "GenerationRequest failed to inherit active default.json overrides",
+            )
+        finally:
+            if prev_env is None:
+                os.environ.pop("SHADOWBOXER_DEFAULT_JSON", None)
+            else:
+                os.environ["SHADOWBOXER_DEFAULT_JSON"] = prev_env
+            get_active_engine_defaults()
+
     c_bbox = pixel_bbox_to_abs_centralized(0, 0, 1023, 1023, height=1024, width=1024)
     _assert(
         c_bbox == [-512, -512, 512, 512], f"Unexpected centralized bbox: {c_bbox}"
@@ -1164,7 +1217,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             f"edit_format={fmt} must enable reference_isolated_kv",
         )
     print(
-        "  [+] Spatio-Visual Graph      : Layer [24] Lock + Box-Picture JSON Binding + Feathered Aperture Mask Verified"
+        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + Preset Hot-Reload + Box-Picture JSON Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)
