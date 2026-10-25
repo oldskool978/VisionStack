@@ -1,3 +1,4 @@
+# ShadowBoxer/models/modeling_qwen35.py
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -316,6 +317,7 @@ def _chunk_gated_delta_rule(
 
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
+    del value, beta
 
     query, key, k_beta, v_beta = [
         x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
@@ -325,21 +327,28 @@ def _chunk_gated_delta_rule(
 
     strictly_upper_mask = _get_strictly_upper_mask(chunk_size, query.device)
     cum_decay = decay.cumsum(dim=3)
+    del decay
     exp_cum_decay = cum_decay.exp()
-
     pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
-    pairwise_decay = pairwise_decay.masked_fill(strictly_upper_mask, float("-inf")).exp()
+    pairwise_decay = pairwise_decay.masked_fill(
+        strictly_upper_mask, float("-inf")
+    ).exp()
 
     key_t = key.transpose(-1, -2)
     ut_system = (k_beta @ key_t) * pairwise_decay
     intra_chunk_attn = (query @ key_t) * pairwise_decay
-    decayed_k_beta = k_beta * exp_cum_decay.unsqueeze(-1)
+    del pairwise_decay, key_t
 
+    decayed_k_beta = k_beta * exp_cum_decay.unsqueeze(-1)
+    del k_beta
     rhs_combined = torch.cat([v_beta, decayed_k_beta], dim=-1)
+    del v_beta, decayed_k_beta
     solved_combined = _solve_unit_lower_triangular(ut_system, rhs_combined)
+    del ut_system, rhs_combined
     new_values, k_cumdecay = torch.split(
         solved_combined, [v_head_dim, k_head_dim], dim=-1
     )
+    del solved_combined
 
     last_recurrent_state = torch.zeros(
         recurrent_state_shape, dtype=new_values.dtype, device=new_values.device
@@ -348,7 +357,9 @@ def _chunk_gated_delta_rule(
 
     query = query * exp_cum_decay.unsqueeze(-1)
     key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
+    del cum_decay
     chunk_decay = exp_cum_decay[..., -1][..., None, None]
+    del exp_cum_decay
 
     for i in range(num_chunks):
         v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ last_recurrent_state
@@ -359,6 +370,15 @@ def _chunk_gated_delta_rule(
             + key[:, :, i].transpose(-1, -2) @ v_new
         )
 
+    del (
+        query,
+        key,
+        new_values,
+        k_cumdecay,
+        intra_chunk_attn,
+        last_recurrent_state,
+        chunk_decay,
+    )
     core_attn_out = core_attn_out.reshape(padded_output_shape)[:, :, :sequence_length]
     return core_attn_out.transpose(1, 2).to(
         initial_dtype, memory_format=torch.contiguous_format
@@ -411,8 +431,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states = (
                 hidden_states * attention_mask[:, :, None].to(hidden_states.dtype)
             )
-        batch_size, seq_len, _ = hidden_states.shape
 
+        batch_size, seq_len, _ = hidden_states.shape
         mixed_qkv = _linear(self.in_proj_qkv, hidden_states).transpose(1, 2)
         z = _linear(self.in_proj_z, hidden_states).reshape(
             batch_size, seq_len, -1, self.head_v_dim
@@ -430,12 +450,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
         )
+        del mixed_qkv
         query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        del a, b
 
         if self.num_v_heads // self.num_k_heads > 1:
             rep = self.num_v_heads // self.num_k_heads
@@ -450,10 +472,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             beta=beta,
             use_qk_l2norm=True,
         )
+        del query, key, value, g, beta
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z).reshape(batch_size, seq_len, -1)
+        del z
         return _linear(self.out_proj, core_attn_out)
 
 
@@ -608,11 +632,13 @@ class Qwen3_5Attention(nn.Module):
                 scale=self.scaling,
                 enable_gqa=enable_gqa,
             )
+        del query_states, key_states, value_states
 
         attn_output = (
             attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         )
         attn_output = attn_output * torch.sigmoid(gate)
+        del gate
         return _linear(self.o_proj, attn_output)
 
 
@@ -643,6 +669,7 @@ class Qwen3_5DecoderLayer(nn.Module):
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
         elif self.block_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
+
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -866,6 +893,8 @@ class Qwen3_5VisionAttention(nn.Module):
             attn_output = (
                 torch.cat(attn_outputs, dim=1).reshape(seq_length, -1).contiguous()
             )
+        del query_states, key_states, value_states
+
         return _linear(self.proj, attn_output)
 
 
@@ -906,6 +935,7 @@ class Qwen3_5VisionModel(nn.Module):
         )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(config)
+
         self.blocks = nn.ModuleList(
             [Qwen3_5VisionBlock(config) for _ in range(config.depth)]
         )
@@ -945,7 +975,6 @@ class Qwen3_5VisionModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         merge = self.spatial_merge_size
         side = self.num_grid_per_side
-
         pos_ids_list: List[torch.Tensor] = []
         interp_embeds_list: List[torch.Tensor] = []
         seqlens: List[int] = [0]
@@ -1091,6 +1120,11 @@ class Qwen3_5TextModel(nn.Module):
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
 
+    def _apply(self, fn, recurse: bool = True):
+        super()._apply(fn, recurse=recurse)
+        _STRICTLY_UPPER_MASK_CACHE.clear()
+        return self
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1101,6 +1135,7 @@ class Qwen3_5TextModel(nn.Module):
     ) -> Qwen3_5ModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1138,6 +1173,7 @@ class Qwen3_5TextModel(nn.Module):
                 full_attn_mask=full_attn_mask,
             )
 
+        del position_embeddings, linear_mask, full_attn_mask
         hidden_states = self.norm(hidden_states)
         return Qwen3_5ModelOutput(last_hidden_state=hidden_states)
 
@@ -1159,6 +1195,7 @@ class Qwen3_5Model(nn.Module):
     def clear_caches(self) -> None:
         self.visual.clear_caches()
         self.rope_deltas = None
+        _STRICTLY_UPPER_MASK_CACHE.clear()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.embed_tokens
@@ -1174,9 +1211,11 @@ class Qwen3_5Model(nn.Module):
         llm_grid_t = int(grid_thw[0].item()) // temp_merge_size
         llm_grid_h = int(grid_thw[1].item()) // spatial_merge_size
         llm_grid_w = int(grid_thw[2].item()) // spatial_merge_size
+
         pos_t = torch.arange(llm_grid_t, device=device, dtype=torch.long) + start_position
         pos_h = torch.arange(llm_grid_h, device=device, dtype=torch.long) + start_position
         pos_w = torch.arange(llm_grid_w, device=device, dtype=torch.long) + start_position
+
         t_grid, h_grid, w_grid = torch.meshgrid(pos_t, pos_h, pos_w, indexing="ij")
         return torch.stack([t_grid, h_grid, w_grid], dim=0).reshape(3, -1)
 
@@ -1242,6 +1281,7 @@ class Qwen3_5Model(nn.Module):
                 position_ids[:, batch_idx, valid_mask] = llm_pos
             else:
                 position_ids[:, batch_idx] = llm_pos
+
             mrope_deltas.append(llm_pos.max() + 1 - len(cur_ids))
 
         deltas_tensor = torch.tensor(mrope_deltas, device=input_ids.device).unsqueeze(1)
@@ -1277,6 +1317,7 @@ class Qwen3_5Model(nn.Module):
             )
             image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            del img_splits, image_embeds, image_mask
 
         if position_ids is None:
             if input_ids is not None and image_grid_thw is not None:

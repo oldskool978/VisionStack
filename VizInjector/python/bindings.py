@@ -1,7 +1,9 @@
+# VizInjector/python/bindings.py
 from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -240,6 +242,22 @@ class VizInjectorClient:
             self.lib.vizinjector_init_backend(1 if prefer_vulkan else 0) == 1
         )
         self._local_vae: Optional[Flux2AutoencoderKL] = None
+        self._closed: bool = False
+
+    def __enter__(self) -> VizInjectorClient:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._local_vae = None
+            try:
+                self.lib.vizinjector_shutdown_backend()
+            except Exception:
+                pass
+            self._closed = True
 
     def _bind_signatures(self) -> None:
         self.lib.vizinjector_init_backend.argtypes = [ctypes.c_int32]
@@ -523,6 +541,7 @@ class VizInjectorClient:
         if ch == 3:
             alpha = np.full((h, w, 1), 255, dtype=np.uint8)
             rgba_array = np.concatenate([rgba_array, alpha], axis=2)
+
         contig = np.ascontiguousarray(rgba_array, dtype=np.uint8)
         c_ptr = contig.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         c_cfg = self._build_c_config(req)
@@ -553,6 +572,7 @@ class VizInjectorClient:
             return self.condition_rgba8(
                 np.asarray(source.convert("RGBA"), dtype=np.uint8), req
             )
+
         if isinstance(source, (str, Path)):
             p = Path(source)
             if not p.is_file():
@@ -636,14 +656,40 @@ class VizInjectorClient:
         hdr.tier = int(tier)
         hdr.orig_width = int(bundle.meta.orig_size[0])
         hdr.orig_height = int(bundle.meta.orig_size[1])
-        hdr.vae_width = int(bundle.meta.vae_size[0])
-        hdr.vae_height = int(bundle.meta.vae_size[1])
-        hdr.vit_width = int(bundle.meta.vit_size[0])
-        hdr.vit_height = int(bundle.meta.vit_size[1])
-        hdr.grid_thw[0] = int(bundle.meta.grid_thw[0])
-        hdr.grid_thw[1] = int(bundle.meta.grid_thw[1])
-        hdr.grid_thw[2] = int(bundle.meta.grid_thw[2])
-        hdr.llm_tokens = int(bundle.llm_tokens)
+
+        vae_w = int(bundle.meta.vae_size[0])
+        vae_h = int(bundle.meta.vae_size[1])
+        if bundle.packed_latents is not None and bundle.packed_latents.ndim == 4:
+            vae_h = int(bundle.packed_latents.shape[2]) * 16
+            vae_w = int(bundle.packed_latents.shape[3]) * 16
+        elif bundle.vae_tensor is not None and bundle.vae_tensor.ndim == 4:
+            vae_h = int(bundle.vae_tensor.shape[2])
+            vae_w = int(bundle.vae_tensor.shape[3])
+        hdr.vae_width = vae_w
+        hdr.vae_height = vae_h
+
+        vit_w = int(bundle.meta.vit_size[0])
+        vit_h = int(bundle.meta.vit_size[1])
+        if bundle.grid_thw is not None and bundle.grid_thw.numel() >= 3:
+            g_flat = bundle.grid_thw.detach().cpu().view(-1).tolist()
+            hdr.grid_thw[0] = int(g_flat[0])
+            hdr.grid_thw[1] = int(g_flat[1])
+            hdr.grid_thw[2] = int(g_flat[2])
+            if vit_w == 0 or vit_h == 0:
+                vit_h = int(g_flat[1]) * 16
+                vit_w = int(g_flat[2]) * 16
+        else:
+            hdr.grid_thw[0] = int(bundle.meta.grid_thw[0])
+            hdr.grid_thw[1] = int(bundle.meta.grid_thw[1])
+            hdr.grid_thw[2] = int(bundle.meta.grid_thw[2])
+        hdr.vit_width = vit_w
+        hdr.vit_height = vit_h
+
+        if bundle.vit_embeds is not None and bundle.vit_embeds.ndim == 2:
+            hdr.llm_tokens = int(bundle.vit_embeds.shape[0])
+        else:
+            hdr.llm_tokens = int(bundle.llm_tokens)
+
         hdr.mean_luminance = float(bundle.meta.telemetry.mean_luminance)
         hdr.rms_contrast = float(bundle.meta.telemetry.rms_contrast)
         hdr.shannon_entropy_bits = float(
@@ -698,6 +744,7 @@ class VizInjectorClient:
         )
         if rc != 0 or not out_ptr:
             raise RuntimeError(f"Failed packing .vizj container (code {rc})")
+
         try:
             blob = ctypes.string_at(out_ptr, int(out_len.value))
         finally:
@@ -717,6 +764,7 @@ class VizInjectorClient:
         req = request if request is not None else VizInjectorRequest()
         in_arr = np.frombuffer(container_bytes, dtype=np.uint8)
         in_ptr = in_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
         hdr = CVizContainerHeader()
         vae_ptr = ctypes.c_void_p()
         vit_ptr = ctypes.c_void_p()
@@ -752,42 +800,63 @@ class VizInjectorClient:
 
         lat_h = int(hdr.vae_height) // 16
         lat_w = int(hdr.vae_width) // 16
+        if (lat_h <= 0 or lat_w <= 0) and hdr.vae_bytes > 0:
+            elem_sz = 2 if hdr.vae_dtype in (VIZJ_DTYPE_BF16, VIZJ_DTYPE_FP16) else 4
+            spatial_cells = int(hdr.vae_bytes) // (128 * elem_sz)
+            side = int(math.isqrt(max(1, spatial_cells)))
+            if side * side == spatial_cells:
+                lat_h = side
+                lat_w = side
+                hdr.vae_height = lat_h * 16
+                hdr.vae_width = lat_w * 16
 
         packed_latents: Optional[torch.Tensor] = None
-        if vae_ptr.value and hdr.vae_bytes > 0:
+        if vae_ptr.value and hdr.vae_bytes > 0 and lat_h > 0 and lat_w > 0:
             if hdr.vae_dtype == VIZJ_DTYPE_BF16:
                 t_bf16 = torch.empty(
                     (1, 128, lat_h, lat_w), dtype=torch.bfloat16
                 )
-                ctypes.memmove(
-                    t_bf16.data_ptr(), vae_ptr.value, int(hdr.vae_bytes)
-                )
-                packed_latents = t_bf16.float()
+                if t_bf16.numel() * t_bf16.element_size() == int(hdr.vae_bytes):
+                    ctypes.memmove(
+                        t_bf16.data_ptr(), vae_ptr.value, int(hdr.vae_bytes)
+                    )
+                    packed_latents = t_bf16.float()
             else:
                 packed_latents = torch.empty(
                     (1, 128, lat_h, lat_w), dtype=torch.float32
                 )
-                ctypes.memmove(
-                    packed_latents.data_ptr(), vae_ptr.value, int(hdr.vae_bytes)
-                )
+                if packed_latents.numel() * packed_latents.element_size() == int(
+                    hdr.vae_bytes
+                ):
+                    ctypes.memmove(
+                        packed_latents.data_ptr(), vae_ptr.value, int(hdr.vae_bytes)
+                    )
 
         vit_embeds: Optional[torch.Tensor] = None
         if vit_ptr.value and hdr.vit_bytes > 0:
             n_tok = max(1, int(hdr.llm_tokens))
             embed_dim = int(hdr.vit_bytes) // (2 * n_tok)
-            vit_embeds = torch.empty((n_tok, embed_dim), dtype=torch.bfloat16)
-            ctypes.memmove(
-                vit_embeds.data_ptr(), vit_ptr.value, int(hdr.vit_bytes)
-            )
+            if embed_dim > 0:
+                vit_embeds = torch.empty((n_tok, embed_dim), dtype=torch.bfloat16)
+                ctypes.memmove(
+                    vit_embeds.data_ptr(), vit_ptr.value, int(hdr.vit_bytes)
+                )
 
         latent_mask: Optional[torch.Tensor] = None
-        if mask_ptr.value and hdr.mask_bytes > 0:
+        if mask_ptr.value and hdr.mask_bytes > 0 and lat_h > 0 and lat_w > 0:
             latent_mask = torch.empty(
                 (1, 1, lat_h, lat_w), dtype=torch.float32
             )
-            ctypes.memmove(
-                latent_mask.data_ptr(), mask_ptr.value, int(hdr.mask_bytes)
-            )
+            if latent_mask.numel() * latent_mask.element_size() == int(hdr.mask_bytes):
+                ctypes.memmove(
+                    latent_mask.data_ptr(), mask_ptr.value, int(hdr.mask_bytes)
+                )
+
+        vit_w = int(hdr.vit_width)
+        vit_h = int(hdr.vit_height)
+        if (vit_w == 0 or vit_h == 0) and int(hdr.grid_thw[1]) > 0 and int(hdr.grid_thw[2]) > 0:
+            vit_h = int(hdr.grid_thw[1]) * 16
+            vit_w = int(hdr.grid_thw[2]) * 16
 
         grid_thw = torch.tensor(
             [[int(hdr.grid_thw[0]), int(hdr.grid_thw[1]), int(hdr.grid_thw[2])]],
@@ -802,7 +871,7 @@ class VizInjectorClient:
         meta = VizInjectorResponseMeta(
             orig_size=(int(hdr.orig_width), int(hdr.orig_height)),
             vae_size=(int(hdr.vae_width), int(hdr.vae_height)),
-            vit_size=(int(hdr.vit_width), int(hdr.vit_height)),
+            vit_size=(vit_w, vit_h),
             grid_thw=(
                 int(hdr.grid_thw[0]),
                 int(hdr.grid_thw[1]),
@@ -838,9 +907,11 @@ class VizInjectorClient:
         b, c, h, w = decoded_tensor.shape
         if c != 3:
             raise ValueError(f"Expected 3-channel RGB tensor, got shape {decoded_tensor.shape}")
+
         cpu_f32 = decoded_tensor.detach().cpu().float().contiguous().numpy()
         pil_list: List[Image.Image] = []
         telem_list: List[VizInjectorTelemetry] = []
+
         for i in range(b):
             sample = np.ascontiguousarray(cpu_f32[i], dtype=np.float32)
             out_rgb8 = np.empty((h, w, 3), dtype=np.uint8)

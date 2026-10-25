@@ -1,7 +1,6 @@
 #include "vizinjector_core.h"
 #include "../common/colorspace_srgb.h"
 #include "../vulkan/vk_compute_engine.h"
-
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -95,7 +94,6 @@ static int build_wire_vizj_from_branches(
     VizInjectorOutput *out
 ) {
     if (!out->vae_planar_f32 || out->vae_width == 0 || out->vae_height == 0) return -1;
-
     size_t px_count = (size_t)out->vae_width * (size_t)out->vae_height;
     uint8_t *rgb8 = (uint8_t *)malloc(px_count * 3u);
     uint8_t *rgba8 = (uint8_t *)malloc(px_count * 4u);
@@ -201,6 +199,13 @@ int32_t vizinjector_core_process_linear_f32(
         &vit_h
     );
 
+    out->vae_width = vae_w;
+    out->vae_height = vae_h;
+    out->vit_width = vit_w;
+    out->vit_height = vit_h;
+    out->mask_width = vae_w / 16u;
+    out->mask_height = vae_h / 16u;
+
     float mtf = (cfg.input_role == VIZ_ROLE_PHOTO_REF) ? cfg.mtf_boost : 0.0f;
     float knee = (cfg.input_role == VIZ_ROLE_DEPTH_MAP) ? 0.005f : cfg.soft_knee_tau;
 
@@ -208,7 +213,6 @@ int32_t vizinjector_core_process_linear_f32(
     if (cfg.emit_vae_branch || cfg.emit_mask_branch) {
         vae_lin = acquire_tls_f32(&g_tls_vae_lin, &g_tls_vae_lin_cap, (size_t)vae_w * (size_t)vae_h * 4u);
         if (!vae_lin) return -2;
-
         if (viz_resample_2d_linear_rgba(src_linear_rgba, src_w, src_h, vae_w, vae_h, (VizFramingMode)cfg.framing_mode, mtf, knee, vae_lin) != 0) {
             return -3;
         }
@@ -220,8 +224,6 @@ int32_t vizinjector_core_process_linear_f32(
         if (!out->vae_planar_f32) {
             return -4;
         }
-        out->vae_width = vae_w;
-        out->vae_height = vae_h;
         out->vae_Floats = (uint32_t)vae_floats;
 
         if (cfg.input_role == VIZ_ROLE_DEPTH_MAP) {
@@ -246,8 +248,6 @@ int32_t vizinjector_core_process_linear_f32(
         if (out->latent_mask_f32) {
             int ch_off = (cfg.input_role == VIZ_ROLE_INPAINT_MASK) ? 0 : 3;
             viz_downsample_latent_mask_16x(vae_lin, 4, ch_off, vae_w, vae_h, cfg.mask_feather_radius, out->latent_mask_f32);
-            out->mask_width = mw;
-            out->mask_height = mh;
             out->mask_Floats = (uint32_t)m_floats;
         }
     }
@@ -257,13 +257,12 @@ int32_t vizinjector_core_process_linear_f32(
         uint32_t grid_w = vit_w / 16u;
         uint32_t num_patches = grid_h * grid_w;
         size_t vit_floats = (size_t)num_patches * 3u * 2u * 256u;
+
         out->vit_patches_f32 = acquire_tls_f32(&g_tls_out_vit, &g_tls_out_vit_cap, vit_floats);
         if (!out->vit_patches_f32) {
             vizinjector_core_free_output(out);
             return -5;
         }
-        out->vit_width = vit_w;
-        out->vit_height = vit_h;
         out->vit_num_patches = num_patches;
         out->vit_Floats = (uint32_t)vit_floats;
 
@@ -321,14 +320,18 @@ int32_t vizinjector_core_process_rgba8(
         &vit_h
     );
 
+    out->vae_width = vae_w;
+    out->vae_height = vae_h;
+    out->vit_width = vit_w;
+    out->vit_height = vit_h;
+    out->mask_width = vae_w / 16u;
+    out->mask_height = vae_h / 16u;
+
     if (cfg.input_role == VIZ_ROLE_COLOR_MAP) {
         size_t vae_floats = (size_t)vae_w * (size_t)vae_h * 3u;
         out->vae_planar_f32 = acquire_tls_f32(&g_tls_out_vae, &g_tls_out_vae_cap, vae_floats);
         if (!out->vae_planar_f32) return -2;
-        out->vae_width = vae_w;
-        out->vae_height = vae_h;
         out->vae_Floats = (uint32_t)vae_floats;
-
         viz_resample_majority_color_map_rgba8(src_rgba8, src_w, src_h, vae_w, vae_h, (VizFramingMode)cfg.framing_mode, out->vae_planar_f32);
 
         VizPerceptualTelemetry telem;
@@ -356,15 +359,14 @@ int32_t vizinjector_core_process_rgba8(
         if (vit_floats > 0u) out->vit_patches_f32 = acquire_tls_f32(&g_tls_out_vit, &g_tls_out_vit_cap, vit_floats);
         if (m_floats > 0u) out->latent_mask_f32 = acquire_tls_f32(&g_tls_out_mask, &g_tls_out_mask_cap, m_floats);
 
-        int need_vae_grid = (cfg.emit_vae_branch || cfg.emit_mask_branch);
         int vk_rc = viz_vk_condition_image_rgba8(
             src_rgba8,
             src_w,
             src_h,
-            need_vae_grid ? vae_w : 0u,
-            need_vae_grid ? vae_h : 0u,
-            cfg.emit_vit_branch ? vit_w : 0u,
-            cfg.emit_vit_branch ? vit_h : 0u,
+            vae_w,
+            vae_h,
+            vit_w,
+            vit_h,
             (VizFramingMode)cfg.framing_mode,
             cfg.deband_8bit,
             cfg.seed,
@@ -380,10 +382,7 @@ int32_t vizinjector_core_process_rgba8(
 
         if (vk_rc == 0) {
             if (cfg.emit_vae_branch && out->vae_planar_f32) {
-                out->vae_width = vae_w;
-                out->vae_height = vae_h;
                 out->vae_Floats = (uint32_t)vae_floats;
-
                 VizPerceptualTelemetry telem;
                 viz_compute_perceptual_telemetry(out->vae_planar_f32, vae_w, vae_h, &telem);
                 out->mean_luminance = telem.mean_luminance;
@@ -392,14 +391,10 @@ int32_t vizinjector_core_process_rgba8(
                 out->laplacian_sharpness = telem.laplacian_sharpness;
             }
             if (cfg.emit_vit_branch && out->vit_patches_f32) {
-                out->vit_width = vit_w;
-                out->vit_height = vit_h;
                 out->vit_num_patches = num_patches;
                 out->vit_Floats = (uint32_t)vit_floats;
             }
             if (cfg.emit_mask_branch && out->latent_mask_f32) {
-                out->mask_width = mw;
-                out->mask_height = mh;
                 out->mask_Floats = (uint32_t)m_floats;
             }
             if (cfg.emit_wire_vizj && out->vae_planar_f32) {
@@ -459,7 +454,7 @@ int32_t vizinjector_core_process_memory(
                     out->orig_height = hdr.orig_height;
                 }
                 if (mask_ptr && hdr.mask_bytes == (size_t)(out->vae_width / 16u) * (out->vae_height / 16u) * sizeof(float)) {
-                    size_t m_floats = (size_t)(out->vae_width / 16u) * (size_t)(out->vae_height / 16u);
+                    size_t m_floats = (size_t)(out->vae_width / 16u) * (out->vae_height / 16u);
                     if (!out->latent_mask_f32) {
                         out->latent_mask_f32 = acquire_tls_f32(&g_tls_out_mask, &g_tls_out_mask_cap, m_floats);
                     }

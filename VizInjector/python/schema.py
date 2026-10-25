@@ -1,3 +1,4 @@
+# VizInjector/python/schema.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,7 +6,9 @@ from typing import Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field, model_validator
 
-FramingModeLiteral = Literal["inscribed", "contain", "stretch", "never_crop"]
+FramingModeLiteral = Literal[
+    "inscribed", "cover_crop", "contain", "stretch", "never_crop"
+]
 InputRoleLiteral = Literal["photo_ref", "color_map", "depth_map", "inpaint_mask"]
 EditFormatLiteral = Literal[
     "standard",
@@ -17,6 +20,7 @@ EditFormatLiteral = Literal[
 
 FRAMING_MODE_TO_INT = {
     "inscribed": 0,
+    "cover_crop": 0,
     "contain": 1,
     "stretch": 2,
     "never_crop": 3,
@@ -63,7 +67,7 @@ class VizInjectorRequest(BaseModel):
     @model_validator(mode="after")
     def _configure_regime_routing(self) -> VizInjectorRequest:
         if self.edit_format == "moss_image_edit":
-            if self.framing_mode == "inscribed":
+            if self.framing_mode in ("inscribed", "cover_crop"):
                 self.framing_mode = "never_crop"
             if self.emit_vit_branch is None:
                 self.emit_vit_branch = False
@@ -111,6 +115,7 @@ class VizInjectorRequest(BaseModel):
             "moss_image_edit",
             "ai_toolkit_isolated",
             "ai_toolkit_full",
+            "control_color_depth",
         )
 
     @property
@@ -119,7 +124,11 @@ class VizInjectorRequest(BaseModel):
 
     @property
     def reference_uses_isolated_kv_cache(self) -> bool:
-        return self.edit_format in ("moss_image_edit", "ai_toolkit_isolated")
+        return self.edit_format in (
+            "moss_image_edit",
+            "ai_toolkit_isolated",
+            "control_color_depth",
+        )
 
     @property
     def reference_isolated_kv(self) -> bool:

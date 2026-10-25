@@ -1,3 +1,4 @@
+# VizToken/viztoken.py
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -21,20 +22,26 @@ from typing import (
     Tuple,
     Union,
 )
+import unicodedata
 
 ROOT_DIR = Path(__file__).resolve().parent
 IS_WIN = sys.platform == "win32"
+
 _DLL_NAMES = (
     ("viztoken.dll", "tiktalkin.dll")
     if IS_WIN
     else ("libviztoken.so", "libtiktalkin.so")
 )
-
 _SWISS_MAGICS = (b"TIKTALKIN_SWISS4", b"VIZTOK_SWISS5___")
 _SWISS_HEADER_FMT = "<16sIIIIIIQQQQQIIQIIQQQ"
 _SWISS_HEADER_SIZE = struct.calcsize(_SWISS_HEADER_FMT)
 _SPECIAL_DISK_FMT = "<iH58s"
 _SPECIAL_DISK_SIZE = struct.calcsize(_SPECIAL_DISK_FMT)
+
+QWEN35_PRETOKENIZE_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 
 
 class SpecialDisk(ctypes.Structure):
@@ -273,34 +280,39 @@ def compile_vocab(
     out_telemetry_json: Optional[Union[str, Path]] = None,
     regex_pattern: Optional[str] = None,
     specials_list: Optional[Sequence[Tuple[str, int]]] = None,
-    eot_token_id: int = 151643,
+    eot_token_id: int = 0,
 ) -> Telemetry:
     binding = get_binding()
-    in_path_str = str(Path(in_tiktoken_path).resolve()).encode("utf-8")
-    out_path_str = str(Path(out_bin_path).resolve()).encode("utf-8")
+    in_path = Path(in_tiktoken_path).resolve()
+    out_path = Path(out_bin_path).resolve()
+    in_path_str = str(in_path).encode("utf-8")
+    out_path_str = str(out_path).encode("utf-8")
     telem_path_str = (
         str(Path(out_telemetry_json).resolve()).encode("utf-8")
         if out_telemetry_json
         else None
     )
     pat_str = regex_pattern.encode("utf-8") if regex_pattern else None
-    effective_specials = (
-        specials_list if specials_list is not None else build_default_yue2_specials()
-    )
-    specials_count = len(effective_specials)
-    specials_arr = (SpecialDisk * specials_count)()
-    for idx, (literal, s_id) in enumerate(effective_specials):
-        specials_arr[idx].id = int(s_id)
-        lit_bytes = literal.encode("utf-8")[:57]
-        specials_arr[idx].length = len(lit_bytes)
-        specials_arr[idx].literal = lit_bytes
+
+    if specials_list is not None:
+        specials_count = len(specials_list)
+        specials_arr = (SpecialDisk * specials_count)()
+        for idx, (literal, s_id) in enumerate(specials_list):
+            specials_arr[idx].id = int(s_id)
+            lit_bytes = literal.encode("utf-8")[:57]
+            specials_arr[idx].length = len(lit_bytes)
+            specials_arr[idx].literal = lit_bytes
+        specials_ptr = ctypes.cast(specials_arr, ctypes.POINTER(SpecialDisk))
+    else:
+        specials_count = 0
+        specials_ptr = ctypes.POINTER(SpecialDisk)()
 
     telem = Telemetry()
     rc = binding.compile_vocab_v5(
         in_path_str,
         out_path_str,
         pat_str,
-        specials_arr,
+        specials_ptr,
         specials_count,
         int(eot_token_id),
         telem_path_str,
@@ -317,16 +329,20 @@ def compile_qwen_ranks_binary(
 ) -> Path:
     src = Path(source_dir_or_file).resolve()
     if src.is_dir():
-        vocab_path = src / "qwen.tiktoken"
+        vocab_path = src / "qwen35.tiktoken"
         if not vocab_path.exists():
-            matches = list(src.rglob("*.tiktoken"))
+            vocab_path = src / "qwen.tiktoken"
+        if not vocab_path.exists():
+            matches = sorted(src.rglob("*.tiktoken"))
             if not matches:
                 raise FileNotFoundError(f"No .tiktoken file located in {src}")
             vocab_path = matches[0]
     else:
         vocab_path = src
+
     if not vocab_path.exists():
         raise FileNotFoundError(f"Vocabulary file missing: {vocab_path}")
+
     dest_bin = (
         Path(target_bin_path).resolve()
         if target_bin_path is not None
@@ -345,11 +361,13 @@ def find_common_prefix(
         tokens_a = tokens_a.detach().cpu().numpy().ravel()
     if hasattr(tokens_b, "detach"):
         tokens_b = tokens_b.detach().cpu().numpy().ravel()
+
     len_a = len(tokens_a)
     len_b = len(tokens_b)
     limit = len_a if len_a < len_b else len_b
     if limit == 0:
         return 0
+
     try:
         import numpy as np
 
@@ -364,6 +382,7 @@ def find_common_prefix(
             return int(binding.find_common_prefix(ptr_a, limit, ptr_b, limit))
     except Exception:
         pass
+
     for i in range(limit):
         if tokens_a[i] != tokens_b[i]:
             return i
@@ -379,8 +398,8 @@ class Encoding:
     ):
         self._name = name
         self._binding = get_binding()
-        resolved_ranks: Optional[Path] = None
 
+        resolved_ranks: Optional[Path] = None
         if ranks_path is not None:
             p = Path(ranks_path).resolve()
             if p.is_file() and p.suffix == ".bin":
@@ -397,11 +416,16 @@ class Encoding:
                         resolved_ranks = bin_candidate
                         break
                 if resolved_ranks is None:
-                    tik_candidate = p / "qwen.tiktoken"
-                    if tik_candidate.exists():
-                        resolved_ranks = compile_qwen_ranks_binary(
-                            tik_candidate, p / "qwen.ranks.bin"
-                        )
+                    for t_name, b_out in (
+                        ("qwen35.tiktoken", "qwen35.ranks.bin"),
+                        ("qwen.tiktoken", "qwen.ranks.bin"),
+                    ):
+                        tik_candidate = p / t_name
+                        if tik_candidate.exists():
+                            resolved_ranks = compile_qwen_ranks_binary(
+                                tik_candidate, p / b_out
+                            )
+                            break
 
         if resolved_ranks is None or not resolved_ranks.exists():
             search_candidates: List[Path] = []
@@ -441,7 +465,12 @@ class Encoding:
             self._n_vocab = max(base_v, total_v)
             self._eot_token = eot_id
             self._has_fast_tables = has_fast
-            defaults = spec_list if spec_list else build_default_yue2_specials()
+            fallback_specs = (
+                build_default_qwen35_specials()
+                if base_v >= 240000
+                else build_default_yue2_specials()
+            )
+            defaults = spec_list if spec_list else fallback_specs
         else:
             self._base_vocab_size = 151643
             self._n_vocab = 184704
@@ -503,6 +532,20 @@ class Encoding:
     def special_token_to_id(self) -> Dict[str, int]:
         return self._special_token_to_id
 
+    def _encode_all_special_unchecked(self, text: str) -> List[int]:
+        if not text:
+            return []
+        if not self._ctx:
+            raise RuntimeError("Operation attempted on closed VizToken context.")
+        raw = text.encode("utf-8")
+        byte_len = len(raw)
+        max_tokens = max(byte_len, 16)
+        out_buf = (ctypes.c_int32 * max_tokens)()
+        count = self._binding.encode(
+            self._ctx, raw, byte_len, out_buf, max_tokens
+        )
+        return list(out_buf[:count])
+
     def encode_ordinary(self, text: str) -> List[int]:
         if not text:
             return []
@@ -549,36 +592,24 @@ class Encoding:
                     )
 
         if allowed_special == "all":
-            raw = text.encode("utf-8")
-            byte_len = len(raw)
-            max_tokens = max(byte_len, 16)
-            out_buf = (ctypes.c_int32 * max_tokens)()
-            count = self._binding.encode(
-                self._ctx, raw, byte_len, out_buf, max_tokens
-            )
-            return list(out_buf[:count])
+            return self._encode_all_special_unchecked(text)
 
         if not allowed_special:
             return self.encode_ordinary(text)
 
         allowed_set = set(allowed_special)
         if allowed_set >= self._special_tokens_set:
-            raw = text.encode("utf-8")
-            byte_len = len(raw)
-            max_tokens = max(byte_len, 16)
-            out_buf = (ctypes.c_int32 * max_tokens)()
-            count = self._binding.encode(
-                self._ctx, raw, byte_len, out_buf, max_tokens
-            )
-            return list(out_buf[:count])
+            return self._encode_all_special_unchecked(text)
 
         valid_allowed = [s for s in allowed_set if s in self._special_tokens_set]
         if not valid_allowed:
             return self.encode_ordinary(text)
+
         valid_allowed_set = set(valid_allowed)
         valid_allowed.sort(key=len, reverse=True)
         pattern = f"({'|'.join(re.escape(s) for s in valid_allowed)})"
         parts = re.split(pattern, text)
+
         result: List[int] = []
         for part in parts:
             if not part:
@@ -588,6 +619,42 @@ class Encoding:
             else:
                 result.extend(self.encode_ordinary(part))
         return result
+
+    def encode_chat(
+        self,
+        prompt: str,
+        enable_thinking: bool = True,
+        max_sequence_length: int = 4096,
+        image_patch_counts: Optional[Sequence[int]] = None,
+    ) -> List[int]:
+        norm_prompt = unicodedata.normalize("NFC", prompt).strip()
+        think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+        if not image_patch_counts:
+            full_text = (
+                f"<|im_start|>user\n{norm_prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n{think_suffix}"
+            )
+            toks = self._encode_all_special_unchecked(full_text)
+        else:
+            img_pad_id = self._special_token_to_id.get("<|image_pad|>", 248056)
+            toks = []
+            for idx, count in enumerate(image_patch_counts, start=1):
+                seg = (
+                    f"<|im_start|>user\nPicture {idx}: <|vision_start|>"
+                    if idx == 1
+                    else f"<|vision_end|>Picture {idx}: <|vision_start|>"
+                )
+                toks.extend(self._encode_all_special_unchecked(seg))
+                toks.extend([img_pad_id] * max(1, int(count)))
+            tail = (
+                f"<|vision_end|>{norm_prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n{think_suffix}"
+            )
+            toks.extend(self._encode_all_special_unchecked(tail))
+
+        if max_sequence_length > 0 and len(toks) > max_sequence_length:
+            toks = toks[:max_sequence_length]
+        return toks
 
     def encode_batch(
         self,
@@ -642,6 +709,7 @@ class Encoding:
             return ""
         if not self._ctx:
             raise RuntimeError("Operation attempted on closed VizToken context.")
+
         try:
             import numpy as np
 

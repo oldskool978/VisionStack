@@ -166,7 +166,7 @@ def build_default_request() -> GenerationRequest:
             "handoff_threshold": 0.35,
             "early_cfg": 3.0,
             "late_cfg": 3.0,
-            "uncond_skip_layers": [22],
+            "uncond_skip_layers": [24],
             "slg_layers": [],
             "slg_scale": 0.0,
             "slg_start": 0.05,
@@ -291,7 +291,7 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     print(
         f" [8]  CFG Guidance Field:     Early CFG: {req.early_cfg:.2f} | Late CFG: {req.late_cfg:.2f}"
     )
-    print(f" [9]  Negative Block Skip:    {req.uncond_skip_layers} (Default: [22])")
+    print(f" [9]  Negative Block Skip:    {req.uncond_skip_layers} (Default: [24])")
     print(f" [10] Positive SLG Guidance:  {slg_str}")
     print(
         f" [11] SDE Dispersion (Early): Eta: {req.eta:.3f} | S-Noise: {req.s_noise:.3f}"
@@ -325,7 +325,9 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     print("=" * 92)
 
 
-def render_telemetry_report(resp: GenerationResponse) -> None:
+def render_telemetry_report(
+    resp: GenerationResponse, engine: Optional[MOSSImageEngine] = None
+) -> None:
     vram_mode = "CPU OFFLOAD" if resp.cpu_offload_active else "RESIDENT VRAM"
     sched_str = "MOSS V2 NEAREST-GRID" if resp.use_v2_grid_used else "CONTINUOUS SHIFT"
     lat_h, lat_w = resp.height // 16, resp.width // 16
@@ -349,6 +351,13 @@ def render_telemetry_report(resp: GenerationResponse) -> None:
         f"Inference Latency:      {resp.generation_time_seconds:.3f}s ({resp.step_latency_ms:.1f} ms/step)"
     )
     print(f"Peak VRAM Footprint:    {resp.peak_vram_gb:.3f} GB ({vram_mode})")
+    if engine is not None and getattr(engine, "memory_guard", None) is not None:
+        hw = engine.memory_guard.poll()
+        if engine.memory_guard.active:
+            print(
+                f"WDDM Hardware Residency:Dedicated: {hw.dedicated_used_gb:.2f}/{hw.dedicated_total_gb:.2f} GB "
+                f"(Avail: {hw.dedicated_avail_gb:.2f} GB) | Shared Spill Delta: +{hw.shared_delta_gb:.2f} GB"
+            )
     print(
         f"Tokenizer Engine:       SOVEREIGN VIZTOKEN (C11 AVX2 SWISS5) | Prompt Cache Hit: {resp.prompt_cache_hit} (Shared Prefix: {resp.common_prefix_tokens} tok)"
     )
@@ -622,6 +631,7 @@ def run_permutation_suite(
     for idx, (vec_name, vec_req) in enumerate(vectors, start=1):
         print(f"\n>>> [{idx:02d}/10] {vec_name} ...")
         resp = engine.synthesize(vec_req)
+        hw = engine.memory_guard.poll()
         rec = {
             "index": idx,
             "vector": vec_name,
@@ -630,6 +640,8 @@ def run_permutation_suite(
             "latency_s": round(resp.generation_time_seconds, 3),
             "step_ms": round(resp.step_latency_ms, 2),
             "peak_vram_gb": round(resp.peak_vram_gb, 3),
+            "wddm_dedicated_gb": round(hw.dedicated_used_gb, 3),
+            "wddm_shared_delta_gb": round(hw.shared_delta_gb, 3),
             "nfe": resp.total_nfe,
             "prompt_cache_hit": resp.prompt_cache_hit,
             "ref_cache_hit": resp.reference_cache_hit,
@@ -643,8 +655,8 @@ def run_permutation_suite(
         results.append(rec)
         print(
             f"    [OK] {vec_name:<38} | {resp.generation_time_seconds:6.2f}s | "
-            f"VRAM={resp.peak_vram_gb:5.2f}GB | Entropy={resp.shannon_entropy_bits:5.2f}b | "
-            f"Pfx={resp.common_prefix_tokens}tok"
+            f"VRAM={resp.peak_vram_gb:5.2f}GB (Spill=+{hw.shared_delta_gb:4.2f}GB) | "
+            f"Entropy={resp.shannon_entropy_bits:5.2f}b | Pfx={resp.common_prefix_tokens}tok"
         )
 
     manifest_path = PERMUTATIONS_OUT_DIR / "permutation_telemetry.json"
@@ -691,7 +703,7 @@ def run_custom_sweep(engine: MOSSImageEngine, base_req: GenerationRequest) -> No
                 output_path=str(out_file),
             )
             resp = engine.synthesize(s_req)
-            render_telemetry_report(resp)
+            render_telemetry_report(resp, engine=engine)
 
 
 def interactive_loop(
@@ -719,7 +731,7 @@ def interactive_loop(
         try:
             if cmd == "g":
                 resp = engine.synthesize(req)
-                render_telemetry_report(resp)
+                render_telemetry_report(resp, engine=engine)
             elif cmd == "w":
                 engine._init_or_swap_components(
                     req.resolve_repo_id(), cpu_offload=False
@@ -1065,7 +1077,7 @@ def main() -> None:
     if args.generate:
         try:
             resp = engine.synthesize(req)
-            render_telemetry_report(resp)
+            render_telemetry_report(resp, engine=engine)
         finally:
             _graceful_exit(engine, 0)
 

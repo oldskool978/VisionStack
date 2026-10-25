@@ -1,6 +1,8 @@
+# ShadowBoxer/engine.py
 from __future__ import annotations
 
 from collections import OrderedDict
+import ctypes
 from dataclasses import dataclass
 import gc
 import json
@@ -62,8 +64,12 @@ os.environ["MIOPEN_FIND_MODE"] = "2"
 os.environ["MIOPEN_LOG_LEVEL"] = "0"
 os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
 os.environ["AMD_LOG_LEVEL"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+    "garbage_collection_threshold:0.8,max_split_size_mb:128"
+)
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = (
+    "garbage_collection_threshold:0.8,max_split_size_mb:128"
+)
 
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
@@ -90,6 +96,7 @@ from schema import (
     GenerationRequest,
     GenerationResponse,
     SUPPORTED_MODELS,
+    bbox_to_normalized,
 )
 
 try:
@@ -125,8 +132,324 @@ _SPLITMIX64_C2 = 0xBF58476D1CE4E5B9
 _SPLITMIX64_C3 = 0x94D049BB133111EB
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 _MASK63 = 0x7FFFFFFFFFFFFFFF
+_VRAM_TRIM_THRESHOLD_BYTES = int(25.6 * (1024**3))
+_MIN_RECLAIMABLE_CACHE_BYTES = 16 * (1024**2)
 
 _GENERATOR_CACHE: Dict[str, torch.Generator] = {}
+
+
+class _PDHVal(ctypes.Union):
+    _fields_ = [
+        ("longValue", ctypes.c_long),
+        ("doubleValue", ctypes.c_double),
+        ("largeValue", ctypes.c_longlong),
+        ("AnsiStringValue", ctypes.c_char_p),
+        ("WideStringValue", ctypes.c_wchar_p),
+    ]
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [
+        ("CStatus", ctypes.c_ulong),
+        ("value", _PDHVal),
+    ]
+
+
+class _PDH_FMT_COUNTERVALUE_ITEM(ctypes.Structure):
+    _fields_ = [
+        ("szName", ctypes.c_wchar_p),
+        ("FmtValue", _PDH_FMT_COUNTERVALUE),
+    ]
+
+
+class _DXGI_ADAPTER_DESC1(ctypes.Structure):
+    _fields_ = [
+        ("Description", ctypes.c_wchar * 128),
+        ("VendorId", ctypes.c_uint),
+        ("DeviceId", ctypes.c_uint),
+        ("SubSysId", ctypes.c_uint),
+        ("Revision", ctypes.c_uint),
+        ("DedicatedVideoMemory", ctypes.c_size_t),
+        ("DedicatedSystemMemory", ctypes.c_size_t),
+        ("SharedSystemMemory", ctypes.c_size_t),
+        ("AdapterLuid", ctypes.c_longlong),
+        ("Flags", ctypes.c_uint),
+    ]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+@dataclass
+class WDDMMemorySnapshot:
+    dedicated_total_gb: float
+    dedicated_used_gb: float
+    dedicated_avail_gb: float
+    shared_budget_gb: float
+    shared_used_gb: float
+    shared_delta_gb: float
+    pt_allocated_gb: float
+    pt_reserved_gb: float
+    pt_reclaimable_gb: float
+    is_spilling: bool
+
+
+class WDDMMemoryGuard:
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.active = False
+        self.adapter_name = "Generic GPU"
+        self.luid_key = ""
+        self.dedicated_total_gb = 0.0
+        self.shared_budget_gb = 0.0
+        self.shared_baseline_gb = 0.0
+        self._pdh = None
+        self._h_query = ctypes.c_void_p()
+        self._h_dedicated = ctypes.c_void_p()
+        self._h_shared = ctypes.c_void_p()
+
+        if sys.platform == "win32" and self.device.type == "cuda":
+            self._init_win32_telemetry()
+
+    @staticmethod
+    def _call_com(
+        ptr: ctypes.c_void_p, index: int, argtypes: List[Any], *args: Any
+    ) -> int:
+        vtable = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+        func_addr = ctypes.cast(vtable, ctypes.POINTER(ctypes.c_void_p))[index]
+        func = ctypes.WINFUNCTYPE(ctypes.c_long, *argtypes)(func_addr)
+        return int(func(ptr, *args))
+
+    def _init_win32_telemetry(self) -> None:
+        try:
+            iid_factory1 = _GUID(
+                0x770AAE78,
+                0xF26F,
+                0x4DBA,
+                (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
+            )
+            factory = ctypes.c_void_p()
+            if (
+                ctypes.windll.dxgi.CreateDXGIFactory1(
+                    ctypes.byref(iid_factory1), ctypes.byref(factory)
+                )
+                != 0
+            ):
+                return
+
+            target_hw_idx = self.device.index if self.device.index is not None else 0
+            hw_seen = 0
+            adapter_idx = 0
+            while True:
+                adapter = ctypes.c_void_p()
+                hr = self._call_com(
+                    factory,
+                    12,
+                    [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)],
+                    adapter_idx,
+                    ctypes.byref(adapter),
+                )
+                if hr < 0:
+                    break
+
+                desc = _DXGI_ADAPTER_DESC1()
+                self._call_com(
+                    adapter,
+                    10,
+                    [ctypes.c_void_p, ctypes.POINTER(_DXGI_ADAPTER_DESC1)],
+                    ctypes.byref(desc),
+                )
+                self._call_com(adapter, 2, [ctypes.c_void_p])
+
+                if not (desc.Flags & 2) and desc.DedicatedVideoMemory > 0:
+                    if hw_seen == target_hw_idx:
+                        high = (desc.AdapterLuid >> 32) & 0xFFFFFFFF
+                        low = desc.AdapterLuid & 0xFFFFFFFF
+                        self.luid_key = f"0x{high:08x}_0x{low:08x}".lower()
+                        self.adapter_name = str(desc.Description)
+                        self.dedicated_total_gb = desc.DedicatedVideoMemory / (1024**3)
+                        self.shared_budget_gb = desc.SharedSystemMemory / (1024**3)
+                        break
+                    hw_seen += 1
+                adapter_idx += 1
+
+            self._call_com(factory, 2, [ctypes.c_void_p])
+            if not self.luid_key:
+                return
+
+            pdh = ctypes.windll.pdh
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(self._h_query)) != 0:
+                return
+
+            add_fn = getattr(pdh, "PdhAddEnglishCounterW", pdh.PdhAddCounterW)
+            p_ded = "\\GPU Adapter Memory(*)\\Dedicated Usage"
+            p_shr = "\\GPU Adapter Memory(*)\\Shared Usage"
+            if (
+                add_fn(self._h_query, p_ded, 0, ctypes.byref(self._h_dedicated)) != 0
+                or add_fn(self._h_query, p_shr, 0, ctypes.byref(self._h_shared)) != 0
+            ):
+                pdh.PdhCloseQuery(self._h_query)
+                self._h_query = ctypes.c_void_p()
+                return
+
+            self._pdh = pdh
+            self.active = True
+            _, shr_used = self._read_pdh_counters()
+            self.shared_baseline_gb = shr_used
+        except Exception:
+            self.active = False
+
+    def _extract_counter_gb(self, h_counter: ctypes.c_void_p) -> float:
+        if not self.active or self._pdh is None or not h_counter.value:
+            return 0.0
+        dw_buf_size = ctypes.c_ulong(0)
+        dw_item_count = ctypes.c_ulong(0)
+        self._pdh.PdhGetFormattedCounterArrayW(
+            h_counter,
+            0x00000400,
+            ctypes.byref(dw_buf_size),
+            ctypes.byref(dw_item_count),
+            None,
+        )
+        if dw_buf_size.value == 0 or dw_item_count.value == 0:
+            return 0.0
+
+        buf = (ctypes.c_char * dw_buf_size.value)()
+        if (
+            self._pdh.PdhGetFormattedCounterArrayW(
+                h_counter,
+                0x00000400,
+                ctypes.byref(dw_buf_size),
+                ctypes.byref(dw_item_count),
+                buf,
+            )
+            != 0
+        ):
+            return 0.0
+
+        items = ctypes.cast(
+            buf,
+            ctypes.POINTER(_PDH_FMT_COUNTERVALUE_ITEM * dw_item_count.value),
+        ).contents
+        total_gb = 0.0
+        target_token = f"luid_{self.luid_key}"
+        for item in items:
+            if item.szName and target_token in item.szName.lower():
+                total_gb += float(item.FmtValue.value.largeValue) / (1024**3)
+        return total_gb
+
+    def _read_pdh_counters(self) -> Tuple[float, float]:
+        if not self.active or self._pdh is None or not self._h_query.value:
+            return 0.0, 0.0
+        if self._pdh.PdhCollectQueryData(self._h_query) != 0:
+            return 0.0, 0.0
+        ded_gb = self._extract_counter_gb(self._h_dedicated)
+        shr_gb = self._extract_counter_gb(self._h_shared)
+        return ded_gb, shr_gb
+
+    def recalibrate_baseline(self) -> None:
+        if self.active:
+            _, shr_used = self._read_pdh_counters()
+            if self.shared_baseline_gb <= 0.0 or shr_used < self.shared_baseline_gb:
+                self.shared_baseline_gb = shr_used
+
+    def poll(self) -> WDDMMemorySnapshot:
+        pt_alloc_bytes = 0
+        pt_res_bytes = 0
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            pt_alloc_bytes = torch.cuda.memory_allocated(self.device)
+            pt_res_bytes = torch.cuda.memory_reserved(self.device)
+
+        pt_alloc_gb = pt_alloc_bytes / (1024**3)
+        pt_res_gb = pt_res_bytes / (1024**3)
+        pt_reclaim_gb = max(0.0, pt_res_gb - pt_alloc_gb)
+
+        if self.active:
+            ded_used, shr_used = self._read_pdh_counters()
+            ded_avail = max(0.0, self.dedicated_total_gb - ded_used)
+            shr_delta = max(0.0, shr_used - self.shared_baseline_gb)
+            is_spilling = shr_delta > 0.05 or ded_avail < 1.25
+            return WDDMMemorySnapshot(
+                dedicated_total_gb=self.dedicated_total_gb,
+                dedicated_used_gb=ded_used,
+                dedicated_avail_gb=ded_avail,
+                shared_budget_gb=self.shared_budget_gb,
+                shared_used_gb=shr_used,
+                shared_delta_gb=shr_delta,
+                pt_allocated_gb=pt_alloc_gb,
+                pt_reserved_gb=pt_res_gb,
+                pt_reclaimable_gb=pt_reclaim_gb,
+                is_spilling=is_spilling,
+            )
+
+        free_b, total_b = (0, 0)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                free_b, total_b = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                total_b = int(32 * (1024**3))
+                free_b = max(0, total_b - pt_res_bytes)
+        ded_total = total_b / (1024**3)
+        ded_avail = free_b / (1024**3)
+        ded_used = max(0.0, ded_total - ded_avail)
+        return WDDMMemorySnapshot(
+            dedicated_total_gb=ded_total,
+            dedicated_used_gb=ded_used,
+            dedicated_avail_gb=ded_avail,
+            shared_budget_gb=0.0,
+            shared_used_gb=0.0,
+            shared_delta_gb=0.0,
+            pt_allocated_gb=pt_alloc_gb,
+            pt_reserved_gb=pt_res_gb,
+            pt_reclaimable_gb=pt_reclaim_gb,
+            is_spilling=False,
+        )
+
+    def enforce_stage_budget(
+        self,
+        required_headroom_gb: float = 2.50,
+        force: bool = False,
+    ) -> WDDMMemorySnapshot:
+        snap = self.poll()
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return snap
+
+        reclaimable_bytes = int(snap.pt_reclaimable_gb * (1024**3))
+        reserved_bytes = int(snap.pt_reserved_gb * (1024**3))
+
+        needs_eviction = (
+            force
+            or snap.is_spilling
+            or (snap.dedicated_avail_gb < required_headroom_gb)
+            or (reserved_bytes > _VRAM_TRIM_THRESHOLD_BYTES)
+        )
+        if needs_eviction and (
+            force or reclaimable_bytes >= _MIN_RECLAIMABLE_CACHE_BYTES
+        ):
+            gc.collect()
+            torch.cuda.empty_cache()
+            snap = self.poll()
+        return snap
+
+    def close(self) -> None:
+        if self.active and self._pdh is not None and self._h_query.value:
+            try:
+                self._pdh.PdhCloseQuery(self._h_query)
+            except Exception:
+                pass
+        self._h_query = ctypes.c_void_p()
+        self._h_dedicated = ctypes.c_void_p()
+        self._h_shared = ctypes.c_void_p()
+        self.active = False
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class _MetaWeightInitMode(TorchFunctionMode):
@@ -153,6 +476,14 @@ def _pin_cpu_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return cpu_t
 
 
+def _evacuate_to_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if t is None:
+        return None
+    if t.device.type == "cpu":
+        return t
+    return t.detach().to(device="cpu").contiguous()
+
+
 def _probe_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
     try:
         with open(path, "rb") as f:
@@ -161,16 +492,73 @@ def _probe_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
             w, h = struct.unpack(">II", hdr[16:24])
             if w > 0 and h > 0:
                 return int(w), int(h)
-        if len(hdr) >= 40 and hdr[:16] == b"VIZJ_CONTAINER01":
+        if len(hdr) >= 48 and hdr[:16] == b"VIZJ_CONTAINER01":
             orig_w, orig_h, vae_w, vae_h = struct.unpack("<IIII", hdr[32:48])
-            if orig_w > 0 and orig_h > 0:
-                return int(orig_w), int(orig_h)
             if vae_w > 0 and vae_h > 0:
                 return int(vae_w), int(vae_h)
+            if orig_w > 0 and orig_h > 0:
+                return int(orig_w), int(orig_h)
         with Image.open(path) as img:
             return int(img.width), int(img.height)
     except Exception:
         return None
+
+
+def _normalize_vizinjector_framing(framing_mode: Optional[str]) -> str:
+    fm = str(framing_mode or "inscribed").strip().lower()
+    if fm in ("inscribed", "cover_crop"):
+        return "inscribed"
+    if fm in ("contain", "stretch", "never_crop"):
+        return fm
+    return "inscribed"
+
+
+def build_box_aperture_mask(
+    layout_items: Sequence[Dict[str, Any]],
+    height: int,
+    width: int,
+    coords_are_pixels: bool,
+    feather_radius_lat: float,
+    device: torch.device,
+    only_flagged_boxes: bool = False,
+) -> Optional[torch.Tensor]:
+    h_lat = max(1, height // 16)
+    w_lat = max(1, width // 16)
+    active_boxes: List[Tuple[float, float, float, float]] = []
+
+    for item in layout_items:
+        if not isinstance(item, dict) or item.get("enabled", True) is False:
+            continue
+        if only_flagged_boxes and not bool(item.get("inpaint_box", False)):
+            continue
+        bbox = item.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            uy0, ux0, uy1, ux1 = bbox_to_normalized(
+                bbox, height=height, width=width, coords_are_pixels=coords_are_pixels
+            )
+            if (uy1 - uy0) > 1e-4 and (ux1 - ux0) > 1e-4:
+                active_boxes.append((uy0, ux0, uy1, ux1))
+
+    if not active_boxes:
+        return None
+
+    yy = torch.arange(h_lat, device=device, dtype=torch.float32).unsqueeze(1) + 0.5
+    xx = torch.arange(w_lat, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
+    feather = max(0.25, float(feather_radius_lat))
+    mask = torch.zeros((h_lat, w_lat), device=device, dtype=torch.float32)
+
+    for uy0, ux0, uy1, ux1 in active_boxes:
+        ly0 = uy0 * h_lat
+        ly1 = uy1 * h_lat
+        lx0 = ux0 * w_lat
+        lx1 = ux1 * w_lat
+        dy = torch.maximum(torch.maximum(ly0 - yy, yy - ly1), torch.zeros_like(yy))
+        dx = torch.maximum(torch.maximum(lx0 - xx, xx - lx1), torch.zeros_like(xx))
+        dist = torch.sqrt(dy * dy + dx * dx)
+        box_m = 0.5 * (1.0 + torch.cos(math.pi * (dist / feather).clamp(0.0, 1.0)))
+        mask = torch.maximum(mask, box_m)
+
+    return mask.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)
 
 
 def splitmix64(seed: int) -> int:
@@ -467,16 +855,16 @@ class BifurcatedFlowMatchScheduler:
         )
 
         active_steps = len(sigmas_np)
-        progress_vals = 1.0 - sigmas_np
         if self.handoff_threshold >= 1.0:
             k_star = active_steps
         elif self.handoff_threshold <= 0.0:
             k_star = 0
         else:
+            denom = float(max(1, active_steps))
             cand = [
                 i
                 for i in range(active_steps)
-                if progress_vals[i] >= self.handoff_threshold
+                if (float(i) / denom) >= self.handoff_threshold - 1e-9
             ]
             k_star = cand[0] if cand else active_steps
 
@@ -586,7 +974,7 @@ class BifurcatedFlowMatchScheduler:
     ) -> torch.Tensor:
         if self.eta <= 0.0 or self.s_noise <= 0.0 or self.handoff_threshold <= 0.0:
             return torch.zeros_like(ref_tensor)
-        progress = 1.0 - s_curr
+        progress = self.current_progress
         if progress >= self.handoff_threshold or s_next <= 0.0:
             return torch.zeros_like(ref_tensor)
 
@@ -800,6 +1188,8 @@ class ReferenceVisionCache:
         path: Path, target_w: int, target_h: int, framing_mode: str
     ) -> str:
         fm = str(framing_mode).lower()
+        if fm == "cover_crop":
+            fm = "inscribed"
         if fm == "never_crop":
             dims = _probe_image_dimensions(path)
             if dims is not None:
@@ -1156,8 +1546,8 @@ def load_image_tensor_16px(
     img = Image.open(image_path).convert("RGB")
     w_in, h_in = img.size
     if target_h is not None and target_w is not None:
-        h_out = (target_h // 16) * 16
-        w_out = (target_w // 16) * 16
+        h_out = max(64, (target_h // 16) * 16)
+        w_out = max(64, (target_w // 16) * 16)
     else:
         scale = min(1.0, math.sqrt((1024.0 * 1024.0) / float(max(1, w_in * h_in))))
         h_out = max(64, (int(round(h_in * scale)) // 16) * 16)
@@ -1227,10 +1617,19 @@ class MOSSImageEngine:
         self.vae: Optional[Flux2AutoencoderKL] = None
         self.embed_cache = PromptEmbedCache(max_entries=32)
         self.ref_cache = ReferenceVisionCache(max_entries=32)
+        self.memory_guard = WDDMMemoryGuard(self.device)
         self.vizinjector: Optional[Any] = None
         if HAS_VIZINJECTOR and VizInjectorClient is not None:
             try:
-                self.vizinjector = VizInjectorClient(prefer_vulkan=prefer_vulkan)
+                local_viz_dll = ROOT_DIR / "vizinjector" / (
+                    "vizinjector.dll"
+                    if sys.platform == "win32"
+                    else "libvizinjector.so"
+                )
+                self.vizinjector = VizInjectorClient(
+                    lib_path=local_viz_dll if local_viz_dll.is_file() else None,
+                    prefer_vulkan=prefer_vulkan,
+                )
             except Exception:
                 self.vizinjector = None
         self._loaded_repo_id: Optional[str] = None
@@ -1261,6 +1660,13 @@ class MOSSImageEngine:
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
+    def _trim_reserved_vram(
+        self, force: bool = False, required_headroom_gb: float = 2.50
+    ) -> WDDMMemorySnapshot:
+        return self.memory_guard.enforce_stage_budget(
+            required_headroom_gb=required_headroom_gb, force=force
+        )
+
     def clear_runtime_caches(self) -> None:
         self.embed_cache.clear()
         self.ref_cache.clear()
@@ -1277,11 +1683,19 @@ class MOSSImageEngine:
             self._sync_device()
         except Exception:
             pass
+        try:
+            self.memory_guard.close()
+        except Exception:
+            pass
 
     def shutdown(self) -> None:
         with torch.inference_mode(False), torch.no_grad():
             try:
                 self._sync_device()
+            except Exception:
+                pass
+            try:
+                self.memory_guard.close()
             except Exception:
                 pass
             if self.vizinjector is not None:
@@ -1379,11 +1793,12 @@ class MOSSImageEngine:
                     self.vae.to(target_device)
                     if self._loaded_repo_id == target_repo_id:
                         self.transformer.to(target_device)
-                        self.transformer.clear_transient_caches()
+                        self.transformer.clear_caches()
                         self._current_offload_state = cpu_offload
                         if torch.cuda.is_available():
                             gc.collect()
                             torch.cuda.empty_cache()
+                        self.memory_guard.recalibrate_baseline()
                         return
                     self._current_offload_state = cpu_offload
                 elif self._loaded_repo_id == target_repo_id:
@@ -1405,6 +1820,8 @@ class MOSSImageEngine:
                     target_repo_id,
                 )
                 transformer_dir = root_path / "transformer"
+                self.transformer.unfuse_lora()
+                self.transformer.clear_caches()
                 del self.transformer
                 self.transformer = None
                 gc.collect()
@@ -1424,6 +1841,10 @@ class MOSSImageEngine:
                 self.transformer.clear_caches()
                 self.transformer.eval().requires_grad_(False)
                 self._loaded_repo_id = target_repo_id
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                self.memory_guard.recalibrate_baseline()
                 logging.info(
                     "Hot-swap completed in %.2fs (Shared Qwen3.5 & Flux2-VAE retained).",
                     time.perf_counter() - t0,
@@ -1490,6 +1911,10 @@ class MOSSImageEngine:
 
             self._loaded_repo_id = target_repo_id
             self._current_offload_state = cpu_offload
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+            self.memory_guard.recalibrate_baseline()
             logging.info(
                 "MOSSImageEngine initialized (%s) in %.2fs.",
                 target_repo_id,
@@ -1507,7 +1932,9 @@ class MOSSImageEngine:
                 or not edit_lora_path.strip()
                 or abs(edit_lora_scale) < 1e-6
             ):
-                self.transformer.unfuse_lora()
+                if self.transformer._lora_backups:
+                    self.transformer.unfuse_lora()
+                    self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
                 return False
 
             raw_spec = edit_lora_path.strip()
@@ -1557,6 +1984,7 @@ class MOSSImageEngine:
                 lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
             )
             del lora_sd
+            self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
             return fused > 0
 
     def _condition_single_reference(
@@ -1564,17 +1992,23 @@ class MOSSImageEngine:
         image_path: Path,
         request: GenerationRequest,
         role_override: Optional[str] = None,
+        framing_override: Optional[str] = None,
         target_w_override: Optional[int] = None,
         target_h_override: Optional[int] = None,
+        force_vit: bool = False,
     ) -> Tuple[CachedReferenceRecord, bool]:
         eff_role = role_override or request.input_role
+        eff_framing = framing_override or request.framing_mode
         eff_w = target_w_override if target_w_override is not None else request.width
         eff_h = target_h_override if target_h_override is not None else request.height
+        eff_w = max(64, (int(eff_w) // 16) * 16)
+        eff_h = max(64, (int(eff_h) // 16) * 16)
+
         cache_key = ReferenceVisionCache.make_key(
             path=image_path,
             target_w=eff_w,
             target_h=eff_h,
-            framing_mode=request.framing_mode,
+            framing_mode=eff_framing,
             input_role=eff_role,
             edit_format=request.edit_format,
             max_vit_patches=request.max_vit_patches,
@@ -1584,7 +2018,7 @@ class MOSSImageEngine:
             path=image_path,
             target_w=eff_w,
             target_h=eff_h,
-            framing_mode=request.framing_mode,
+            framing_mode=eff_framing,
             input_role=eff_role,
             clamp_sigma=request.latent_clamp_sigma,
             mtf_boost=request.mtf_boost,
@@ -1610,7 +2044,9 @@ class MOSSImageEngine:
             and int(request.export_vizj_tier) == VIZJ_TIER_DUAL_LATENT
         )
         need_vit = eff_role == "photo_ref" and (
-            request.edit_format != "moss_image_edit" or want_tier2_export
+            force_vit
+            or request.edit_format != "moss_image_edit"
+            or want_tier2_export
         )
 
         if (
@@ -1640,7 +2076,7 @@ class MOSSImageEngine:
                 target_width=eff_w,
                 target_height=eff_h,
                 max_vit_patches=max_patches,
-                framing_mode=request.framing_mode,
+                framing_mode=_normalize_vizinjector_framing(eff_framing),
                 input_role=eff_role,
                 edit_format=request.edit_format,
                 emit_vae_branch=False if have_cached_vae else None,
@@ -1658,16 +2094,32 @@ class MOSSImageEngine:
             if have_cached_vae:
                 packed_lat = cached_vae_tuple[0]
                 latent_mask = cached_vae_tuple[1]
+                cached_meta = cached_vae_tuple[2]
+                if bundle.meta is not None:
+                    if packed_lat is not None and packed_lat.ndim == 4:
+                        bundle.meta.vae_size = (
+                            int(packed_lat.shape[3]) * 16,
+                            int(packed_lat.shape[2]) * 16,
+                        )
+                    if (
+                        cached_meta is not None
+                        and getattr(cached_meta, "telemetry", None) is not None
+                    ):
+                        bundle.meta.telemetry = cached_meta.telemetry
             else:
-                packed_lat = bundle.packed_latents
+                packed_lat = _evacuate_to_cpu(bundle.packed_latents)
                 if packed_lat is None and bundle.vae_tensor is not None:
                     raw_lat = self.vae.encode_to_packed_latents(bundle.vae_tensor)
-                    packed_lat = subphase_radial_clamp(
+                    clamped_lat = subphase_radial_clamp(
                         raw_lat, max_sigma=request.latent_clamp_sigma
                     )
-                latent_mask = bundle.latent_mask
+                    packed_lat = _evacuate_to_cpu(clamped_lat)
+                    del raw_lat, clamped_lat
+                    bundle.vae_tensor = None
+                    self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+                latent_mask = _evacuate_to_cpu(bundle.latent_mask)
 
-            vit_embeds = bundle.vit_embeds
+            vit_embeds = _evacuate_to_cpu(bundle.vit_embeds)
             if (
                 vit_embeds is None
                 and need_vit
@@ -1680,13 +2132,16 @@ class MOSSImageEngine:
                         device=self.text_encoder.visual.device, non_blocking=True
                     ),
                 )
-                vit_embeds = torch.cat(img_splits, dim=0).detach()
+                vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
+                del img_splits
+                self.text_encoder.visual.clear_caches()
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
 
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
                 vit_embeds=vit_embeds,
-                vit_patches=bundle.vit_patches,
-                grid_thw=bundle.grid_thw,
+                vit_patches=_evacuate_to_cpu(bundle.vit_patches),
+                grid_thw=_evacuate_to_cpu(bundle.grid_thw),
                 llm_tokens=int(bundle.llm_tokens) if need_vit else 0,
                 latent_mask=latent_mask,
                 viz_meta=bundle.meta,
@@ -1700,9 +2155,12 @@ class MOSSImageEngine:
             else:
                 img_t = load_image_tensor_16px(image_path, eff_h, eff_w)
                 raw_lat = self.vae.encode_to_packed_latents(img_t)
-                packed_lat = subphase_radial_clamp(
+                clamped_lat = subphase_radial_clamp(
                     raw_lat, max_sigma=request.latent_clamp_sigma
                 )
+                packed_lat = _evacuate_to_cpu(clamped_lat)
+                del img_t, raw_lat, clamped_lat
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
                 was_hit = False
 
             vit_embeds = None
@@ -1719,7 +2177,10 @@ class MOSSImageEngine:
                         device=self.text_encoder.visual.device, non_blocking=True
                     ),
                 )
-                vit_embeds = torch.cat(img_splits, dim=0).detach()
+                vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
+                del img_splits
+                self.text_encoder.visual.clear_caches()
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
                 vit_embeds=vit_embeds,
@@ -1782,11 +2243,32 @@ class MOSSImageEngine:
         elif vision_reference_paths:
             patch_tensors = []
             grid_tensors = []
+            embed_tensors = []
             patch_counts = []
             for p_str in vision_reference_paths:
                 p = Path(p_str)
                 if p.is_file():
                     st = p.stat()
+                    if self.vizinjector is not None and VizInjectorRequest is not None:
+                        v_req = VizInjectorRequest(
+                            emit_vae_branch=False,
+                            emit_mask_branch=False,
+                            emit_vit_branch=True,
+                            prefer_vulkan=True,
+                        )
+                        v_bundle = self.vizinjector.condition_image(p, v_req)
+                        if v_bundle.grid_thw is not None and v_bundle.llm_tokens > 0:
+                            n_llm = int(v_bundle.llm_tokens)
+                            grid_tensors.append(v_bundle.grid_thw)
+                            patch_counts.append(n_llm)
+                            if v_bundle.vit_embeds is not None:
+                                embed_tensors.append(v_bundle.vit_embeds)
+                            elif v_bundle.vit_patches is not None:
+                                patch_tensors.append(v_bundle.vit_patches)
+                            vision_sig_list.append(
+                                (str(p.resolve()), int(st.st_mtime_ns), int(n_llm))
+                            )
+                            continue
                     patches, g_thw, n_llm = pack_vision_patches_32px(p)
                     patch_tensors.append(patches)
                     grid_tensors.append(g_thw)
@@ -1794,13 +2276,18 @@ class MOSSImageEngine:
                     vision_sig_list.append(
                         (str(p.resolve()), int(st.st_mtime_ns), int(n_llm))
                     )
-            if patch_tensors:
-                pixel_values = torch.cat(patch_tensors, dim=0).to(
-                    device=te_device, non_blocking=True
-                )
+            if grid_tensors:
                 image_grid_thw = torch.cat(grid_tensors, dim=0).to(
                     device=te_device, non_blocking=True
                 )
+                if embed_tensors and len(embed_tensors) == len(grid_tensors):
+                    pre_vit_embeds = torch.cat(embed_tensors, dim=0).to(
+                        device=te_device, non_blocking=True
+                    )
+                elif patch_tensors:
+                    pixel_values = torch.cat(patch_tensors, dim=0).to(
+                        device=te_device, non_blocking=True
+                    )
 
         tok_list = self.tokenizer.encode_chat(
             prompt=prompt,
@@ -1818,6 +2305,7 @@ class MOSSImageEngine:
                 vision_signature=vision_signature,
             )
             if cached is not None:
+                del pixel_values, image_grid_thw, pre_vit_embeds
                 mask = torch.ones(
                     (1, cached.shape[1]), dtype=torch.bool, device=out_device
                 )
@@ -1840,6 +2328,7 @@ class MOSSImageEngine:
                     non_blocking=True,
                 ),
             )
+            del base_embeds, image_mask, pre_vit_embeds
 
         output = self.text_encoder(
             input_ids=input_ids,
@@ -1848,14 +2337,22 @@ class MOSSImageEngine:
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
-        hidden = output.last_hidden_state
+        hidden_cpu = _evacuate_to_cpu(output.last_hidden_state)
+        del (
+            output,
+            input_ids,
+            attention_mask,
+            inputs_embeds,
+            pixel_values,
+            image_grid_thw,
+        )
 
-        if use_cache:
+        if use_cache and hidden_cpu is not None:
             self.embed_cache.insert(
-                tok_list, hidden, vision_signature=vision_signature
+                tok_list, hidden_cpu, vision_signature=vision_signature
             )
 
-        hidden_out = hidden.to(device=out_device, non_blocking=True)
+        hidden_out = hidden_cpu.to(device=out_device, non_blocking=True)
         mask_out = torch.ones(
             (1, hidden_out.shape[1]), dtype=torch.bool, device=out_device
         )
@@ -1894,7 +2391,11 @@ class MOSSImageEngine:
             input_ids=dummy_ids,
             attention_mask=torch.ones_like(dummy_ids, device=exec_dev),
         )
+        dummy_ctx_cpu = _evacuate_to_cpu(dummy_out.last_hidden_state)
+        del dummy_ids, dummy_out
+        self.text_encoder.clear_caches()
         self._sync_device()
+        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         sys.stdout.write(
             f"  [2/3] Warmup: 42-Layer MOSS-DiT 4D-RoPE Velocity Field ({width}x{height})...\n"
@@ -1906,30 +2407,37 @@ class MOSSImageEngine:
             device=exec_dev,
             dtype=torch.float32,
         )
+        dummy_ctx = dummy_ctx_cpu.to(device=exec_dev, non_blocking=True)
         dummy_mask = torch.ones(
-            (1, dummy_out.last_hidden_state.shape[1]),
+            (1, dummy_ctx.shape[1]),
             device=exec_dev,
             dtype=torch.bool,
         )
         _ = self.transformer(
             dummy_lat,
             torch.tensor([500.0], device=exec_dev),
-            dummy_out.last_hidden_state,
+            dummy_ctx,
             dummy_mask,
         )
+        del dummy_ctx_cpu, dummy_ctx, dummy_mask, dummy_lat
         self.transformer.clear_caches()
         self._sync_device()
+        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         sys.stdout.write(
             f"  [3/3] Warmup: Flux2-VAE FP32 Unpatch & Decoder ({width}x{height})...\n"
         )
         sys.stdout.flush()
-        _ = self.vae.decode_packed_latents(dummy_lat)
+        dummy_lat_vae = torch.zeros(
+            (1, self.transformer.config.latent_channels, h_lat, w_lat),
+            device=exec_dev,
+            dtype=torch.float32,
+        )
+        dummy_dec = self.vae.decode_packed_latents(dummy_lat_vae)
+        del dummy_lat_vae, dummy_dec
         self._sync_device()
-
-        del dummy_ids, dummy_out, dummy_lat, dummy_mask
-        if exec_dev.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+        self.memory_guard.recalibrate_baseline()
 
         elapsed = time.perf_counter() - t0
         self._warmed_up = True
@@ -1957,6 +2465,9 @@ class MOSSImageEngine:
             request.edit_lora_path, request.edit_lora_scale
         )
 
+        if not cpu_offload:
+            self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
+
         reporter: Optional[EngineProgressReporter] = None
         if progress_callback is None:
             reporter = EngineProgressReporter()
@@ -1980,9 +2491,10 @@ class MOSSImageEngine:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(explicit_seed)
 
-        init_latents: Optional[torch.Tensor] = None
-        inpaint_mask_tensor: Optional[torch.Tensor] = None
-        ref_latents_list: List[torch.Tensor] = []
+        init_latents_cpu: Optional[torch.Tensor] = None
+        inpaint_mask_cpu: Optional[torch.Tensor] = None
+        ref_latents_cpu_list: List[torch.Tensor] = []
+        ref_bboxes_list: List[Optional[Tuple[float, float, float, float]]] = []
         ref_records_for_prompt: List[CachedReferenceRecord] = []
         any_ref_cache_hit = False
         exported_vizj_str: Optional[str] = None
@@ -1993,11 +2505,12 @@ class MOSSImageEngine:
         has_control = bool(
             request.control_image_path and Path(request.control_image_path).is_file()
         )
-        valid_ref_paths = [
-            Path(p) for p in request.reference_image_paths if Path(p).is_file()
+        visual_ref_specs, _ = request.resolve_visual_references()
+        valid_ref_specs = [
+            spec for spec in visual_ref_specs if Path(spec["path"]).is_file()
         ]
 
-        if has_init or has_control or valid_ref_paths:
+        if has_init or has_control or valid_ref_specs:
             if cpu_offload:
                 self.vae.to(self.device)
                 self.text_encoder.to(self.device)
@@ -2012,7 +2525,7 @@ class MOSSImageEngine:
                     target_h_override=request.height,
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
-                init_latents = init_rec.packed_latents
+                init_latents_cpu = _evacuate_to_cpu(init_rec.packed_latents)
 
                 if (
                     request.inpaint_mask_path
@@ -2023,34 +2536,46 @@ class MOSSImageEngine:
                         m_req = VizInjectorRequest(
                             target_width=request.width,
                             target_height=request.height,
-                            framing_mode=request.framing_mode,
+                            framing_mode=_normalize_vizinjector_framing(
+                                request.framing_mode
+                            ),
                             input_role="inpaint_mask",
                             mask_feather_radius=request.mask_feather_radius,
                             prefer_vulkan=request.prefer_vulkan,
                         )
                         m_bundle = self.vizinjector.condition_image(mask_p, m_req)
                         if m_bundle.latent_mask is not None:
-                            inpaint_mask_tensor = m_bundle.latent_mask.to(
-                                device=self.device, non_blocking=True
-                            )
-                    if inpaint_mask_tensor is None:
+                            inpaint_mask_cpu = _evacuate_to_cpu(m_bundle.latent_mask)
+                    if inpaint_mask_cpu is None:
                         m_img = Image.open(mask_p).convert("L")
                         m_img = m_img.resize(
                             (request.width // 16, request.height // 16),
                             resample=Image.Resampling.BILINEAR,
                         )
                         m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
-                        inpaint_mask_tensor = (
-                            torch.from_numpy(m_arr)
-                            .unsqueeze(0)
-                            .unsqueeze(0)
-                            .to(device=self.device, non_blocking=True)
+                        inpaint_mask_cpu = (
+                            torch.from_numpy(m_arr).unsqueeze(0).unsqueeze(0).contiguous()
                         )
+                elif request.layout_items and (
+                    bool(request.preserve_canvas_outside_boxes)
+                    or any(
+                        isinstance(it, dict) and bool(it.get("inpaint_box", False))
+                        for it in request.layout_items
+                    )
+                ):
+                    only_flagged = not bool(request.preserve_canvas_outside_boxes)
+                    inpaint_mask_cpu = build_box_aperture_mask(
+                        layout_items=request.layout_items,
+                        height=request.height,
+                        width=request.width,
+                        coords_are_pixels=request.layout_coords_are_pixels,
+                        feather_radius_lat=float(request.mask_feather_radius or 1.25),
+                        device=torch.device("cpu"),
+                        only_flagged_boxes=only_flagged,
+                    )
                 elif init_rec.latent_mask is not None:
                     if float(torch.min(init_rec.latent_mask).item()) < 0.99:
-                        inpaint_mask_tensor = init_rec.latent_mask.to(
-                            device=self.device, non_blocking=True
-                        )
+                        inpaint_mask_cpu = _evacuate_to_cpu(init_rec.latent_mask)
 
             if has_control:
                 ctrl_p = Path(request.control_image_path)
@@ -2068,32 +2593,40 @@ class MOSSImageEngine:
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
                 if ctrl_rec.packed_latents is not None:
-                    ref_latents_list.append(
-                        ctrl_rec.packed_latents.to(
-                            device=self.device,
-                            dtype=torch.float32,
-                            non_blocking=True,
-                        )
+                    ref_latents_cpu_list.append(
+                        _evacuate_to_cpu(ctrl_rec.packed_latents)
                     )
+                    ref_bboxes_list.append(None)
 
-            for r_path in valid_ref_paths:
+            for spec in valid_ref_specs:
+                r_path = Path(spec["path"])
+                px_box = spec.get("pixel_bbox")
+                norm_box = spec.get("norm_bbox")
+                is_box_ref = norm_box is not None
+                if px_box is not None:
+                    ymin, xmin, ymax, xmax = px_box
+                    ref_w = max(64, ((xmax - xmin + 8) // 16) * 16)
+                    ref_h = max(64, ((ymax - ymin + 8) // 16) * 16)
+                else:
+                    ref_w = request.width
+                    ref_h = request.height
+
                 r_rec, hit = self._condition_single_reference(
                     r_path,
                     request,
-                    role_override=request.input_role,
+                    role_override=spec.get("input_role", request.input_role),
+                    framing_override=spec.get("framing_mode", request.framing_mode),
+                    target_w_override=ref_w,
+                    target_h_override=ref_h,
+                    force_vit=is_box_ref,
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
                 if r_rec.packed_latents is not None:
-                    ref_latents_list.append(
-                        r_rec.packed_latents.to(
-                            device=self.device,
-                            dtype=torch.float32,
-                            non_blocking=True,
-                        )
-                    )
-                if (
-                    r_rec.llm_tokens > 0
-                    and request.edit_format != "moss_image_edit"
+                    ref_latents_cpu_list.append(_evacuate_to_cpu(r_rec.packed_latents))
+                    ref_bboxes_list.append(norm_box)
+
+                if r_rec.llm_tokens > 0 and (
+                    is_box_ref or request.edit_format != "moss_image_edit"
                 ):
                     ref_records_for_prompt.append(r_rec)
 
@@ -2129,6 +2662,8 @@ class MOSSImageEngine:
                 if torch.cuda.is_available():
                     gc.collect()
                     torch.cuda.empty_cache()
+            else:
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
 
         effective_prompt = request.compile_effective_prompt()
         pos_hits_before = self.embed_cache.pos_hits
@@ -2147,7 +2682,7 @@ class MOSSImageEngine:
             effective_prompt,
             max_sequence_length=request.max_sequence_length,
             enable_thinking=request.enable_thinking,
-            device=self.device,
+            device=torch.device("cpu"),
             is_negative=False,
             prebuilt_vision_records=ref_records_for_prompt,
         )
@@ -2162,19 +2697,22 @@ class MOSSImageEngine:
                 request.negative_prompt or "",
                 max_sequence_length=request.max_sequence_length,
                 enable_thinking=request.enable_thinking,
-                device=self.device,
+                device=torch.device("cpu"),
                 is_negative=True,
             )
             self._sync_device()
             effective_cb("context", 2, ctx_total)
 
         del ref_records_for_prompt
+        self.text_encoder.clear_caches()
 
         if cpu_offload:
             self.text_encoder.to("cpu")
             if torch.cuda.is_available():
                 gc.collect()
                 torch.cuda.empty_cache()
+        else:
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         if cpu_offload:
             self.transformer.to(self.device)
@@ -2186,25 +2724,46 @@ class MOSSImageEngine:
         slg_skip_set = validate_skip_layers(request.slg_layers, depth, "slg_layers")
 
         num_imgs = request.num_images_per_prompt
+        pos_dev = pos_embeds.to(device=self.device, non_blocking=True)
+        pos_mask_dev = pos_mask.to(device=self.device, non_blocking=True)
+        neg_dev = (
+            neg_embeds.to(device=self.device, non_blocking=True)
+            if neg_embeds is not None
+            else None
+        )
+        neg_mask_dev = (
+            neg_mask.to(device=self.device, non_blocking=True)
+            if neg_mask is not None
+            else None
+        )
+        del pos_embeds, pos_mask, neg_embeds, neg_mask
+
         if num_imgs == 1:
-            positive = pos_embeds
-            positive_mask = pos_mask
-            negative = neg_embeds
-            negative_mask = neg_mask
+            positive = pos_dev
+            positive_mask = pos_mask_dev
+            negative = neg_dev
+            negative_mask = neg_mask_dev
         else:
-            positive = pos_embeds.repeat_interleave(num_imgs, dim=0)
-            positive_mask = pos_mask.repeat_interleave(num_imgs, dim=0)
+            positive = pos_dev.repeat_interleave(num_imgs, dim=0)
+            positive_mask = pos_mask_dev.repeat_interleave(num_imgs, dim=0)
             negative = (
-                neg_embeds.repeat_interleave(num_imgs, dim=0)
-                if neg_embeds is not None
+                neg_dev.repeat_interleave(num_imgs, dim=0)
+                if neg_dev is not None
                 else None
             )
             negative_mask = (
-                neg_mask.repeat_interleave(num_imgs, dim=0)
-                if neg_mask is not None
+                neg_mask_dev.repeat_interleave(num_imgs, dim=0)
+                if neg_mask_dev is not None
                 else None
             )
-        del pos_embeds, pos_mask, neg_embeds, neg_mask
+            del pos_dev, pos_mask_dev, neg_dev, neg_mask_dev
+
+        ref_latents_list: List[torch.Tensor] = [
+            r_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True)
+            for r_cpu in ref_latents_cpu_list
+            if r_cpu is not None
+        ]
+        del ref_latents_cpu_list
 
         shape = (
             num_imgs,
@@ -2223,8 +2782,8 @@ class MOSSImageEngine:
         )
 
         clean_init_latents: Optional[torch.Tensor] = None
-        if init_latents is not None:
-            clean_init_latents = init_latents.to(
+        if init_latents_cpu is not None:
+            clean_init_latents = init_latents_cpu.to(
                 device=self.device, dtype=torch.float32, non_blocking=True
             )
             if clean_init_latents.shape[-2:] != shape[-2:]:
@@ -2234,18 +2793,21 @@ class MOSSImageEngine:
                     mode="bilinear",
                     align_corners=False,
                 )
-        del init_latents
+        del init_latents_cpu
 
-        if (
-            inpaint_mask_tensor is not None
-            and inpaint_mask_tensor.shape[-2:] != shape[-2:]
-        ):
-            inpaint_mask_tensor = F.interpolate(
-                inpaint_mask_tensor.float(),
-                size=shape[-2:],
-                mode="bilinear",
-                align_corners=False,
+        inpaint_mask_tensor: Optional[torch.Tensor] = None
+        if inpaint_mask_cpu is not None:
+            inpaint_mask_tensor = inpaint_mask_cpu.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
             )
+            if inpaint_mask_tensor.shape[-2:] != shape[-2:]:
+                inpaint_mask_tensor = F.interpolate(
+                    inpaint_mask_tensor,
+                    size=shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        del inpaint_mask_cpu
 
         start_step = 0
         if clean_init_latents is not None and 0.0 < request.denoise_strength < 1.0:
@@ -2272,16 +2834,16 @@ class MOSSImageEngine:
         )
 
         if use_bifurcated:
-            active_scheduler: Union[MOSSImageScheduler, BifurcatedFlowMatchScheduler] = (
-                BifurcatedFlowMatchScheduler(
-                    early_solver=request.early_solver,
-                    late_solver=request.late_solver,
-                    handoff_threshold=request.handoff_threshold,
-                    shift=request.shift,
-                    eta=request.eta,
-                    s_noise=request.s_noise,
-                    use_v2_grid=request.use_v2_grid,
-                )
+            active_scheduler: Union[
+                MOSSImageScheduler, BifurcatedFlowMatchScheduler
+            ] = BifurcatedFlowMatchScheduler(
+                early_solver=request.early_solver,
+                late_solver=request.late_solver,
+                handoff_threshold=request.handoff_threshold,
+                shift=request.shift,
+                eta=request.eta,
+                s_noise=request.s_noise,
+                use_v2_grid=request.use_v2_grid,
             )
             active_scheduler.set_timesteps(
                 num_inference_steps=request.num_inference_steps,
@@ -2306,6 +2868,11 @@ class MOSSImageEngine:
         num_passes = len(timesteps)
         total_nfe = 0
         active_ref_latents = ref_latents_list if ref_latents_list else None
+        active_ref_bboxes = (
+            ref_bboxes_list
+            if (ref_bboxes_list and any(b is not None for b in ref_bboxes_list))
+            else None
+        )
         ref_zero_t = request.effective_reference_zero_timestep
         ref_iso_kv = request.effective_reference_isolated_kv
 
@@ -2343,6 +2910,7 @@ class MOSSImageEngine:
                 reference_latents=active_ref_latents,
                 reference_zero_timestep=ref_zero_t,
                 reference_isolated_kv=ref_iso_kv,
+                reference_bboxes=active_ref_bboxes,
             ).sample.float()
             conditional = prediction
             total_nfe += 1
@@ -2361,6 +2929,7 @@ class MOSSImageEngine:
                     reference_latents=active_ref_latents,
                     reference_zero_timestep=ref_zero_t,
                     reference_isolated_kv=ref_iso_kv,
+                    reference_bboxes=active_ref_bboxes,
                     **skip_kwargs,
                 ).sample.float()
                 prediction = uncond + current_cfg * (prediction - uncond)
@@ -2376,6 +2945,7 @@ class MOSSImageEngine:
                     reference_latents=active_ref_latents,
                     reference_zero_timestep=ref_zero_t,
                     reference_isolated_kv=ref_iso_kv,
+                    reference_bboxes=active_ref_bboxes,
                 ).sample.float()
                 if not do_step_cfg:
                     prediction = skipped
@@ -2420,14 +2990,28 @@ class MOSSImageEngine:
 
         dit_elapsed = time.perf_counter() - dit_t0
 
-        self.transformer.clear_transient_caches()
+        if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
+            early_steps = active_scheduler._early_steps
+            late_steps = active_scheduler._late_steps
+        else:
+            early_steps = len(active_scheduler.timesteps)
+            late_steps = 0
+
+        latents_cpu = _evacuate_to_cpu(latents)
+        self.transformer.clear_caches()
         del (
+            latents,
+            timesteps,
+            active_scheduler,
+            step_events,
             positive,
             positive_mask,
             negative,
             negative_mask,
             active_ref_latents,
+            active_ref_bboxes,
             ref_latents_list,
+            ref_bboxes_list,
             prediction,
             conditional,
             uncond,
@@ -2443,35 +3027,43 @@ class MOSSImageEngine:
                 gc.collect()
                 torch.cuda.empty_cache()
             self.vae.to(self.device)
+        else:
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
 
         if reporter is not None:
             reporter.start_stage("vae", num_imgs)
 
-        decoded_tensor = self.vae.decode_packed_latents(latents)
-        del latents
+        latents_vae = latents_cpu.to(device=self.device, non_blocking=True)
+        del latents_cpu
+        decoded_gpu = self.vae.decode_packed_latents(latents_vae)
+        del latents_vae
+        decoded_cpu = _evacuate_to_cpu(decoded_gpu)
+        del decoded_gpu
         self._sync_device()
-
-        if self.vizinjector is not None:
-            pil_images, viz_telems = self.vizinjector.postprocess_to_pil(
-                decoded_tensor, apply_bayer_dither=request.apply_bayer_dither
-            )
-            mean_luma = viz_telems[0].mean_luminance
-            rms_contrast = viz_telems[0].rms_contrast
-            entropy = viz_telems[0].shannon_entropy_bits
-            sharpness = viz_telems[0].laplacian_sharpness
-        else:
-            pil_images = self.postprocess_to_pil(decoded_tensor)
-            mean_luma, rms_contrast, entropy, sharpness = compute_image_telemetry(
-                pil_images[0]
-            )
-        del decoded_tensor
-        effective_cb("vae", len(pil_images), len(pil_images))
 
         if cpu_offload:
             self.vae.to("cpu")
             if torch.cuda.is_available():
                 gc.collect()
                 torch.cuda.empty_cache()
+        else:
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+
+        if self.vizinjector is not None:
+            pil_images, viz_telems = self.vizinjector.postprocess_to_pil(
+                decoded_cpu, apply_bayer_dither=request.apply_bayer_dither
+            )
+            mean_luma = viz_telems[0].mean_luminance
+            rms_contrast = viz_telems[0].rms_contrast
+            entropy = viz_telems[0].shannon_entropy_bits
+            sharpness = viz_telems[0].laplacian_sharpness
+        else:
+            pil_images = self.postprocess_to_pil(decoded_cpu)
+            mean_luma, rms_contrast, entropy, sharpness = compute_image_telemetry(
+                pil_images[0]
+            )
+        del decoded_cpu
+        effective_cb("vae", len(pil_images), len(pil_images))
 
         if reporter is not None:
             reporter.close()
@@ -2492,13 +3084,6 @@ class MOSSImageEngine:
             ep = out_path.with_name(f"{out_path.stem}_{idx}{out_path.suffix}")
             extra_img.save(str(ep))
             extra_paths.append(str(ep))
-
-        if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
-            early_steps = active_scheduler._early_steps
-            late_steps = active_scheduler._late_steps
-        else:
-            early_steps = len(active_scheduler.timesteps)
-            late_steps = 0
 
         step_ms = (dit_elapsed * 1000.0) / float(max(1, early_steps + late_steps))
 

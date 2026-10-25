@@ -1,10 +1,11 @@
+# ShadowBoxer/models/modeling_moss.py
 from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -21,6 +22,9 @@ _FP8_DTYPES: Set[torch.dtype] = {
     )
     if (dtype := getattr(torch, name, None)) is not None
 }
+
+IsoKVSpec = Tuple[int, Tuple[int, ...], int]
+NormBBox = Tuple[float, float, float, float]
 
 
 def _maybe_pin_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -110,6 +114,31 @@ def validate_skip_layers(
     return set(parsed)
 
 
+def _normalize_ref_bboxes(
+    ref_shapes: Optional[List[Tuple[int, int]]],
+    ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]],
+) -> Tuple[Optional[NormBBox], ...]:
+    if not ref_shapes:
+        return ()
+    if not ref_bboxes:
+        return tuple(None for _ in ref_shapes)
+    out: List[Optional[NormBBox]] = []
+    for idx in range(len(ref_shapes)):
+        b = ref_bboxes[idx] if idx < len(ref_bboxes) else None
+        if b is None or len(b) != 4:
+            out.append(None)
+        else:
+            y0 = max(0.0, min(1.0, float(b[0])))
+            x0 = max(0.0, min(1.0, float(b[1])))
+            y1 = max(y0, min(1.0, float(b[2])))
+            x1 = max(x0, min(1.0, float(b[3])))
+            if y0 <= 1e-5 and x0 <= 1e-5 and y1 >= 1.0 - 1e-5 and x1 >= 1.0 - 1e-5:
+                out.append(None)
+            else:
+                out.append((round(y0, 6), round(x0, 6), round(y1, 6), round(x1, 6)))
+    return tuple(out)
+
+
 def _rotate(
     x: torch.Tensor,
     rope: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -131,6 +160,7 @@ def _attention(
     rope: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     heads: int,
     attn_mask: Optional[torch.Tensor] = None,
+    iso_kv_spec: Optional[IsoKVSpec] = None,
 ) -> torch.Tensor:
     if q.ndim == 3:
         q = q.unflatten(-1, (heads, -1))
@@ -141,11 +171,62 @@ def _attention(
     q = _rotate(q, rope).transpose(1, 2)
     k = _rotate(k, rope).transpose(1, 2)
     v = v.transpose(1, 2)
+
+    q_in = q if q.dtype == v.dtype else q.to(v.dtype)
+    k_in = k if k.dtype == v.dtype else k.to(v.dtype)
+    v_in = v
+
+    if iso_kv_spec is not None and attn_mask is None:
+        target_tokens, ref_token_lengths, _ = iso_kv_spec
+        total_ref = sum(ref_token_lengths)
+        if total_ref > 0:
+            text_start = target_tokens + total_ref
+            out_buf = torch.empty_like(q_in)
+
+            q_main = torch.cat(
+                (q_in[:, :, :target_tokens, :], q_in[:, :, text_start:, :]), dim=2
+            )
+            out_main = F.scaled_dot_product_attention(
+                q_main, k_in, v_in, attn_mask=None
+            )
+            out_buf[:, :, :target_tokens, :].copy_(out_main[:, :, :target_tokens, :])
+            out_buf[:, :, text_start:, :].copy_(out_main[:, :, target_tokens:, :])
+            del q_main, out_main
+
+            k_text = k_in[:, :, text_start:, :]
+            v_text = v_in[:, :, text_start:, :]
+            cursor = target_tokens
+            for r_len in ref_token_lengths:
+                next_cursor = cursor + r_len
+                q_ref = q_in[:, :, cursor:next_cursor, :]
+                if next_cursor == text_start:
+                    k_ref = k_in[:, :, cursor:, :]
+                    v_ref = v_in[:, :, cursor:, :]
+                    out_ref = F.scaled_dot_product_attention(
+                        q_ref, k_ref, v_ref, attn_mask=None
+                    )
+                else:
+                    k_ref = torch.cat(
+                        (k_in[:, :, cursor:next_cursor, :], k_text), dim=2
+                    )
+                    v_ref = torch.cat(
+                        (v_in[:, :, cursor:next_cursor, :], v_text), dim=2
+                    )
+                    out_ref = F.scaled_dot_product_attention(
+                        q_ref, k_ref, v_ref, attn_mask=None
+                    )
+                    del k_ref, v_ref
+                out_buf[:, :, cursor:next_cursor, :].copy_(out_ref)
+                del out_ref
+                cursor = next_cursor
+
+            return out_buf.transpose(1, 2).flatten(2)
+
     return (
         F.scaled_dot_product_attention(
-            q if q.dtype == v.dtype else q.to(v.dtype),
-            k if k.dtype == v.dtype else k.to(v.dtype),
-            v,
+            q_in,
+            k_in,
+            v_in,
             attn_mask=attn_mask,
         )
         .transpose(1, 2)
@@ -230,6 +311,7 @@ class _Block(nn.Module):
             ],
         ],
         attn_mask: Optional[torch.Tensor] = None,
+        iso_kv_spec: Optional[IsoKVSpec] = None,
     ) -> torch.Tensor:
         if isinstance(modulation, tuple):
             shift_a, scale_a_p1, gate_a, shift_f, scale_f_p1, gate_f = modulation
@@ -250,7 +332,15 @@ class _Block(nn.Module):
         q = self.q_norm(_linear(self.proj["q"], y).unflatten(-1, (self.heads, -1)))
         k = self.k_norm(_linear(self.proj["k"], y).unflatten(-1, (self.heads, -1)))
         v = _linear(self.proj["v"], y).unflatten(-1, (self.heads, -1))
-        attn_out = _attention(q, k, v, rope, self.heads, attn_mask=attn_mask)
+        attn_out = _attention(
+            q,
+            k,
+            v,
+            rope,
+            self.heads,
+            attn_mask=attn_mask,
+            iso_kv_spec=iso_kv_spec,
+        )
         x = x + _linear(self.proj["o"], attn_out) * gate_a
 
         y = self.norm2(x) * scale_f_p1 + shift_f
@@ -267,11 +357,11 @@ class _RoPE(nn.Module):
         self.base = base
         self.register_buffer("bands", self._default_bands(torch.device("cpu")))
         self._phase_cache: OrderedDict[
-            Tuple[int, int, int, Tuple[Tuple[int, int], ...], str, torch.dtype],
+            Tuple[Any, ...],
             torch.Tensor,
         ] = OrderedDict()
         self._expanded_cache: OrderedDict[
-            Tuple[int, int, int, Tuple[Tuple[int, int], ...], str, torch.dtype],
+            Tuple[Any, ...],
             Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
         ] = OrderedDict()
 
@@ -304,9 +394,12 @@ class _RoPE(nn.Module):
         text_length: int,
         device: torch.device,
         ref_shapes: Optional[List[Tuple[int, int]]] = None,
+        ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> torch.Tensor:
         if self.bands.dtype != torch.float32 or self.bands.device != device:
             self.bands = self._default_bands(device)
+        cy = (height - 1) / 2.0
+        cx = (width - 1) / 2.0
         h, w = torch.meshgrid(
             torch.arange(height, device=device),
             torch.arange(width, device=device),
@@ -319,32 +412,72 @@ class _RoPE(nn.Module):
             .flatten(0, 1)
             .float()
         )
-        image[:, 2] -= (height - 1) / 2.0
-        image[:, 3] -= (width - 1) / 2.0
-
+        image[:, 2] -= cy
+        image[:, 3] -= cx
         coord_parts = [image]
+
         if ref_shapes:
-            for r_idx, (rh, rw) in enumerate(ref_shapes, start=1):
-                gh, gw = torch.meshgrid(
-                    torch.arange(rh, device=device),
-                    torch.arange(rw, device=device),
-                    indexing="ij",
-                )
-                ref_coord = (
-                    torch.stack(
+            norm_boxes = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+            for r_idx, ((rh, rw), r_box) in enumerate(
+                zip(ref_shapes, norm_boxes), start=1
+            ):
+                if r_box is not None:
+                    uy0, ux0, uy1, ux1 = r_box
+                    y_start = uy0 * (height - 1) - cy
+                    y_end = uy1 * (height - 1) - cy
+                    x_start = ux0 * (width - 1) - cx
+                    x_end = ux1 * (width - 1) - cx
+                    if rh > 1:
+                        y_axis = torch.linspace(
+                            y_start, y_end, rh, device=device, dtype=torch.float32
+                        )
+                    else:
+                        y_axis = torch.tensor(
+                            [0.5 * (y_start + y_end)],
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                    if rw > 1:
+                        x_axis = torch.linspace(
+                            x_start, x_end, rw, device=device, dtype=torch.float32
+                        )
+                    else:
+                        x_axis = torch.tensor(
+                            [0.5 * (x_start + x_end)],
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                    gh, gw = torch.meshgrid(y_axis, x_axis, indexing="ij")
+                    ref_coord = torch.stack(
                         (
-                            torch.full_like(gh, r_idx),
-                            torch.full_like(gh, text_length),
+                            torch.full_like(gh, float(r_idx)),
+                            torch.full_like(gh, float(text_length)),
                             gh,
                             gw,
                         ),
                         -1,
+                    ).flatten(0, 1)
+                else:
+                    gh, gw = torch.meshgrid(
+                        torch.arange(rh, device=device),
+                        torch.arange(rw, device=device),
+                        indexing="ij",
                     )
-                    .flatten(0, 1)
-                    .float()
-                )
-                ref_coord[:, 2] -= (rh - 1) / 2.0
-                ref_coord[:, 3] -= (rw - 1) / 2.0
+                    ref_coord = (
+                        torch.stack(
+                            (
+                                torch.full_like(gh, r_idx),
+                                torch.full_like(gh, text_length),
+                                gh,
+                                gw,
+                            ),
+                            -1,
+                        )
+                        .flatten(0, 1)
+                        .float()
+                    )
+                    ref_coord[:, 2] -= (rh - 1) / 2.0
+                    ref_coord[:, 3] -= (rw - 1) / 2.0
                 coord_parts.append(ref_coord)
 
         text = torch.zeros(text_length, 4, device=device, dtype=torch.float32)
@@ -360,24 +493,28 @@ class _RoPE(nn.Module):
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         ref_shapes: Optional[List[Tuple[int, int]]] = None,
+        ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         ref_key = tuple(ref_shapes) if ref_shapes else ()
-        cache_key = (height, width, text_length, ref_key, str(device), dtype)
+        bbox_key = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+        cache_key = (height, width, text_length, ref_key, bbox_key, str(device), dtype)
         cached = self._expanded_cache.get(cache_key)
         if cached is not None:
             self._expanded_cache.move_to_end(cache_key)
             return cached
 
-        phase = self._compute_phase(height, width, text_length, device, ref_shapes)
+        phase = self._compute_phase(
+            height, width, text_length, device, ref_shapes, bbox_key
+        )
         sin_half = phase.sin().flatten(-2).to(dtype=dtype)
         cos_half = phase.cos().flatten(-2).to(dtype=dtype)
-        sin_signed = torch.cat((-sin_half, sin_half), dim=-1)[None, :, None, :].contiguous()
+        sin_signed = (
+            torch.cat((-sin_half, sin_half), dim=-1)[None, :, None, :].contiguous()
+        )
         cos_full = torch.cat((cos_half, cos_half), dim=-1)[None, :, None, :].contiguous()
-
         total_img_tokens = sin_signed.shape[1] - text_length
         sin_text = sin_signed[:, total_img_tokens:, :, :]
         cos_text = cos_full[:, total_img_tokens:, :, :]
-
         pair = ((sin_signed, cos_full), (sin_text, cos_text))
         self._expanded_cache[cache_key] = pair
         while len(self._expanded_cache) > 16:
@@ -392,15 +529,18 @@ class _RoPE(nn.Module):
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         ref_shapes: Optional[List[Tuple[int, int]]] = None,
+        ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> torch.Tensor:
         ref_key = tuple(ref_shapes) if ref_shapes else ()
-        cache_key = (height, width, text_length, ref_key, str(device), dtype)
+        bbox_key = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+        cache_key = (height, width, text_length, ref_key, bbox_key, str(device), dtype)
         cached = self._phase_cache.get(cache_key)
         if cached is not None:
             self._phase_cache.move_to_end(cache_key)
             return cached
-
-        phase = self._compute_phase(height, width, text_length, device, ref_shapes)
+        phase = self._compute_phase(
+            height, width, text_length, device, ref_shapes, bbox_key
+        )
         rope_out = (
             torch.cat((phase.sin(), phase.cos()), -2)
             .flatten(-2)
@@ -463,8 +603,10 @@ class MOSSImageTransformer(nn.Module):
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
+
         self._lora_backups: Dict[str, torch.Tensor] = {}
         self._active_lora_tag: Optional[str] = None
+
         self._isolated_mask_cache: OrderedDict[
             Tuple[int, Tuple[int, ...], int, str], torch.Tensor
         ] = OrderedDict()
@@ -508,13 +650,13 @@ class MOSSImageTransformer(nn.Module):
         self._time_mod_cache.clear()
         self._text_proj_cache.clear()
         self._ref_proj_cache.clear()
+        self._mod_seq_buf = None
 
     def clear_caches(self) -> None:
         self.rope.clear_cache()
         self._isolated_mask_cache.clear()
         self._mod_zero_cache.clear()
         self.clear_transient_caches()
-        self._mod_seq_buf = None
 
     def _apply(self, fn, recurse: bool = True):
         super()._apply(fn, recurse=recurse)
@@ -683,7 +825,6 @@ class MOSSImageTransformer(nn.Module):
             timestep, device=device, dtype=torch.float32
         ).reshape(-1)
         times = times.expand(batch)
-
         half = self.config.freq_dim // 2
         freq = 10000.0 ** (
             -torch.arange(half, device=device, dtype=torch.float64) / half
@@ -728,6 +869,7 @@ class MOSSImageTransformer(nn.Module):
         height: int,
         width: int,
         ref_shapes: Optional[List[Tuple[int, int]]],
+        ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], int]:
         mask_id = id(mask) if mask is not None else 0
         mask_ptr = int(mask.data_ptr()) if mask is not None else 0
@@ -757,6 +899,7 @@ class MOSSImageTransformer(nn.Module):
                     encoder_hidden_states.device,
                     dtype=act_dtype,
                     ref_shapes=ref_shapes,
+                    ref_bboxes=ref_bboxes,
                 )
                 return cached_text, full_rope_4d, text_len
 
@@ -775,6 +918,7 @@ class MOSSImageTransformer(nn.Module):
             encoder_hidden_states.device,
             dtype=act_dtype,
             ref_shapes=ref_shapes,
+            ref_bboxes=ref_bboxes,
         )
         text = self.text_embedder(
             context if context.dtype == act_dtype else context.to(act_dtype),
@@ -826,14 +970,15 @@ class MOSSImageTransformer(nn.Module):
         self, total_seq: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         dim = self.config.dim
+        alloc_seq = ((total_seq + 255) // 256) * 256
         if (
             self._mod_seq_buf is None
             or self._mod_seq_buf.device != device
             or self._mod_seq_buf.dtype != dtype
             or self._mod_seq_buf.shape[2] < total_seq
+            or self._mod_seq_buf.shape[2] > alloc_seq * 2
             or self._mod_seq_buf.shape[3] != dim
         ):
-            alloc_seq = ((total_seq + 255) // 256) * 256
             self._mod_seq_buf = torch.empty(
                 (1, 6, alloc_seq, dim), device=device, dtype=dtype
             )
@@ -893,8 +1038,10 @@ class MOSSImageTransformer(nn.Module):
         reference_latents: Optional[List[torch.Tensor]] = None,
         reference_zero_timestep: bool = False,
         reference_isolated_kv: bool = False,
+        reference_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> Union[TransformerOutput, Tuple[torch.Tensor, ...]]:
         skip_set = validate_skip_layers(skip_layers, len(self.layers))
+
         if (
             hidden_states.ndim != 4
             or hidden_states.shape[1] != self.config.latent_channels
@@ -911,6 +1058,7 @@ class MOSSImageTransformer(nn.Module):
         mod, head = self._compute_time_modulation(
             timestep, batch, hidden_states.device
         )
+
         mod_zero: Optional[torch.Tensor] = None
         if reference_latents and reference_zero_timestep:
             mod_zero = self._get_cached_zero_modulation(hidden_states.device)
@@ -932,7 +1080,6 @@ class MOSSImageTransformer(nn.Module):
             seq_parts = [video]
             total_img_tokens = target_tokens
             ref_token_lengths: List[int] = []
-
             if reference_latents:
                 for ref_lat in reference_latents:
                     r_emb = self._get_or_compute_ref_projection(
@@ -951,6 +1098,7 @@ class MOSSImageTransformer(nn.Module):
                 height=height,
                 width=width,
                 ref_shapes=ref_shapes,
+                ref_bboxes=reference_bboxes,
             )
             seq_parts.append(text)
             x = torch.cat(seq_parts, 1)
@@ -971,6 +1119,7 @@ class MOSSImageTransformer(nn.Module):
                 shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
                     mod_i[:, :, None, :].unbind(1)
                 )
+
             active_mod = (
                 shift_a,
                 1 + scale_a,
@@ -980,18 +1129,19 @@ class MOSSImageTransformer(nn.Module):
                 gate_f,
             )
 
-            attn_mask: Optional[torch.Tensor] = None
+            iso_kv_spec: Optional[IsoKVSpec] = None
             if reference_latents and reference_isolated_kv and ref_token_lengths:
-                attn_mask = self._get_isolated_reference_mask(
-                    target_tokens=target_tokens,
-                    ref_token_lengths=ref_token_lengths,
-                    text_tokens=text_len,
-                    device=hidden_states.device,
-                )
+                iso_kv_spec = (target_tokens, tuple(ref_token_lengths), text_len)
 
             for layer_index, layer in enumerate(self.layers):
                 if layer_index not in skip_set:
-                    x = layer(x, full_rope_4d, active_mod, attn_mask=attn_mask)
+                    x = layer(
+                        x,
+                        full_rope_4d,
+                        active_mod,
+                        attn_mask=None,
+                        iso_kv_spec=iso_kv_spec,
+                    )
 
             x = self.final_norm_video(
                 x[:, :target_tokens].to(self.final_norm_video.weight.dtype)

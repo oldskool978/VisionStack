@@ -15,7 +15,6 @@ BIN_DIR = ROOT_DIR / "bin"
 DIST_DIR = ROOT_DIR / "dist"
 DIST_BIN = DIST_DIR / "bin"
 CACHE_DIR = ROOT_DIR / ".forge_cache"
-
 IS_WIN = sys.platform == "win32"
 HERMETIC_PYTHON_EXE = BIN_DIR / "python" / ("python.exe" if IS_WIN else "bin/python")
 
@@ -93,8 +92,12 @@ def audit_gate_1_binaries_and_sysroot() -> VizInjectorClient:
     for py_name in ("schema.py", "bindings.py", "modeling_vae.py", "__init__.py"):
         staged_py = DIST_BIN / py_name
         if not staged_py.is_file():
-            raise FileNotFoundError(f"Missing staged Python module in dist/bin: {staged_py}")
-    print("  [+] Staged Drop-In Bundle    : schema.py, bindings.py, modeling_vae.py, __init__.py verified in dist/bin")
+            raise FileNotFoundError(
+                f"Missing staged Python module in dist/bin: {staged_py}"
+            )
+    print(
+        "  [+] Staged Drop-In Bundle    : schema.py, bindings.py, modeling_vae.py, __init__.py verified in dist/bin"
+    )
 
     client = VizInjectorClient(DLL_PATH, prefer_vulkan=True)
     print(
@@ -109,7 +112,6 @@ def audit_gate_2_radiometric_math_and_isotropy(client: VizInjectorClient) -> Non
     )
     rng = np.random.default_rng(42)
     ident_rgb = rng.integers(0, 256, size=(256, 256, 3), dtype=np.uint8)
-
     for prefer_vk, label in ((True, "Vulkan"), (False, "C11 AVX2 LUT")):
         req_id = VizInjectorRequest(
             target_width=256,
@@ -244,7 +246,6 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
     )
     b_vk = client.condition_rgba8(synth_rgba, req_vk)
     b_cpu = client.condition_rgba8(synth_rgba, req_cpu)
-
     mae_vae = float(
         torch.mean(torch.abs(b_vk.vae_tensor - b_cpu.vae_tensor)).item()
     )
@@ -338,7 +339,11 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         target_width=1024,
         target_height=1024,
         edit_format="ai_toolkit_isolated",
+        framing_mode="cover_crop",
     )
+    assert (
+        req_edit.framing_mode_id == 0
+    ), f"Expected cover_crop framing_mode_id == 0, got {req_edit.framing_mode_id}"
     b_edit = client.condition_rgba8(synth_rgba, req_edit)
     assert b_edit.meta.vae_size == (
         1024,
@@ -348,8 +353,44 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         b_edit.meta.vit_size[0] <= 384 and b_edit.meta.vit_size[1] <= 384
     ), f"AI-Toolkit ViT size exceeded 384px cap: {b_edit.meta.vit_size}"
     assert b_edit.meta.reference_zero_timestep and b_edit.meta.reference_isolated_kv
+
+    for prefer_vk in (True, False):
+        req_vit_only = VizInjectorRequest(
+            target_width=1024,
+            target_height=1024,
+            edit_format="ai_toolkit_isolated",
+            emit_vae_branch=False,
+            emit_mask_branch=False,
+            emit_vit_branch=True,
+            prefer_vulkan=prefer_vk,
+        )
+        b_vit_only = client.condition_rgba8(synth_rgba, req_vit_only)
+        assert (
+            b_vit_only.vae_tensor is None and b_vit_only.latent_mask is None
+        ), "ViT-only pass must not allocate VAE or mask tensors"
+        assert (
+            b_vit_only.vit_patches is not None and b_vit_only.llm_tokens == 144
+        ), f"ViT-only pass failed to emit 144 LLM tokens: {b_vit_only.llm_tokens}"
+        assert b_vit_only.meta.vae_size == (
+            1024,
+            1024,
+        ), f"ViT-only pass failed to preserve coupled vae_size: {b_vit_only.meta.vae_size}"
+        assert b_vit_only.meta.vit_size == (
+            384,
+            384,
+        ), f"ViT-only pass failed to preserve coupled vit_size: {b_vit_only.meta.vit_size}"
+
+    req_ctrl_fmt = VizInjectorRequest(
+        target_width=1024,
+        target_height=1024,
+        edit_format="control_color_depth",
+        input_role="color_map",
+    )
+    assert (
+        req_ctrl_fmt.reference_zero_timestep and req_ctrl_fmt.reference_isolated_kv
+    ), "control_color_depth must enable reference_zero_timestep and reference_isolated_kv"
     print(
-        f"  [+] OpenMOSS Edit Routing    : VAE={b_edit.meta.vae_size}, ViT={b_edit.meta.vit_size} ({b_edit.llm_tokens} LLM tok, t=0 KV-Isolated)"
+        f"  [+] OpenMOSS Edit Routing    : VAE={b_edit.meta.vae_size}, ViT={b_edit.meta.vit_size} ({b_edit.llm_tokens} LLM tok, ViT-Only Coupled Grid & cover_crop Verified)"
     )
 
 
@@ -399,12 +440,25 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
 
     reloaded.packed_latents = torch.randn((1, 128, 32, 32), dtype=torch.float32)
     reloaded.vit_embeds = torch.randn((256, 4096), dtype=torch.bfloat16)
+    reloaded.meta.vae_size = (0, 0)
+    reloaded.meta.vit_size = (0, 0)
+
     t1_bytes = client.save_vizj(reloaded, tier=VIZJ_TIER_VAE_LATENT, use_bf16=True)
     t2_bytes = client.save_vizj(reloaded, tier=VIZJ_TIER_DUAL_LATENT, use_bf16=True)
+
     b_t1 = client.load_vizj_bytes(t1_bytes)
     b_t2 = client.load_vizj_bytes(t2_bytes)
     assert b_t1.packed_latents.shape == (1, 128, 32, 32)
+    assert b_t2.packed_latents.shape == (1, 128, 32, 32)
     assert b_t2.vit_embeds.shape == (256, 4096)
+    assert b_t2.meta.vae_size == (
+        512,
+        512,
+    ), f"save_vizj failed to heal vae_size from packed_latents: {b_t2.meta.vae_size}"
+    assert b_t2.meta.vit_size == (
+        512,
+        512,
+    ), f"save_vizj failed to heal vit_size from grid_thw: {b_t2.meta.vit_size}"
 
     corrupted = bytearray(t1_bytes)
     corrupted[-8] ^= 0xFF
@@ -415,7 +469,7 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
         crc_caught = True
     assert crc_caught, "CRC32C failed to reject corrupted .vizj payload"
     print(
-        f"  [+] Tier-1 & Tier-2 .VIZJ    : Tier-1 = {len(t1_bytes) / 1024:.1f} KB, Tier-2 = {len(t2_bytes) / (1024**2):.2f} MB | HW CRC32C Verified"
+        f"  [+] Tier-1 & Tier-2 .VIZJ    : Tier-1 = {len(t1_bytes) / 1024:.1f} KB, Tier-2 = {len(t2_bytes) / (1024**2):.2f} MB | Self-Healing Header & HW CRC32C Verified"
     )
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -467,6 +521,7 @@ def audit_gate_5_gpu_acceleration_and_latentization(
         test_rgb[..., 2] = np.clip((1.0 - 0.5 * (xx + yy)) * 255.0, 0, 255).astype(
             np.uint8
         )
+
         bundle = client.latentize(
             test_rgb,
             request=VizInjectorRequest(
@@ -511,10 +566,13 @@ def main() -> None:
     print("=" * 88)
     t0 = time.perf_counter()
     client = audit_gate_1_binaries_and_sysroot()
-    audit_gate_2_radiometric_math_and_isotropy(client)
-    audit_gate_3_vulkan_parity_and_edgecases(client)
-    audit_gate_4_cli_and_vizj_container(client)
-    audit_gate_5_gpu_acceleration_and_latentization(client)
+    try:
+        audit_gate_2_radiometric_math_and_isotropy(client)
+        audit_gate_3_vulkan_parity_and_edgecases(client)
+        audit_gate_4_cli_and_vizj_container(client)
+        audit_gate_5_gpu_acceleration_and_latentization(client)
+    finally:
+        client.close()
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 88)
     print(

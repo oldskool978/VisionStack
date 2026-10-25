@@ -33,6 +33,25 @@ SUPPORTED_EDIT_FORMATS = [
     "control_color_depth",
 ]
 
+DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = [
+    {
+        "category": "refrigerator",
+        "caption": "A sleek brushed-steel refrigerator door with a small yellow sticky note",
+        "bbox": [32, 48, 992, 592],
+    },
+    {
+        "category": "text",
+        "text": "Remember to test SFT & Base permutations @ 1024x1024",
+        "bbox": [288, 144, 544, 480],
+    },
+    {
+        "category": "bowl",
+        "caption": "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
+        "bbox": [592, 608, 976, 976],
+    },
+]
+DEFAULT_LAYOUT_BOXES = DEFAULT_LAYOUT_ITEMS
+
 BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "model_variant": "sft",
     "height": 1024,
@@ -46,11 +65,11 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "guidance_scale": 3.0,
     "early_cfg": 3.0,
     "late_cfg": 3.0,
-    "uncond_skip_layers": [22],
+    "uncond_skip_layers": [24],
     "slg_layers": [],
     "slg_scale": 0.0,
-    "slg_start": 0.0,
-    "slg_stop": 1.0,
+    "slg_start": 0.05,
+    "slg_stop": 0.60,
     "eta": 0.0,
     "s_noise": 1.0,
     "max_sequence_length": 4096,
@@ -68,6 +87,7 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "latent_clamp_sigma": 4.5,
     "apply_bayer_dither": True,
     "use_reference_cache": True,
+    "preserve_canvas_outside_boxes": False,
     "cpu_offload": False,
     "prepass_warmup": True,
 }
@@ -77,6 +97,19 @@ _PRESET_CACHE: Dict[str, Any] = {
     "path": None,
     "has_custom_default": False,
     "defaults": dict(BASELINE_ENGINE_DEFAULTS),
+}
+
+_INTERNAL_BOX_KEYS = {
+    "image_path",
+    "image",
+    "vizj_path",
+    "framing_mode",
+    "input_role",
+    "denoise_strength",
+    "inpaint_box",
+    "id",
+    "label",
+    "enabled",
 }
 
 
@@ -98,30 +131,121 @@ def pixel_bbox_to_abs_centralized(
     ]
 
 
+def bbox_to_pixel_rect(
+    bbox: Sequence[Union[int, float]],
+    height: int,
+    width: int,
+    coords_are_pixels: bool = True,
+) -> Tuple[int, int, int, int]:
+    if len(bbox) != 4:
+        return (0, 0, height, width)
+    y0, x0, y1, x1 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    if (
+        not coords_are_pixels
+        and -1e-5 <= min(y0, x0, y1, x1)
+        and max(y0, x0, y1, x1) <= 1.0 + 1e-5
+    ):
+        py0 = y0 * height
+        px0 = x0 * width
+        py1 = y1 * height
+        px1 = x1 * width
+    elif not coords_are_pixels or min(y0, x0, y1, x1) < 0.0:
+        cy = (height - 1) / 2.0
+        cx = (width - 1) / 2.0
+        py0 = y0 + cy
+        px0 = x0 + cx
+        py1 = y1 + cy
+        px1 = x1 + cx
+    else:
+        py0, px0, py1, px1 = y0, x0, y1, x1
+
+    ymin = max(0, min(height - 1, int(round(min(py0, py1)))))
+    xmin = max(0, min(width - 1, int(round(min(px0, px1)))))
+    ymax = max(ymin + 1, min(height, int(round(max(py0, py1)))))
+    xmax = max(xmin + 1, min(width, int(round(max(px0, px1)))))
+    return (ymin, xmin, ymax, xmax)
+
+
+def bbox_to_normalized(
+    bbox: Sequence[Union[int, float]],
+    height: int,
+    width: int,
+    coords_are_pixels: bool = True,
+) -> Tuple[float, float, float, float]:
+    ymin, xmin, ymax, xmax = bbox_to_pixel_rect(
+        bbox, height=height, width=width, coords_are_pixels=coords_are_pixels
+    )
+    h_denom = float(max(1, height))
+    w_denom = float(max(1, width))
+    return (
+        max(0.0, min(1.0, ymin / h_denom)),
+        max(0.0, min(1.0, xmin / w_denom)),
+        max(0.0, min(1.0, ymax / h_denom)),
+        max(0.0, min(1.0, xmax / w_denom)),
+    )
+
+
 def compile_layout_prompt(
     caption: str,
     items: Sequence[Dict[str, Any]],
     height: int = 1024,
     width: int = 1024,
     coords_are_pixels: bool = False,
+    box_picture_map: Optional[Dict[int, int]] = None,
 ) -> str:
     normalized_items = []
-    for item in items:
-        entry = dict(item)
-        bbox = entry.get("bbox")
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict) or item.get("enabled", True) is False:
+            continue
+        raw_entry = dict(item)
+        bbox = raw_entry.get("bbox")
+        clean_entry: Dict[str, Any] = {}
+        for k, v in raw_entry.items():
+            if k in _INTERNAL_BOX_KEYS or v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            clean_entry[k] = v
+
+        if "category" not in clean_entry:
+            clean_entry["category"] = "text" if "text" in clean_entry else "region"
+
+        if box_picture_map and idx in box_picture_map and "reference" not in clean_entry:
+            clean_entry["reference"] = f"Picture {box_picture_map[idx]}"
+
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-            if coords_are_pixels:
-                entry["bbox"] = pixel_bbox_to_abs_centralized(
-                    float(bbox[0]),
-                    float(bbox[1]),
-                    float(bbox[2]),
-                    float(bbox[3]),
+            v0, v1, v2, v3 = (
+                float(bbox[0]),
+                float(bbox[1]),
+                float(bbox[2]),
+                float(bbox[3]),
+            )
+            if (
+                not coords_are_pixels
+                and -1e-5 <= min(v0, v1, v2, v3)
+                and max(v0, v1, v2, v3) <= 1.0 + 1e-5
+            ):
+                clean_entry["bbox"] = pixel_bbox_to_abs_centralized(
+                    v0 * (height - 1),
+                    v1 * (width - 1),
+                    v2 * (height - 1),
+                    v3 * (width - 1),
+                    height=height,
+                    width=width,
+                )
+            elif coords_are_pixels and min(v0, v1, v2, v3) >= 0.0:
+                clean_entry["bbox"] = pixel_bbox_to_abs_centralized(
+                    v0,
+                    v1,
+                    v2,
+                    v3,
                     height=height,
                     width=width,
                 )
             else:
-                entry["bbox"] = [int(round(float(v))) for v in bbox]
-        normalized_items.append(entry)
+                clean_entry["bbox"] = [int(round(v)) for v in (v0, v1, v2, v3)]
+
+        normalized_items.append(clean_entry)
 
     layout_payload = {
         "bbox_format": "yxyx",
@@ -289,6 +413,7 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         "prefer_vulkan",
         "apply_bayer_dither",
         "use_reference_cache",
+        "preserve_canvas_outside_boxes",
     ):
         if flag_key in data and data[flag_key] is not None:
             harvested[flag_key] = bool(data[flag_key])
@@ -360,6 +485,7 @@ class GenerationRequest(BaseModel):
     prompt_mode: str = Field(default="natural")
     layout_items: List[Dict[str, Any]] = Field(default_factory=list)
     layout_coords_are_pixels: bool = Field(default=False)
+    preserve_canvas_outside_boxes: Optional[bool] = Field(default=None)
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1024, ge=256, le=2048)
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
@@ -496,6 +622,10 @@ class GenerationRequest(BaseModel):
             self.apply_bayer_dither = bool(active["apply_bayer_dither"])
         if self.use_reference_cache is None:
             self.use_reference_cache = bool(active["use_reference_cache"])
+        if self.preserve_canvas_outside_boxes is None:
+            self.preserve_canvas_outside_boxes = bool(
+                active.get("preserve_canvas_outside_boxes", False)
+            )
         if self.cpu_offload is None:
             self.cpu_offload = bool(active["cpu_offload"])
         if self.prepass_warmup is None:
@@ -509,10 +639,98 @@ class GenerationRequest(BaseModel):
     def from_dict(cls, data: Dict[str, Any]) -> GenerationRequest:
         return cls.model_validate(data)
 
+    def has_box_images(self) -> bool:
+        for item in self.layout_items:
+            if isinstance(item, dict) and item.get("enabled", True) is not False:
+                img_p = item.get("image_path") or item.get("image") or item.get("vizj_path")
+                if isinstance(img_p, str) and img_p.strip():
+                    return True
+        return False
+
+    def resolve_visual_references(
+        self,
+    ) -> Tuple[List[Dict[str, Any]], Dict[int, int]]:
+        """
+        Consolidates global `reference_image_paths` and per-box `image_path` entries
+        into an ordered list of reference descriptors and a `box_idx -> Picture_k` map.
+        Each descriptor contains:
+          - path: str
+          - norm_bbox: Optional[Tuple[float, float, float, float]]
+          - pixel_bbox: Optional[Tuple[int, int, int, int]]
+          - framing_mode: str
+          - input_role: str
+          - box_index: Optional[int]
+        """
+        specs: List[Dict[str, Any]] = []
+        box_pic_map: Dict[int, int] = {}
+
+        for p_str in self.reference_image_paths:
+            if isinstance(p_str, str) and p_str.strip():
+                specs.append(
+                    {
+                        "path": p_str.strip(),
+                        "norm_bbox": None,
+                        "pixel_bbox": None,
+                        "framing_mode": self.framing_mode or "inscribed",
+                        "input_role": self.input_role or "photo_ref",
+                        "box_index": None,
+                    }
+                )
+
+        for idx, item in enumerate(self.layout_items):
+            if not isinstance(item, dict) or item.get("enabled", True) is False:
+                continue
+            img_p = (
+                item.get("image_path")
+                or item.get("image")
+                or item.get("vizj_path")
+            )
+            if not isinstance(img_p, str) or not img_p.strip():
+                continue
+            clean_p = img_p.strip()
+            bbox = item.get("bbox")
+            norm_box: Optional[Tuple[float, float, float, float]] = None
+            px_box: Optional[Tuple[int, int, int, int]] = None
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                norm_box = bbox_to_normalized(
+                    bbox,
+                    height=self.height,
+                    width=self.width,
+                    coords_are_pixels=self.layout_coords_are_pixels,
+                )
+                px_box = bbox_to_pixel_rect(
+                    bbox,
+                    height=self.height,
+                    width=self.width,
+                    coords_are_pixels=self.layout_coords_are_pixels,
+                )
+            fm = str(item.get("framing_mode") or self.framing_mode or "inscribed").lower()
+            if fm not in SUPPORTED_FRAMING_MODES:
+                fm = self.framing_mode or "inscribed"
+            role = str(item.get("input_role") or self.input_role or "photo_ref").lower()
+            if role not in SUPPORTED_INPUT_ROLES:
+                role = self.input_role or "photo_ref"
+
+            specs.append(
+                {
+                    "path": clean_p,
+                    "norm_bbox": norm_box,
+                    "pixel_bbox": px_box,
+                    "framing_mode": fm,
+                    "input_role": role,
+                    "box_index": idx,
+                }
+            )
+            box_pic_map[idx] = len(specs)
+
+        return specs, box_pic_map
+
     @property
     def effective_reference_zero_timestep(self) -> bool:
         if self.reference_zero_timestep is not None:
             return bool(self.reference_zero_timestep)
+        if self.has_box_images():
+            return True
         return self.edit_format in (
             "moss_image_edit",
             "ai_toolkit_isolated",
@@ -524,6 +742,8 @@ class GenerationRequest(BaseModel):
     def effective_reference_isolated_kv(self) -> bool:
         if self.reference_isolated_kv is not None:
             return bool(self.reference_isolated_kv)
+        if self.has_box_images():
+            return True
         return self.edit_format in (
             "moss_image_edit",
             "ai_toolkit_isolated",
@@ -538,13 +758,15 @@ class GenerationRequest(BaseModel):
 
     def compile_effective_prompt(self) -> str:
         mode = (self.prompt_mode or "natural").strip().lower()
-        if mode in ("layout", "layout_json") and self.layout_items:
+        if (mode in ("layout", "layout_json") or self.has_box_images()) and self.layout_items:
+            _, box_pic_map = self.resolve_visual_references()
             return compile_layout_prompt(
                 caption=self.prompt,
                 items=self.layout_items,
                 height=self.height,
                 width=self.width,
                 coords_are_pixels=self.layout_coords_are_pixels,
+                box_picture_map=box_pic_map,
             )
         return self.prompt.strip()
 

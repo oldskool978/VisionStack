@@ -1,3 +1,4 @@
+# ShadowBoxer/models/tokenizer.py
 from __future__ import annotations
 
 import base64
@@ -167,7 +168,9 @@ def render_qwen35_chat_prompt(
             pads = "<|image_pad|>" * max(1, int(count))
             parts.append(f"Picture {idx}: <|vision_start|>{pads}<|vision_end|>")
         vision_prefix = "".join(parts)
-    body = f"{vision_prefix}{prompt.strip()}"
+
+    clean_prompt = unicodedata.normalize("NFC", prompt).strip()
+    body = f"{vision_prefix}{clean_prompt}"
     think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
     return f"<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n{think_suffix}"
 
@@ -220,6 +223,16 @@ class MOSSImageTokenizer:
         self.base_vocab_size = self._enc.base_vocab_size
         self.has_fast_tables = self._enc.has_fast_tables
 
+    def close(self) -> None:
+        if hasattr(self, "_enc") and self._enc is not None:
+            self._enc.close()
+
+    def __enter__(self) -> MOSSImageTokenizer:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     @property
     def ranks_path(self) -> Path:
         return self._enc.ranks_path
@@ -263,13 +276,46 @@ class MOSSImageTokenizer:
         max_sequence_length: int = 4096,
         image_patch_counts: Optional[Sequence[int]] = None,
     ) -> List[int]:
-        formatted = render_qwen35_chat_prompt(
-            prompt,
-            enable_thinking=enable_thinking,
-            image_patch_counts=image_patch_counts,
-        )
-        toks = self.encode(formatted, allowed_special="all")
-        if len(toks) > max_sequence_length:
+        native_chat_fn = getattr(self._enc, "encode_chat", None)
+        if callable(native_chat_fn):
+            return native_chat_fn(
+                prompt=prompt,
+                enable_thinking=enable_thinking,
+                max_sequence_length=max_sequence_length,
+                image_patch_counts=image_patch_counts,
+            )
+
+        norm_prompt = unicodedata.normalize("NFC", prompt).strip()
+        think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+        if not image_patch_counts:
+            full_text = (
+                f"<|im_start|>user\n{norm_prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n{think_suffix}"
+            )
+            toks = self._enc.encode(
+                full_text, allowed_special="all", disallowed_special=()
+            )
+        else:
+            toks = []
+            for idx, count in enumerate(image_patch_counts, start=1):
+                seg = (
+                    f"<|im_start|>user\nPicture {idx}: <|vision_start|>"
+                    if idx == 1
+                    else f"<|vision_end|>Picture {idx}: <|vision_start|>"
+                )
+                toks.extend(
+                    self._enc.encode(seg, allowed_special="all", disallowed_special=())
+                )
+                toks.extend([IMAGE_PAD_TOKEN_ID] * max(1, int(count)))
+            tail = (
+                f"<|vision_end|>{norm_prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n{think_suffix}"
+            )
+            toks.extend(
+                self._enc.encode(tail, allowed_special="all", disallowed_special=())
+            )
+
+        if max_sequence_length > 0 and len(toks) > max_sequence_length:
             toks = toks[:max_sequence_length]
         return toks
 

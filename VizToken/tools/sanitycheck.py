@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import gc
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -88,6 +87,12 @@ def run_differential_matrix(
     assert (
         sov_enc.has_fast_tables
     ), "SWISS5 zero-init fast tables were not active in compiled container"
+    with open(sov_enc.ranks_path, "rb") as f_hdr:
+        magic = f_hdr.read(16)
+    assert (
+        magic == b"VIZTOK_SWISS5___"
+    ), f"Expected SWISS5 magic header b'VIZTOK_SWISS5___', got {magic!r}"
+
     vectors = [
         ("ABC Notation Basic", "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\n|: CDEF GABc :|"),
         (
@@ -155,6 +160,7 @@ def run_differential_matrix(
             ("Verse: Midnight riding under neon streetlights\n[CEG]2 c'2\n" * 200),
         ),
     ]
+
     print(f"\n--- Running Adversarial Differential Suite ({len(vectors)} vectors) ---")
     for idx, (label, sample) in enumerate(vectors):
         normalized = unicodedata.normalize("NFC", sample)
@@ -165,12 +171,14 @@ def run_differential_matrix(
             print(f"    Ref ({len(ref_tokens)}): {ref_tokens[:20]}")
             print(f"    Sov ({len(sov_tokens)}): {sov_tokens[:20]}")
             sys.exit(1)
+
         decoded = sov_enc.decode(sov_tokens)
         if decoded != normalized:
             print(f"[!] ROUNDTRIP FAILURE on vector [{idx:02d}] ({label}):")
             print(f"    Input:   {repr(normalized)}")
             print(f"    Decoded: {repr(decoded)}")
             sys.exit(1)
+
         print(
             f"  Vector [{idx:02d}]: PASSED (Bit-Exact) | {label:<36} ({len(sov_tokens):4d} tokens)"
         )
@@ -180,8 +188,13 @@ def run_qwen35_shadowboxer_audit() -> None:
     qwen35_vocab = ROOT_DIR / "qwen35.tiktoken"
     if not qwen35_vocab.is_file() or not RANKS_QWEN35_BIN.is_file():
         return
-
     print("\n--- Running ShadowBoxer Qwen3.5 (248K Vocab) Multimodal & Layout Audit ---")
+    with open(RANKS_QWEN35_BIN, "rb") as f_hdr:
+        magic35 = f_hdr.read(16)
+    assert (
+        magic35 == b"VIZTOK_SWISS5___"
+    ), f"Expected Qwen3.5 SWISS5 magic header b'VIZTOK_SWISS5___', got {magic35!r}"
+
     ranks35 = {
         base64.b64decode(t): int(r)
         for t, r in (
@@ -201,7 +214,12 @@ def run_qwen35_shadowboxer_audit() -> None:
     )
     with viztoken.Encoding("Qwen3_5", ranks_path=RANKS_QWEN35_BIN) as sov35:
         assert sov35.has_fast_tables, "Qwen3.5 SWISS5 fast tables missing"
-        assert sov35.base_vocab_size >= 240000, f"Unexpected base vocab: {sov35.base_vocab_size}"
+        assert (
+            sov35.base_vocab_size >= 240000
+        ), f"Unexpected base vocab: {sov35.base_vocab_size}"
+        assert (
+            sov35.eot_token == 248044
+        ), f"Expected Qwen3.5 EOT token 248044, got {sov35.eot_token}"
 
         pads = "<|image_pad|>" * 2304
         multimodal_prompt = (
@@ -214,8 +232,50 @@ def run_qwen35_shadowboxer_audit() -> None:
         sov_ids = sov35.encode(multimodal_prompt, allowed_special="all")
         assert ref_ids == sov_ids, "Qwen3.5 multimodal prompt divergence"
         assert sov35.decode(sov_ids) == multimodal_prompt, "Qwen3.5 decode mismatch"
+
+        user_body = (
+            '{"bbox_format": "yxyx", "bbox_coord_space": "abs_centralized", '
+            '"summary": {"caption": " Café-croissant & brushed-steel refrigerator "}, '
+            '"items": [{"category": "text", "text": "OPENMOSS 2026", "bbox": [-220, -320, -100, -60]}]}'
+        )
+        norm_body = unicodedata.normalize("NFC", user_body).strip()
+        for enable_thinking in (True, False):
+            think_sfx = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+            for patch_counts in (None, [144], [2304, 576]):
+                if patch_counts:
+                    v_pfx = "".join(
+                        f"Picture {idx}: <|vision_start|>{'<|image_pad|>' * c}<|vision_end|>"
+                        for idx, c in enumerate(patch_counts, start=1)
+                    )
+                else:
+                    v_pfx = ""
+                expected_str = (
+                    f"<|im_start|>user\n{v_pfx}{norm_body}<|im_end|>\n"
+                    f"<|im_start|>assistant\n{think_sfx}"
+                )
+                ref_chat_ids = ref35.encode(expected_str, allowed_special="all")
+                sov_chat_ids = sov35.encode_chat(
+                    user_body,
+                    enable_thinking=enable_thinking,
+                    max_sequence_length=8192,
+                    image_patch_counts=patch_counts,
+                )
+                assert (
+                    ref_chat_ids == sov_chat_ids
+                ), f"encode_chat mismatch for thinking={enable_thinking}, patches={patch_counts}"
+
+        trunc_ids = sov35.encode_chat(
+            user_body,
+            enable_thinking=True,
+            max_sequence_length=128,
+            image_patch_counts=[256],
+        )
+        assert (
+            len(trunc_ids) == 128
+        ), f"encode_chat max_sequence_length truncation failed: {len(trunc_ids)}"
+
         print(
-            f"  [+] Qwen3.5 Multimodal RLE + Layout JSON: PASSED (Bit-Exact, {len(sov_ids):,} tokens)"
+            f"  [+] Qwen3.5 Multimodal RLE + Zero-Alloc encode_chat: PASSED (Bit-Exact, {len(sov_ids):,} tokens, SWISS5 Magic Verified)"
         )
 
 
@@ -312,7 +372,6 @@ def run_agentic_prefix_splicing_audit(sov_enc: viztoken.Encoding) -> None:
     t_orig = sov_enc.encode_ordinary(orig_abc)
     t_edit = sov_enc.encode_ordinary(edit_abc)
     split_pt = viztoken.find_common_prefix(t_orig, t_edit)
-
     assert 0 < split_pt < len(t_orig), "ABC mutation split point out of range"
     assert t_orig[:split_pt] == t_edit[:split_pt], "Common prefix content mismatch"
     assert t_orig[split_pt] != t_edit[split_pt], "Common prefix divergence failure"
@@ -338,6 +397,7 @@ def run_batch_pipeline_audit(
         batch_prompts, allowed_special="all", num_threads=4
     )
     assert ref_batch == sov_batch, "encode_batch returned divergent output"
+
     sov_decoded_batch = sov_enc.decode_batch(sov_batch, num_threads=4)
     assert sov_decoded_batch == batch_prompts, "decode_batch roundtrip divergence"
     print(
@@ -377,9 +437,11 @@ def run_thread_safety_soak(
     for t in t_pool:
         t.join()
     t_elapsed = time.perf_counter() - t0
+
     if errors:
         print(f"[!] Multithreaded soak failure: {errors[0]}")
         sys.exit(1)
+
     total_encodes = threads * passes_per_thread
     print(
         f"  [+] Completed {total_encodes:,} concurrent operations in {t_elapsed:.2f}s ({total_encodes / t_elapsed:,.0f} ops/s). Zero race conditions."
@@ -393,6 +455,7 @@ def run_memory_soak(sov_enc: viztoken.Encoding, cycles: int = 25000) -> None:
         * 10
     )
     normalized = unicodedata.normalize("NFC", payload)
+
     gc.collect()
     mem_initial = get_process_memory_mb()
     for _ in range(1000):
@@ -400,20 +463,24 @@ def run_memory_soak(sov_enc: viztoken.Encoding, cycles: int = 25000) -> None:
         _ = sov_enc.decode(t)
     gc.collect()
     mem_baseline = get_process_memory_mb()
+
     t0 = time.perf_counter()
     for _ in range(cycles):
         toks = sov_enc.encode(normalized, allowed_special="all")
         _ = sov_enc.decode(toks)
     t_elapsed = time.perf_counter() - t0
+
     gc.collect()
     mem_final = get_process_memory_mb()
     delta_mb = mem_final - mem_baseline
+
     print(f"  Initial RSS:   {mem_initial:.2f} MB")
     print(f"  Baseline RSS:  {mem_baseline:.2f} MB")
     print(f"  Final RSS:     {mem_final:.2f} MB")
     print(
         f"  Delta RSS:     {delta_mb:+.3f} MB over {cycles:,} cycles ({cycles / t_elapsed:,.0f} ops/s)"
     )
+
     if delta_mb > 1.5:
         print(f"[!] Leak threshold exceeded: {delta_mb:+.3f} MB")
         sys.exit(1)
@@ -428,6 +495,7 @@ def main() -> None:
         "       VIZTOKEN COMPREHENSIVE CONVERGENCE, THREAD SAFETY & SOAK AUDITOR"
     )
     print("=" * 84)
+
     vocab_path = resolve_vocab_file("qwen.tiktoken")
     ranks = {
         base64.b64decode(t): int(r)
@@ -446,6 +514,7 @@ def main() -> None:
         mergeable_ranks=ranks,
         special_tokens=specials_dict,
     )
+
     with viztoken.Encoding("YuE2", ranks_path=RANKS_BIN) as sov_enc:
         run_differential_matrix(ref_enc, sov_enc)
         run_special_token_edgecases(ref_enc, sov_enc)
