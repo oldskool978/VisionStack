@@ -41,9 +41,16 @@ CACHE_DIR = _resolve_cache_dir()
 MIOPEN_CACHE_DIR = CACHE_DIR / "miopen"
 MIOPEN_DB_DIR = MIOPEN_CACHE_DIR / "db"
 MIOPEN_KERNELS_DIR = MIOPEN_CACHE_DIR / "kernels"
+COMGR_CACHE_DIR = MIOPEN_CACHE_DIR / "comgr"
 TMP_DIR = Path(os.environ.get("TMP") or (ROOT_DIR / "artifacts" / "tmp")).resolve()
 
-for _d in (CACHE_DIR, MIOPEN_DB_DIR, MIOPEN_KERNELS_DIR, TMP_DIR):
+for _d in (
+    CACHE_DIR,
+    MIOPEN_DB_DIR,
+    MIOPEN_KERNELS_DIR,
+    COMGR_CACHE_DIR,
+    TMP_DIR,
+):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -52,13 +59,17 @@ def _configure_rocm_runtime_env() -> None:
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(CACHE_DIR / "hub"))
     os.environ.setdefault("MIOPEN_USER_DB_PATH", str(MIOPEN_DB_DIR))
     os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", str(MIOPEN_KERNELS_DIR))
+    os.environ.setdefault("AMD_COMGR_CACHE", "1")
+    os.environ.setdefault("AMD_COMGR_CACHE_DIR", str(COMGR_CACHE_DIR))
+    os.environ.pop("MIOPEN_FIND_ENFORCE", None)
     if os.environ.get("MIOPEN_FIND_MODE", "").strip().lower() in (
         "",
         "1",
+        "2",
         "normal",
+        "fast",
     ):
-        os.environ["MIOPEN_FIND_MODE"] = "2"
-    os.environ.setdefault("MIOPEN_FIND_ENFORCE", "1")
+        os.environ["MIOPEN_FIND_MODE"] = "3"
     os.environ.setdefault("MIOPEN_LOG_LEVEL", "0")
     os.environ.setdefault("MIOPEN_ENABLE_LOGGING", "0")
     os.environ.setdefault("AMD_LOG_LEVEL", "0")
@@ -382,7 +393,8 @@ class WDDMMemoryGuard:
     def recalibrate_baseline(self) -> None:
         if self.active:
             _, shr_used = self._query_video_memory_info()
-            self.shared_baseline_gb = shr_used
+            if self.shared_baseline_gb <= 0.0 or shr_used < self.shared_baseline_gb:
+                self.shared_baseline_gb = shr_used
 
     def poll(self) -> WDDMMemorySnapshot:
         pt_alloc_bytes = 0
@@ -464,7 +476,6 @@ class WDDMMemoryGuard:
         snap = self.poll()
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return snap
-        reclaimable_bytes = int(snap.pt_reclaimable_gb * (1024**3))
         reserved_bytes = int(snap.pt_reserved_gb * (1024**3))
         split_bytes = int(snap.pt_inactive_split_gb * (1024**3))
         needs_eviction = (
@@ -475,13 +486,21 @@ class WDDMMemoryGuard:
             or (split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
             or (reserved_bytes > _VRAM_TRIM_THRESHOLD_BYTES)
         )
-        if needs_eviction and (
-            force or reclaimable_bytes >= _MIN_RECLAIMABLE_CACHE_BYTES
-        ):
+        if needs_eviction:
             gc.collect()
-            torch.cuda.synchronize(self.device)
-            torch.cuda.empty_cache()
-            snap = self.poll()
+            reclaimable_bytes = max(
+                0,
+                torch.cuda.memory_reserved(self.device)
+                - torch.cuda.memory_allocated(self.device),
+            )
+            if (
+                force
+                or snap.is_spilling
+                or reclaimable_bytes >= _MIN_RECLAIMABLE_CACHE_BYTES
+            ):
+                torch.cuda.synchronize(self.device)
+                torch.cuda.empty_cache()
+                snap = self.poll()
         return snap
 
     def close(self) -> None:
@@ -1841,9 +1860,7 @@ class MOSSImageEngine:
                         self.transformer.to(target_device)
                         self.transformer.clear_caches()
                         self._current_offload_state = cpu_offload
-                        self._trim_reserved_vram(
-                            force=cpu_offload, required_headroom_gb=4.20
-                        )
+                        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
                         self.memory_guard.recalibrate_baseline()
                         return
                     self._current_offload_state = cpu_offload
@@ -1884,7 +1901,7 @@ class MOSSImageEngine:
                 self.transformer.clear_caches()
                 self.transformer.eval().requires_grad_(False)
                 self._loaded_repo_id = target_repo_id
-                self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+                self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
                 self.memory_guard.recalibrate_baseline()
                 logging.info(
                     "Hot-swap completed in %.2fs (Shared Qwen3.5 & Flux2-VAE retained).",
@@ -1900,6 +1917,7 @@ class MOSSImageEngine:
                 self._trim_reserved_vram(force=True, required_headroom_gb=26.5)
             else:
                 self._trim_reserved_vram(force=False, required_headroom_gb=26.5)
+                self.memory_guard.recalibrate_baseline()
 
             t_start = time.perf_counter()
             tokenizer_dir = root_path / "tokenizer"
@@ -1923,7 +1941,7 @@ class MOSSImageEngine:
                 te_dir, self.text_encoder, device=target_device, dtype=self.dtype
             )
             self.text_encoder.eval().requires_grad_(False)
-            self._trim_reserved_vram(force=False, required_headroom_gb=11.0)
+            self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
 
             logging.info(
                 "Loading Sovereign MOSSImageTransformer (42-Layer DiT) from %s",
@@ -1940,7 +1958,7 @@ class MOSSImageEngine:
                 dtype=self.dtype,
             )
             self.transformer.eval().requires_grad_(False)
-            self._trim_reserved_vram(force=False, required_headroom_gb=4.50)
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.50)
 
             logging.info(
                 "Loading Sovereign Flux2AutoencoderKL (FP32) from %s", vae_dir
@@ -1954,7 +1972,7 @@ class MOSSImageEngine:
 
             self._loaded_repo_id = target_repo_id
             self._current_offload_state = cpu_offload
-            self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             self.memory_guard.recalibrate_baseline()
             logging.info(
                 "MOSSImageEngine initialized (%s) in %.2fs.",
@@ -1975,7 +1993,7 @@ class MOSSImageEngine:
             ):
                 if self.transformer._lora_backups:
                     self.transformer.unfuse_lora()
-                    self._trim_reserved_vram(force=False, required_headroom_gb=3.50)
+                    self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
                 return False
 
             raw_spec = edit_lora_path.strip()
@@ -2025,7 +2043,7 @@ class MOSSImageEngine:
                 lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
             )
             del lora_sd
-            self._trim_reserved_vram(force=False, required_headroom_gb=3.50)
+            self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
             return fused > 0
 
     def _condition_single_reference(
@@ -2157,7 +2175,7 @@ class MOSSImageEngine:
                     packed_lat = _evacuate_to_cpu(clamped_lat)
                     del raw_lat, clamped_lat
                     bundle.vae_tensor = None
-                    self._trim_reserved_vram(force=False, required_headroom_gb=3.50)
+                    self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
                 latent_mask = _evacuate_to_cpu(bundle.latent_mask)
 
             vit_embeds = _evacuate_to_cpu(bundle.vit_embeds)
@@ -2176,7 +2194,7 @@ class MOSSImageEngine:
                 vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
                 del img_splits
                 self.text_encoder.visual.clear_caches()
-                self._trim_reserved_vram(force=False, required_headroom_gb=3.50)
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
 
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
@@ -2201,7 +2219,7 @@ class MOSSImageEngine:
                 )
                 packed_lat = _evacuate_to_cpu(clamped_lat)
                 del img_t, raw_lat, clamped_lat
-                self._trim_reserved_vram(force=False, required_headroom_gb=3.50)
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
                 was_hit = False
 
             vit_embeds = None
@@ -2221,7 +2239,7 @@ class MOSSImageEngine:
                 vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
                 del img_splits
                 self.text_encoder.visual.clear_caches()
-                self._trim_reserved_vram(force=False, required_headroom_gb=3.50)
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
 
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
@@ -2437,7 +2455,7 @@ class MOSSImageEngine:
         del dummy_ids, dummy_out
         self.text_encoder.clear_caches()
         self._sync_device()
-        self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         sys.stdout.write(
             f"  [2/3] Warmup: 42-Layer MOSS-DiT 4D-RoPE Velocity Field ({width}x{height})...\n"
@@ -2466,23 +2484,21 @@ class MOSSImageEngine:
         del dummy_ctx_cpu, dummy_ctx, dummy_mask, dummy_lat
         self.transformer.clear_caches()
         self._sync_device()
-        self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         sys.stdout.write(
             f"  [3/3] Warmup: Flux2-VAE FP32 Unpatch & Decoder ({width}x{height})...\n"
         )
         sys.stdout.flush()
-        vae_h_lat = min(h_lat, 16)
-        vae_w_lat = min(w_lat, 16)
         dummy_lat_vae = torch.zeros(
-            (1, self.transformer.config.latent_channels, vae_h_lat, vae_w_lat),
+            (1, self.transformer.config.latent_channels, h_lat, w_lat),
             device=exec_dev,
             dtype=torch.float32,
         )
         dummy_dec = self.vae.decode_packed_latents(dummy_lat_vae)
         del dummy_lat_vae, dummy_dec
         self._sync_device()
-        self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
         self.memory_guard.recalibrate_baseline()
 
         elapsed = time.perf_counter() - t0
@@ -2511,7 +2527,7 @@ class MOSSImageEngine:
             request.edit_lora_path, request.edit_lora_scale
         )
         if not cpu_offload:
-            self._trim_reserved_vram(force=False, required_headroom_gb=3.80)
+            self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
 
         reporter: Optional[EngineProgressReporter] = None
         if progress_callback is None:
@@ -2704,7 +2720,7 @@ class MOSSImageEngine:
                 self.vae.to("cpu")
                 self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             else:
-                self._trim_reserved_vram(force=False, required_headroom_gb=3.80)
+                self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
 
         effective_prompt = request.compile_effective_prompt()
         pos_hits_before = self.embed_cache.pos_hits
@@ -2750,7 +2766,7 @@ class MOSSImageEngine:
             self.text_encoder.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
         else:
-            self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         if cpu_offload:
             self.transformer.to(self.device)
@@ -2924,10 +2940,6 @@ class MOSSImageEngine:
             reporter.start_stage("dit", num_passes)
 
         dit_t0 = time.perf_counter()
-        prediction: Optional[torch.Tensor] = None
-        conditional: Optional[torch.Tensor] = None
-        uncond: Optional[torch.Tensor] = None
-        skipped: Optional[torch.Tensor] = None
 
         for pass_index, timestep in enumerate(timesteps):
             if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
@@ -2942,6 +2954,7 @@ class MOSSImageEngine:
             current_cfg = early_cfg if is_early else late_cfg
             do_step_cfg = abs(current_cfg - 1.0) > 1e-5
             skip_active = request.slg_start <= step_frac < request.slg_stop
+            do_slg = bool(slg_skip_set and request.slg_scale > 0.0 and skip_active)
 
             prediction = self.transformer(
                 latents,
@@ -2953,7 +2966,7 @@ class MOSSImageEngine:
                 reference_isolated_kv=ref_iso_kv,
                 reference_bboxes=active_ref_bboxes,
             ).sample.float()
-            conditional = prediction
+            conditional = prediction if do_slg else None
             total_nfe += 1
 
             if do_step_cfg and negative is not None:
@@ -2974,9 +2987,10 @@ class MOSSImageEngine:
                     **skip_kwargs,
                 ).sample.float()
                 prediction = uncond + current_cfg * (prediction - uncond)
+                del uncond
                 total_nfe += 1
 
-            if slg_skip_set and request.slg_scale > 0.0 and skip_active:
+            if do_slg and conditional is not None:
                 skipped = self.transformer(
                     latents,
                     timestep,
@@ -2991,11 +3005,15 @@ class MOSSImageEngine:
                 if not do_step_cfg:
                     prediction = skipped
                 prediction = prediction + request.slg_scale * (conditional - skipped)
+                del skipped
                 total_nfe += 1
+
+            del conditional
 
             latents = active_scheduler.step(
                 prediction, timestep, latents, generator=sde_gen, return_dict=False
             )
+            del prediction
 
             if inpaint_mask_tensor is not None and clean_init_latents is not None:
                 next_sigma = (
@@ -3016,6 +3034,7 @@ class MOSSImageEngine:
                     inpaint_mask_tensor * latents
                     + (1.0 - inpaint_mask_tensor) * noised_bg
                 )
+                del noised_bg
 
             if use_cuda_events:
                 curr_ev = step_events[pass_index & 1]
@@ -3052,10 +3071,6 @@ class MOSSImageEngine:
             active_ref_bboxes,
             ref_latents_list,
             ref_bboxes_list,
-            prediction,
-            conditional,
-            uncond,
-            skipped,
             clean_init_latents,
             inpaint_mask_tensor,
             noise,
@@ -3066,7 +3081,7 @@ class MOSSImageEngine:
             self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
             self.vae.to(self.device)
         else:
-            self._trim_reserved_vram(force=False, required_headroom_gb=4.40)
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
 
         if reporter is not None:
             reporter.start_stage("vae", num_imgs)
@@ -3083,7 +3098,7 @@ class MOSSImageEngine:
             self.vae.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
         else:
-            self._trim_reserved_vram(force=False, required_headroom_gb=4.20)
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
         if self.vizinjector is not None:
             pil_images, viz_telems = self.vizinjector.postprocess_to_pil(

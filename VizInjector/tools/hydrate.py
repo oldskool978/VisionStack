@@ -260,7 +260,7 @@ def safe_subprocess(cmd: list, env: dict[str, str] | None = None) -> str:
         return ""
 
 
-def _has_NonEmpty_dir(path: Path) -> bool:
+def _has_nonempty_dir(path: Path) -> bool:
     try:
         return path.is_dir() and any(path.iterdir())
     except OSError:
@@ -311,19 +311,19 @@ def resolve_rocm_sdk_layout(target_sandbox: Path) -> dict[str, str]:
             llvm_bin = (root_cand / "lib" / "llvm" / "bin").resolve()
         if (
             device_lib is None
-            and _has_NonEmpty_dir(root_cand / "lib" / "llvm" / "amdgcn" / "bitcode")
+            and _has_nonempty_dir(root_cand / "lib" / "llvm" / "amdgcn" / "bitcode")
         ):
             device_lib = (root_cand / "lib" / "llvm" / "amdgcn" / "bitcode").resolve()
         if (
             miopen_sys_db is None
-            and _has_NonEmpty_dir(root_cand / "share" / "miopen" / "db")
+            and _has_nonempty_dir(root_cand / "share" / "miopen" / "db")
         ):
             miopen_sys_db = (root_cand / "share" / "miopen" / "db").resolve()
 
     if (
         miopen_sys_db is None
         and site_packages is not None
-        and _has_NonEmpty_dir(site_packages / "torch" / "share" / "miopen" / "db")
+        and _has_nonempty_dir(site_packages / "torch" / "share" / "miopen" / "db")
     ):
         miopen_sys_db = (site_packages / "torch" / "share" / "miopen" / "db").resolve()
 
@@ -360,6 +360,9 @@ def get_isolated_env() -> dict[str, str]:
         WHEELS_DIR,
         PIP_CACHE_DIR,
         HF_CACHE_DIR,
+        HF_CACHE_DIR / "miopen" / "db",
+        HF_CACHE_DIR / "miopen" / "kernels",
+        HF_CACHE_DIR / "miopen" / "comgr",
         LOCAL_APPDATA_DIR,
         ROAMING_APPDATA_DIR,
     ):
@@ -458,10 +461,11 @@ def get_isolated_env() -> dict[str, str]:
         "HUGGINGFACE_HUB_CACHE": str(HF_CACHE_DIR / "hub"),
         "MIOPEN_USER_DB_PATH": str(HF_CACHE_DIR / "miopen" / "db"),
         "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
+        "AMD_COMGR_CACHE": "1",
+        "AMD_COMGR_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "comgr"),
         "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
         "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
-        "MIOPEN_FIND_MODE": "2",
-        "MIOPEN_FIND_ENFORCE": "1",
+        "MIOPEN_FIND_MODE": "3",
         "MIOPEN_LOG_LEVEL": "0",
         "MIOPEN_ENABLE_LOGGING": "0",
         "AMD_LOG_LEVEL": "0",
@@ -474,8 +478,13 @@ def get_isolated_env() -> dict[str, str]:
     }
     for k, v in contract_defaults.items():
         cur = os.environ.get(k)
-        if k == "MIOPEN_FIND_MODE" and cur is not None and cur.strip().lower() in ("1", "normal"):
-            env[k] = "2"
+        if k == "MIOPEN_FIND_MODE" and cur is not None and cur.strip().lower() in (
+            "1",
+            "2",
+            "normal",
+            "fast",
+        ):
+            env[k] = "3"
         else:
             env[k] = cur if (cur is not None and cur.strip()) else v
 
@@ -2102,9 +2111,10 @@ def orchestrate_hermetic_runtime_environment(
 ) -> None:
     miopen_db = HF_CACHE_DIR / "miopen" / "db"
     miopen_kernels = HF_CACHE_DIR / "miopen" / "kernels"
+    comgr_cache = HF_CACHE_DIR / "miopen" / "comgr"
     inductor_dir = HF_CACHE_DIR / "torch_inductor"
     triton_dir = HF_CACHE_DIR / "triton"
-    for p in (miopen_db, miopen_kernels, inductor_dir, triton_dir):
+    for p in (miopen_db, miopen_kernels, comgr_cache, inductor_dir, triton_dir):
         p.mkdir(parents=True, exist_ok=True)
 
     (BASE_DIR / "launch_env.bat").unlink(missing_ok=True)
@@ -2141,6 +2151,19 @@ elif (_ROOT.parent / ".hf_cache").exists():
     _HF = (_ROOT.parent / ".hf_cache").resolve()
 else:
     _HF = (_ROOT / ".hf_cache").resolve()
+
+for _d in (
+    _HF,
+    _HF / "miopen" / "db",
+    _HF / "miopen" / "kernels",
+    _HF / "miopen" / "comgr",
+    _HF / "torch_inductor",
+    _HF / "triton",
+):
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 
 def _env_default(key: str, val: str) -> None:
@@ -2221,11 +2244,19 @@ _env_default("TRANSFORMERS_CACHE", str(_HF / "transformers"))
 _env_default("HUGGINGFACE_HUB_CACHE", str(_HF / "hub"))
 _env_default("MIOPEN_USER_DB_PATH", str(_HF / "miopen" / "db"))
 _env_default("MIOPEN_CUSTOM_CACHE_DIR", str(_HF / "miopen" / "kernels"))
+_env_default("AMD_COMGR_CACHE", "1")
+_env_default("AMD_COMGR_CACHE_DIR", str(_HF / "miopen" / "comgr"))
 _env_default("TORCHINDUCTOR_CACHE_DIR", str(_HF / "torch_inductor"))
 _env_default("TRITON_CACHE_DIR", str(_HF / "triton"))
-if os.environ.get("MIOPEN_FIND_MODE", "").strip().lower() in ("", "1", "normal"):
-    os.environ["MIOPEN_FIND_MODE"] = "2"
-_env_default("MIOPEN_FIND_ENFORCE", "1")
+os.environ.pop("MIOPEN_FIND_ENFORCE", None)
+if os.environ.get("MIOPEN_FIND_MODE", "").strip().lower() in (
+    "",
+    "1",
+    "2",
+    "normal",
+    "fast",
+):
+    os.environ["MIOPEN_FIND_MODE"] = "3"
 _env_default("MIOPEN_LOG_LEVEL", "0")
 _env_default("MIOPEN_ENABLE_LOGGING", "0")
 _env_default("AMD_LOG_LEVEL", "0")

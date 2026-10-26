@@ -78,11 +78,13 @@ class _ResnetBlock2D(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.silu(self.norm1(x), inplace=True)
+        h = self.norm1(x)
+        h = F.silu(h, inplace=True)
+        h = self.conv1(h)
         if self.conv_shortcut is not None:
             x = self.conv_shortcut(x)
-        h = self.conv1(h)
-        h = F.silu(self.norm2(h), inplace=True)
+        h = self.norm2(h)
+        h = F.silu(h, inplace=True)
         h = self.conv2(h)
         return h.add_(x)
 
@@ -168,10 +170,19 @@ class _DownEncoderBlock2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for resnet in self.resnets:
-            x = resnet(x)
+            h = resnet.norm1(x)
+            h = F.silu(h, inplace=True)
+            h = resnet.conv1(h)
+            if resnet.conv_shortcut is not None:
+                x = resnet.conv_shortcut(x)
+            h = resnet.norm2(h)
+            h = F.silu(h, inplace=True)
+            x = resnet.conv2(h).add_(x)
+            del h
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
-                x = downsampler(x)
+                x = F.pad(x, (0, 1, 0, 1), mode="constant", value=0.0)
+                x = downsampler.conv(x)
         return x
 
 
@@ -199,10 +210,19 @@ class _UpDecoderBlock2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for resnet in self.resnets:
-            x = resnet(x)
+            h = resnet.norm1(x)
+            h = F.silu(h, inplace=True)
+            h = resnet.conv1(h)
+            if resnet.conv_shortcut is not None:
+                x = resnet.conv_shortcut(x)
+            h = resnet.norm2(h)
+            h = F.silu(h, inplace=True)
+            x = resnet.conv2(h).add_(x)
+            del h
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
-                x = upsampler(x)
+                x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+                x = upsampler.conv(x)
         return x
 
 
@@ -274,9 +294,23 @@ class _Flux2Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv_in(x)
         for block in self.down_blocks:
-            x = block(x)
+            for resnet in block.resnets:
+                h = resnet.norm1(x)
+                h = F.silu(h, inplace=True)
+                h = resnet.conv1(h)
+                if resnet.conv_shortcut is not None:
+                    x = resnet.conv_shortcut(x)
+                h = resnet.norm2(h)
+                h = F.silu(h, inplace=True)
+                x = resnet.conv2(h).add_(x)
+                del h
+            if block.downsamplers is not None:
+                for downsampler in block.downsamplers:
+                    x = F.pad(x, (0, 1, 0, 1), mode="constant", value=0.0)
+                    x = downsampler.conv(x)
         x = self.mid_block(x)
-        x = F.silu(self.conv_norm_out(x), inplace=True)
+        x = self.conv_norm_out(x)
+        x = F.silu(x, inplace=True)
         return self.conv_out(x)
 
 
@@ -329,8 +363,22 @@ class _Flux2Decoder(nn.Module):
         z = self.conv_in(z)
         z = self.mid_block(z)
         for block in self.up_blocks:
-            z = block(z)
-        z = F.silu(self.conv_norm_out(z), inplace=True)
+            for resnet in block.resnets:
+                h = resnet.norm1(z)
+                h = F.silu(h, inplace=True)
+                h = resnet.conv1(h)
+                if resnet.conv_shortcut is not None:
+                    z = resnet.conv_shortcut(z)
+                h = resnet.norm2(h)
+                h = F.silu(h, inplace=True)
+                z = resnet.conv2(h).add_(z)
+                del h
+            if block.upsamplers is not None:
+                for upsampler in block.upsamplers:
+                    z = F.interpolate(z, scale_factor=2.0, mode="nearest")
+                    z = upsampler.conv(z)
+        z = self.conv_norm_out(z)
+        z = F.silu(z, inplace=True)
         return self.conv_out(z)
 
 
@@ -488,6 +536,7 @@ class Flux2AutoencoderKL(nn.Module):
     def decode_packed_latents(self, latents: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=self.device.type, enabled=False):
             z = latents.to(device=self.device, dtype=torch.float32)
+            del latents
             eps = self.config.batch_norm_eps
             std = (self.bn.running_var.float() + eps).sqrt().to(z).view(1, -1, 1, 1)
             mean = self.bn.running_mean.float().to(z).view(1, -1, 1, 1)
@@ -501,7 +550,9 @@ class Flux2AutoencoderKL(nn.Module):
             )
             if z.dtype != self.dtype:
                 z = z.to(dtype=self.dtype)
-            decoded = self.decode(z, return_dict=False)[0]
+            if self.post_quant_conv is not None:
+                z = self.post_quant_conv(z)
+            decoded = self.decoder(z)
             del z
             return decoded.float().clamp_(-1.0, 1.0)
 
@@ -509,6 +560,7 @@ class Flux2AutoencoderKL(nn.Module):
     def encode_to_packed_latents(self, images: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=self.device.type, enabled=False):
             x = images.to(device=self.device, dtype=self.dtype)
+            del images
             h = self.encoder(x)
             del x
             if self.quant_conv is not None:
@@ -529,4 +581,6 @@ class Flux2AutoencoderKL(nn.Module):
                 .view(1, -1, 1, 1)
             )
             mean = self.bn.running_mean.float().to(z_patch).view(1, -1, 1, 1)
-            return ((z_patch - mean) * inv_std).float()
+            z_patch = z_patch.sub_(mean).mul_(inv_std)
+            del inv_std, mean
+            return z_patch.float()

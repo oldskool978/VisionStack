@@ -34,6 +34,9 @@ for _d in (
     WHEELS_DIR,
     PIP_CACHE_DIR,
     HF_CACHE_DIR,
+    HF_CACHE_DIR / "miopen" / "db",
+    HF_CACHE_DIR / "miopen" / "kernels",
+    HF_CACHE_DIR / "miopen" / "comgr",
     LOCAL_APPDATA_DIR,
     ROAMING_APPDATA_DIR,
 ):
@@ -699,10 +702,11 @@ def build_hermetic_env(
         "TORCH_EXTENSIONS_DIR": str(HF_CACHE_DIR / "torch_extensions"),
         "MIOPEN_USER_DB_PATH": str(HF_CACHE_DIR / "miopen" / "db"),
         "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
+        "AMD_COMGR_CACHE": "1",
+        "AMD_COMGR_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "comgr"),
         "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
         "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
-        "MIOPEN_FIND_MODE": "2",
-        "MIOPEN_FIND_ENFORCE": "1",
+        "MIOPEN_FIND_MODE": "3",
         "MIOPEN_LOG_LEVEL": "0",
         "MIOPEN_ENABLE_LOGGING": "0",
         "AMD_LOG_LEVEL": "0",
@@ -733,8 +737,13 @@ def build_hermetic_env(
 
     for k, v in defaults.items():
         cur = os.environ.get(k)
-        if k == "MIOPEN_FIND_MODE" and cur is not None and cur.strip().lower() in ("1", "normal"):
-            env[k] = "2"
+        if k == "MIOPEN_FIND_MODE" and cur is not None and cur.strip().lower() in (
+            "1",
+            "2",
+            "normal",
+            "fast",
+        ):
+            env[k] = "3"
         else:
             env[k] = cur if (cur is not None and cur.strip()) else v
     return env
@@ -1254,6 +1263,7 @@ for _d in (
     _HF,
     _HF / "miopen" / "db",
     _HF / "miopen" / "kernels",
+    _HF / "miopen" / "comgr",
     _HF / "torch_inductor",
     _HF / "triton",
     _TMP,
@@ -1357,11 +1367,19 @@ _env_default("HUGGINGFACE_HUB_CACHE", str(_HF / "hub"))
 _env_default("TORCH_EXTENSIONS_DIR", str(_HF / "torch_extensions"))
 _env_default("MIOPEN_USER_DB_PATH", str(_HF / "miopen" / "db"))
 _env_default("MIOPEN_CUSTOM_CACHE_DIR", str(_HF / "miopen" / "kernels"))
+_env_default("AMD_COMGR_CACHE", "1")
+_env_default("AMD_COMGR_CACHE_DIR", str(_HF / "miopen" / "comgr"))
 _env_default("TORCHINDUCTOR_CACHE_DIR", str(_HF / "torch_inductor"))
 _env_default("TRITON_CACHE_DIR", str(_HF / "triton"))
-if os.environ.get("MIOPEN_FIND_MODE", "").strip().lower() in ("", "1", "normal"):
-    os.environ["MIOPEN_FIND_MODE"] = "2"
-_env_default("MIOPEN_FIND_ENFORCE", "1")
+os.environ.pop("MIOPEN_FIND_ENFORCE", None)
+if os.environ.get("MIOPEN_FIND_MODE", "").strip().lower() in (
+    "",
+    "1",
+    "2",
+    "normal",
+    "fast",
+):
+    os.environ["MIOPEN_FIND_MODE"] = "3"
 _env_default("MIOPEN_LOG_LEVEL", "0")
 _env_default("MIOPEN_ENABLE_LOGGING", "0")
 _env_default("AMD_LOG_LEVEL", "0")
@@ -1435,9 +1453,10 @@ def generate_environment_anchors(
 
     miopen_db = HF_CACHE_DIR / "miopen" / "db"
     miopen_kernels = HF_CACHE_DIR / "miopen" / "kernels"
+    comgr_cache = HF_CACHE_DIR / "miopen" / "comgr"
     inductor_dir = HF_CACHE_DIR / "torch_inductor"
     triton_dir = HF_CACHE_DIR / "triton"
-    for p in (miopen_db, miopen_kernels, inductor_dir, triton_dir):
+    for p in (miopen_db, miopen_kernels, comgr_cache, inductor_dir, triton_dir):
         p.mkdir(parents=True, exist_ok=True)
 
     inject_hermetic_sitecustomize(
@@ -1536,10 +1555,12 @@ set "HUGGINGFACE_HUB_CACHE=%ROOT_DIR%.hf_cache\\hub"
 set "TORCH_EXTENSIONS_DIR=%ROOT_DIR%.hf_cache\\torch_extensions"
 set "MIOPEN_USER_DB_PATH=%ROOT_DIR%.hf_cache\\miopen\\db"
 set "MIOPEN_CUSTOM_CACHE_DIR=%ROOT_DIR%.hf_cache\\miopen\\kernels"
+set "AMD_COMGR_CACHE=1"
+set "AMD_COMGR_CACHE_DIR=%ROOT_DIR%.hf_cache\\miopen\\comgr"
 set "TORCHINDUCTOR_CACHE_DIR=%ROOT_DIR%.hf_cache\\torch_inductor"
 set "TRITON_CACHE_DIR=%ROOT_DIR%.hf_cache\\triton"
-set "MIOPEN_FIND_MODE=2"
-set "MIOPEN_FIND_ENFORCE=1"
+set "MIOPEN_FIND_ENFORCE="
+set "MIOPEN_FIND_MODE=3"
 set "MIOPEN_LOG_LEVEL=0"
 set "MIOPEN_ENABLE_LOGGING=0"
 set "AMD_LOG_LEVEL=0"
@@ -1608,10 +1629,12 @@ $env:HUGGINGFACE_HUB_CACHE = "$ROOT_DIR\\.hf_cache\\hub"
 $env:TORCH_EXTENSIONS_DIR = "$ROOT_DIR\\.hf_cache\\torch_extensions"
 $env:MIOPEN_USER_DB_PATH = "$ROOT_DIR\\.hf_cache\\miopen\\db"
 $env:MIOPEN_CUSTOM_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\miopen\\kernels"
+$env:AMD_COMGR_CACHE = "1"
+$env:AMD_COMGR_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\miopen\\comgr"
 $env:TORCHINDUCTOR_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\torch_inductor"
 $env:TRITON_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\triton"
-$env:MIOPEN_FIND_MODE = "2"
-$env:MIOPEN_FIND_ENFORCE = "1"
+Remove-Item Env:MIOPEN_FIND_ENFORCE -ErrorAction SilentlyContinue
+$env:MIOPEN_FIND_MODE = "3"
 $env:MIOPEN_LOG_LEVEL = "0"
 $env:MIOPEN_ENABLE_LOGGING = "0"
 $env:AMD_LOG_LEVEL = "0"
@@ -1678,10 +1701,12 @@ export HUGGINGFACE_HUB_CACHE="${{ROOT_DIR}}/.hf_cache/hub"
 export TORCH_EXTENSIONS_DIR="${{ROOT_DIR}}/.hf_cache/torch_extensions"
 export MIOPEN_USER_DB_PATH="${{ROOT_DIR}}/.hf_cache/miopen/db"
 export MIOPEN_CUSTOM_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/miopen/kernels"
+export AMD_COMGR_CACHE="1"
+export AMD_COMGR_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/miopen/comgr"
 export TORCHINDUCTOR_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/torch_inductor"
 export TRITON_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/triton"
-export MIOPEN_FIND_MODE="2"
-export MIOPEN_FIND_ENFORCE="1"
+unset MIOPEN_FIND_ENFORCE
+export MIOPEN_FIND_MODE="3"
 export MIOPEN_LOG_LEVEL="0"
 export MIOPEN_ENABLE_LOGGING="0"
 export AMD_LOG_LEVEL="0"
