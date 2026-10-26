@@ -39,6 +39,7 @@ for _d in (
 ):
     _d.mkdir(parents=True, exist_ok=True)
 
+os.environ.pop("TORCH_BLAS_PREFER_HIPBLASLT", None)
 tempfile.tempdir = str(TMP_DIR)
 os.environ["TEMP"] = str(TMP_DIR)
 os.environ["TMP"] = str(TMP_DIR)
@@ -191,6 +192,39 @@ def resolve_dynamic_python_matrix() -> dict[str, str]:
     except Exception:
         pass
     return matrix
+
+
+def _install_c10_env_sanitizer(target_dir: Path) -> None:
+    site_packages = (
+        target_dir / "Lib" / "site-packages"
+        if os.name == "nt"
+        else next(target_dir.glob("lib/python*/site-packages"), None)
+    )
+    if site_packages is None or not site_packages.is_dir():
+        return
+    sanitizer_code = (
+        "import os\n"
+        "_C10_BOOL_FLAGS = (\n"
+        "    'TORCH_BLAS_PREFER_HIPBLASLT',\n"
+        "    'TORCH_USE_HIP_DSA',\n"
+        "    'CUDA_LAUNCH_BLOCKING',\n"
+        "    'HIP_LAUNCH_BLOCKING',\n"
+        "    'TORCH_SHOW_CPP_STACKTRACES',\n"
+        ")\n"
+        "for _k in _C10_BOOL_FLAGS:\n"
+        "    _v = os.environ.get(_k)\n"
+        "    if _v is not None and _v not in ('0', '1'):\n"
+        "        _norm = _v.strip().lower()\n"
+        "        if _norm in ('1', 'true', 'yes', 'on'):\n"
+        "            os.environ[_k] = '1'\n"
+        "        elif _norm in ('0', 'false', 'no', 'off'):\n"
+        "            os.environ[_k] = '0'\n"
+        "        else:\n"
+        "            os.environ.pop(_k, None)\n"
+    )
+    (site_packages / "sitecustomize.py").write_text(
+        sanitizer_code, encoding="utf-8"
+    )
 
 
 def build_hermetic_env(target_sandbox: Path) -> dict[str, str]:
@@ -510,6 +544,7 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         and site_packages is not None
         and (site_packages / "pip").is_dir()
     ):
+        _install_c10_env_sanitizer(target_dir)
         print_status(
             f"Reusing existing hermetic base interpreter at {target_dir.name}.",
             "INFO",
@@ -572,6 +607,7 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
             source_extracted.rename(target_dir)
         executable = target_dir / "bin" / "python"
 
+    _install_c10_env_sanitizer(target_dir)
     hermetic_env = build_hermetic_env(target_dir)
     pip_bootstrapper = TMP_DIR / "get-pip.py"
     v_parts = version.split(".")
@@ -929,6 +965,7 @@ def condition_pytorch_runtime(
 def generate_environment_anchors(
     target_dir: Path, executable: Path, hsa_override: str = ""
 ) -> None:
+    _install_c10_env_sanitizer(target_dir)
     project_root = target_dir.parent
     rel_env_name = target_dir.name
 
@@ -951,7 +988,7 @@ def generate_environment_anchors(
     hsa_ps1_line = (
         f'$env:HSA_OVERRIDE_GFX_VERSION="{hsa_override}"'
         if hsa_override
-        else '$env:HSA_OVERRIDE_GFX_VERSION=""'
+        else "Remove-Item Env:\\HSA_OVERRIDE_GFX_VERSION -ErrorAction SilentlyContinue"
     )
     hsa_echo_ps1 = (
         'Write-Host " HSA GFX Override: $env:HSA_OVERRIDE_GFX_VERSION"'
@@ -1029,12 +1066,12 @@ cmd /k
         ps1_content = f"""# Hermetic Sandbox PowerShell Launcher
 $ErrorActionPreference = "Continue"
 $ROOT_DIR = $PSScriptRoot
-$env:PYTHONPATH = ""
-$env:PYTHONCASEOK = ""
-$env:VIRTUAL_ENV = ""
-$env:CONDA_PREFIX = ""
-$env:CONDA_DEFAULT_ENV = ""
-$env:TORCH_BLAS_PREFER_HIPBLASLT = ""
+Remove-Item Env:\\PYTHONPATH -ErrorAction SilentlyContinue
+Remove-Item Env:\\PYTHONCASEOK -ErrorAction SilentlyContinue
+Remove-Item Env:\\VIRTUAL_ENV -ErrorAction SilentlyContinue
+Remove-Item Env:\\CONDA_PREFIX -ErrorAction SilentlyContinue
+Remove-Item Env:\\CONDA_DEFAULT_ENV -ErrorAction SilentlyContinue
+Remove-Item Env:\\TORCH_BLAS_PREFER_HIPBLASLT -ErrorAction SilentlyContinue
 $env:PYTHONNOUSERSITE = "1"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"

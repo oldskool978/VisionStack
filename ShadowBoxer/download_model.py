@@ -32,6 +32,7 @@ def _resolve_cache_dir() -> Path:
     return (ROOT_DIR / ".hf_cache").resolve()
 
 
+os.environ.pop("TORCH_BLAS_PREFER_HIPBLASLT", None)
 CACHE_DIR = _resolve_cache_dir()
 os.environ["HF_HOME"] = str(CACHE_DIR)
 os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR / "hub")
@@ -390,7 +391,6 @@ def condition_subsystem_shards(
         torch.cuda.synchronize()
     if HAS_REFINERY:
         clear_refinery_cache()
-
     return quantized_count, preserved_count, stripped_count
 
 
@@ -402,21 +402,28 @@ def link_or_copy_shared_subsystem(src_sub: Path, dst_sub: Path) -> int:
     for src_file in src_sub.rglob("*"):
         if not src_file.is_file():
             continue
+        real_src = src_file.resolve()
+        if not real_src.is_file():
+            continue
         rel = src_file.relative_to(src_sub)
         dst_file = dst_sub / rel
         dst_file.parent.mkdir(parents=True, exist_ok=True)
-        if dst_file.exists():
+        if dst_file.exists() or dst_file.is_symlink():
             try:
-                if dst_file.stat().st_ino == src_file.stat().st_ino:
+                if (
+                    dst_file.exists()
+                    and not dst_file.is_symlink()
+                    and dst_file.stat().st_ino == real_src.stat().st_ino
+                ):
                     linked_files += 1
                     continue
-                dst_file.unlink()
+                dst_file.unlink(missing_ok=True)
             except OSError:
                 pass
         try:
-            os.link(src_file, dst_file)
+            os.link(real_src, dst_file)
         except OSError:
-            shutil.copy2(src_file, dst_file)
+            shutil.copy2(real_src, dst_file)
         linked_files += 1
     return linked_files
 
@@ -457,11 +464,20 @@ def restore_pristine_shards_if_needed(
             manifest_mismatch = True
 
     unlinked_count = 0
-    for sub_name in ("transformer", "text_encoder"):
+    for sub_name in ("transformer", "text_encoder", "vae"):
         sub_dir = snap / sub_name
         if not sub_dir.is_dir():
             continue
         for sf_path in sorted(sub_dir.glob("*.safetensors")):
+            if sf_path.is_symlink() and not sf_path.exists():
+                try:
+                    sf_path.unlink(missing_ok=True)
+                    unlinked_count += 1
+                except OSError:
+                    pass
+                continue
+            if sub_name == "vae":
+                continue
             try:
                 _, _, _, has_non_bf16 = inspect_shard_header(
                     sf_path, sub_name, target_dtype
@@ -470,7 +486,7 @@ def restore_pristine_shards_if_needed(
                 has_non_bf16 = True
             if has_non_bf16 and (manifest_mismatch or target_dtype is None):
                 try:
-                    sf_path.unlink()
+                    sf_path.unlink(missing_ok=True)
                     unlinked_count += 1
                 except OSError:
                     pass
@@ -478,7 +494,7 @@ def restore_pristine_shards_if_needed(
     if unlinked_count > 0:
         manifest_file.unlink(missing_ok=True)
         logging.info(
-            "Unlinked %d previously quantized shard(s) in %s to restore pristine BF16 blobs.",
+            "Unlinked %d stale or quantized shard(s) in %s to restore pristine BF16 blobs.",
             unlinked_count,
             repo_id,
         )
@@ -516,9 +532,9 @@ def find_donor_snapshot(
                 and (snap / "vae").is_dir()
             ):
                 te_shards = sorted((snap / "text_encoder").glob("*.safetensors"))
-                if len(te_shards) == 4:
+                if len(te_shards) == 4 and all(s.resolve().is_file() for s in te_shards):
                     needs_mod, _, _, _ = inspect_shard_header(
-                        te_shards[0], "text_encoder", target_dtype
+                        te_shards[0].resolve(), "text_encoder", target_dtype
                     )
                     if not needs_mod:
                         return snap
