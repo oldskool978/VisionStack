@@ -132,6 +132,13 @@ def safe_rmtree(dir_path: Path) -> None:
             time.sleep(0.15 * (attempt + 1))
 
 
+def _has_nonempty_dir(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(path.iterdir())
+    except OSError:
+        return False
+
+
 def resolve_dynamic_python_matrix() -> dict[str, str]:
     matrix = dict(FALLBACK_MATRIX)
     if os.name != "nt":
@@ -497,6 +504,9 @@ def resolve_rocm_sdk_layout(
     rocm_root: Path | None = None
     rocm_bin: Path | None = None
     rocm_cmake: Path | None = None
+    llvm_bin: Path | None = None
+    device_lib: Path | None = None
+    miopen_sys_db: Path | None = None
 
     if executable is not None and executable.is_file():
         q_root = safe_subprocess(
@@ -518,49 +528,73 @@ def resolve_rocm_sdk_layout(
         if q_cmake and Path(q_cmake).is_dir():
             rocm_cmake = Path(q_cmake).resolve()
 
+    sdk_roots: list[Path] = []
     if site_packages is not None and site_packages.is_dir():
         devel_dir = site_packages / "_rocm_sdk_devel"
         core_dir = site_packages / "_rocm_sdk_core"
+        for cand in (devel_dir, core_dir):
+            if cand.is_dir():
+                sdk_roots.append(cand.resolve())
+        for pkg_dir in sorted(site_packages.glob("_rocm_sdk_*")):
+            resolved_pkg = pkg_dir.resolve()
+            if resolved_pkg not in sdk_roots:
+                sdk_roots.append(resolved_pkg)
         if rocm_root is None:
             if (devel_dir / "bin").is_dir():
                 rocm_root = devel_dir.resolve()
             elif (core_dir / "bin").is_dir():
                 rocm_root = core_dir.resolve()
-        if rocm_root is not None:
-            if rocm_bin is None and (rocm_root / "bin").is_dir():
-                rocm_bin = (rocm_root / "bin").resolve()
-            if rocm_cmake is None and (rocm_root / "lib" / "cmake").is_dir():
-                rocm_cmake = (rocm_root / "lib" / "cmake").resolve()
 
     if rocm_root is None:
         rocm_root = target_sandbox.resolve()
+    if rocm_root not in sdk_roots:
+        sdk_roots.insert(0, rocm_root)
 
-    llvm_bin = rocm_root / "lib" / "llvm" / "bin"
-    device_lib = rocm_root / "lib" / "llvm" / "amdgcn" / "bitcode"
-    miopen_sys_db = rocm_root / "share" / "miopen" / "db"
+    if rocm_bin is None and (rocm_root / "bin").is_dir():
+        rocm_bin = (rocm_root / "bin").resolve()
+
+    for root_cand in sdk_roots:
+        if rocm_cmake is None and (root_cand / "lib" / "cmake").is_dir():
+            rocm_cmake = (root_cand / "lib" / "cmake").resolve()
+        if llvm_bin is None and (root_cand / "lib" / "llvm" / "bin").is_dir():
+            llvm_bin = (root_cand / "lib" / "llvm" / "bin").resolve()
+        if (
+            device_lib is None
+            and _has_nonempty_dir(root_cand / "lib" / "llvm" / "amdgcn" / "bitcode")
+        ):
+            device_lib = (root_cand / "lib" / "llvm" / "amdgcn" / "bitcode").resolve()
+        if (
+            miopen_sys_db is None
+            and _has_nonempty_dir(root_cand / "share" / "miopen" / "db")
+        ):
+            miopen_sys_db = (root_cand / "share" / "miopen" / "db").resolve()
+
+    if (
+        miopen_sys_db is None
+        and site_packages is not None
+        and _has_nonempty_dir(site_packages / "torch" / "share" / "miopen" / "db")
+    ):
+        miopen_sys_db = (site_packages / "torch" / "share" / "miopen" / "db").resolve()
 
     extra_bins: list[str] = []
     if rocm_bin is not None and rocm_bin.is_dir():
         extra_bins.append(str(rocm_bin))
-    if llvm_bin.is_dir():
-        extra_bins.append(str(llvm_bin.resolve()))
-    if site_packages is not None and site_packages.is_dir():
-        for pkg_dir in sorted(site_packages.glob("_rocm_sdk_*")):
-            b_dir = pkg_dir / "bin"
-            if b_dir.is_dir():
-                b_str = str(b_dir.resolve())
-                if b_str not in extra_bins:
-                    extra_bins.append(b_str)
+    if llvm_bin is not None and llvm_bin.is_dir():
+        extra_bins.append(str(llvm_bin))
+    for root_cand in sdk_roots:
+        b_dir = root_cand / "bin"
+        if b_dir.is_dir():
+            b_str = str(b_dir.resolve())
+            if b_str not in extra_bins:
+                extra_bins.append(b_str)
 
     return {
         "rocm_root": str(rocm_root),
         "rocm_bin": str(rocm_bin) if rocm_bin is not None else "",
         "rocm_cmake": str(rocm_cmake) if rocm_cmake is not None else "",
-        "llvm_bin": str(llvm_bin.resolve()) if llvm_bin.is_dir() else "",
-        "device_lib": str(device_lib.resolve()) if device_lib.is_dir() else "",
-        "miopen_sys_db": (
-            str(miopen_sys_db.resolve()) if miopen_sys_db.is_dir() else ""
-        ),
+        "llvm_bin": str(llvm_bin) if llvm_bin is not None else "",
+        "device_lib": str(device_lib) if device_lib is not None else "",
+        "miopen_sys_db": str(miopen_sys_db) if miopen_sys_db is not None else "",
         "extra_bins": os.pathsep.join(extra_bins),
     }
 
@@ -667,7 +701,8 @@ def build_hermetic_env(
         "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
         "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
         "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
-        "MIOPEN_FIND_MODE": "1",
+        "MIOPEN_FIND_MODE": "2",
+        "MIOPEN_FIND_ENFORCE": "1",
         "MIOPEN_LOG_LEVEL": "0",
         "MIOPEN_ENABLE_LOGGING": "0",
         "AMD_LOG_LEVEL": "0",
@@ -697,7 +732,11 @@ def build_hermetic_env(
         defaults["MIOPEN_SYSTEM_DB_PATH"] = rocm_layout["miopen_sys_db"]
 
     for k, v in defaults.items():
-        env[k] = os.environ.get(k) or v
+        cur = os.environ.get(k)
+        if k == "MIOPEN_FIND_MODE" and cur is not None and cur.strip().lower() in ("1", "normal"):
+            env[k] = "2"
+        else:
+            env[k] = cur if (cur is not None and cur.strip()) else v
     return env
 
 
@@ -1232,6 +1271,13 @@ def _env_default(key: str, val: str) -> None:
         os.environ[key] = val
 
 
+def _has_files(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(path.iterdir())
+    except OSError:
+        return False
+
+
 _ROCM_DEVEL = _SP_DIR / "_rocm_sdk_devel"
 _ROCM_CORE = _SP_DIR / "_rocm_sdk_core"
 if (_ROCM_DEVEL / "bin").is_dir():
@@ -1241,10 +1287,30 @@ elif (_ROCM_CORE / "bin").is_dir():
 else:
     _ROCM_ROOT = _ENV_DIR.resolve()
 
+_SDK_ROOTS = [_ROCM_ROOT]
+for _cand_r in [_ROCM_DEVEL, _ROCM_CORE] + sorted(_SP_DIR.glob("_rocm_sdk_*")):
+    if _cand_r.is_dir():
+        _res_r = _cand_r.resolve()
+        if _res_r not in _SDK_ROOTS:
+            _SDK_ROOTS.append(_res_r)
+
 _LLVM_BIN = _ROCM_ROOT / "lib" / "llvm" / "bin"
 _DEVICE_LIB = _ROCM_ROOT / "lib" / "llvm" / "amdgcn" / "bitcode"
 _ROCM_CMAKE = _ROCM_ROOT / "lib" / "cmake"
 _MIOPEN_SYS_DB = _ROCM_ROOT / "share" / "miopen" / "db"
+
+for _r in _SDK_ROOTS:
+    if not _LLVM_BIN.is_dir() and (_r / "lib" / "llvm" / "bin").is_dir():
+        _LLVM_BIN = _r / "lib" / "llvm" / "bin"
+    if not _has_files(_DEVICE_LIB) and _has_files(_r / "lib" / "llvm" / "amdgcn" / "bitcode"):
+        _DEVICE_LIB = _r / "lib" / "llvm" / "amdgcn" / "bitcode"
+    if not _ROCM_CMAKE.is_dir() and (_r / "lib" / "cmake").is_dir():
+        _ROCM_CMAKE = _r / "lib" / "cmake"
+    if not _has_files(_MIOPEN_SYS_DB) and _has_files(_r / "share" / "miopen" / "db"):
+        _MIOPEN_SYS_DB = _r / "share" / "miopen" / "db"
+
+if not _has_files(_MIOPEN_SYS_DB) and _has_files(_SP_DIR / "torch" / "share" / "miopen" / "db"):
+    _MIOPEN_SYS_DB = _SP_DIR / "torch" / "share" / "miopen" / "db"
 
 _env_default("PYTHONHOME", str(_ENV_DIR))
 _env_default("PYTHONNOUSERSITE", "1")
@@ -1263,17 +1329,19 @@ _env_default("XDG_CACHE_HOME", str(_CACHE))
 _env_default("XDG_CONFIG_HOME", str(_ROOT / ".config"))
 _env_default("XDG_DATA_HOME", str(_ROOT / ".local" / "share"))
 
-_env_default("ROCM_PATH", str(_ROCM_ROOT))
+_cur_rocm = os.environ.get("ROCM_PATH", "")
+if not _cur_rocm.strip() or Path(_cur_rocm).resolve() == _ENV_DIR.resolve():
+    os.environ["ROCM_PATH"] = str(_ROCM_ROOT)
 _env_default("ROCM_HOME", str(_ROCM_ROOT))
 _env_default("HIP_PATH", str(_ROCM_ROOT))
 if _LLVM_BIN.is_dir():
     _env_default("HIP_CLANG_PATH", str(_LLVM_BIN))
-if _DEVICE_LIB.is_dir():
+if _has_files(_DEVICE_LIB):
     _env_default("HIP_DEVICE_LIB_PATH", str(_DEVICE_LIB))
 if _ROCM_CMAKE.is_dir():
     _env_default("CMAKE_PREFIX_PATH", str(_ROCM_CMAKE))
-if _MIOPEN_SYS_DB.is_dir():
-    _env_default("MIOPEN_SYSTEM_DB_PATH", str(_MIOPEN_SYS_DB))
+if _has_files(_MIOPEN_SYS_DB):
+    os.environ["MIOPEN_SYSTEM_DB_PATH"] = str(_MIOPEN_SYS_DB)
 
 if {repr(profile == "ROCM")}:
     _env_default("HIP_PLATFORM", "amd")
@@ -1291,7 +1359,9 @@ _env_default("MIOPEN_USER_DB_PATH", str(_HF / "miopen" / "db"))
 _env_default("MIOPEN_CUSTOM_CACHE_DIR", str(_HF / "miopen" / "kernels"))
 _env_default("TORCHINDUCTOR_CACHE_DIR", str(_HF / "torch_inductor"))
 _env_default("TRITON_CACHE_DIR", str(_HF / "triton"))
-_env_default("MIOPEN_FIND_MODE", "1")
+if os.environ.get("MIOPEN_FIND_MODE", "").strip().lower() in ("", "1", "normal"):
+    os.environ["MIOPEN_FIND_MODE"] = "2"
+_env_default("MIOPEN_FIND_ENFORCE", "1")
 _env_default("MIOPEN_LOG_LEVEL", "0")
 _env_default("MIOPEN_ENABLE_LOGGING", "0")
 _env_default("AMD_LOG_LEVEL", "0")
@@ -1468,7 +1538,8 @@ set "MIOPEN_USER_DB_PATH=%ROOT_DIR%.hf_cache\\miopen\\db"
 set "MIOPEN_CUSTOM_CACHE_DIR=%ROOT_DIR%.hf_cache\\miopen\\kernels"
 set "TORCHINDUCTOR_CACHE_DIR=%ROOT_DIR%.hf_cache\\torch_inductor"
 set "TRITON_CACHE_DIR=%ROOT_DIR%.hf_cache\\triton"
-set "MIOPEN_FIND_MODE=1"
+set "MIOPEN_FIND_MODE=2"
+set "MIOPEN_FIND_ENFORCE=1"
 set "MIOPEN_LOG_LEVEL=0"
 set "MIOPEN_ENABLE_LOGGING=0"
 set "AMD_LOG_LEVEL=0"
@@ -1539,7 +1610,8 @@ $env:MIOPEN_USER_DB_PATH = "$ROOT_DIR\\.hf_cache\\miopen\\db"
 $env:MIOPEN_CUSTOM_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\miopen\\kernels"
 $env:TORCHINDUCTOR_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\torch_inductor"
 $env:TRITON_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\triton"
-$env:MIOPEN_FIND_MODE = "1"
+$env:MIOPEN_FIND_MODE = "2"
+$env:MIOPEN_FIND_ENFORCE = "1"
 $env:MIOPEN_LOG_LEVEL = "0"
 $env:MIOPEN_ENABLE_LOGGING = "0"
 $env:AMD_LOG_LEVEL = "0"
@@ -1608,7 +1680,8 @@ export MIOPEN_USER_DB_PATH="${{ROOT_DIR}}/.hf_cache/miopen/db"
 export MIOPEN_CUSTOM_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/miopen/kernels"
 export TORCHINDUCTOR_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/torch_inductor"
 export TRITON_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/triton"
-export MIOPEN_FIND_MODE="1"
+export MIOPEN_FIND_MODE="2"
+export MIOPEN_FIND_ENFORCE="1"
 export MIOPEN_LOG_LEVEL="0"
 export MIOPEN_ENABLE_LOGGING="0"
 export AMD_LOG_LEVEL="0"

@@ -1,3 +1,4 @@
+# ShadowBoxer/models/modeling_vae.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from safetensors.torch import load_file as load_safetensors
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+_SDPA_QUERY_CHUNK_SIZE = 2048
 
 
 @dataclass
@@ -97,14 +100,27 @@ class _AttentionBlock2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
-        normed = self.group_norm(x).view(b, c, h * w).transpose(1, 2)
+        seq_len = h * w
+        normed = self.group_norm(x).reshape(b, c, seq_len).transpose(1, 2).contiguous()
         q = self.to_q(normed).unsqueeze(1)
         k = self.to_k(normed).unsqueeze(1)
         v = self.to_v(normed).unsqueeze(1)
         del normed
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False).squeeze(1)
+
+        if seq_len <= _SDPA_QUERY_CHUNK_SIZE * 2:
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False
+            ).squeeze(1)
+        else:
+            out = torch.empty((b, seq_len, c), dtype=q.dtype, device=q.device)
+            for start in range(0, seq_len, _SDPA_QUERY_CHUNK_SIZE):
+                end = min(start + _SDPA_QUERY_CHUNK_SIZE, seq_len)
+                out[:, start:end, :] = F.scaled_dot_product_attention(
+                    q[:, :, start:end, :], k, v, dropout_p=0.0, is_causal=False
+                ).squeeze(1)
+
         del q, k, v
-        out = self.to_out[0](out).transpose(1, 2).view(b, c, h, w)
+        out = self.to_out[0](out).transpose(1, 2).reshape(b, c, h, w)
         return out.add_(x)
 
 
@@ -373,6 +389,7 @@ class Flux2AutoencoderKL(nn.Module):
             use_post_quant_conv=use_post_quant_conv,
             use_quant_conv=use_quant_conv,
         )
+
         packed_channels = latent_channels * patch_size[0] * patch_size[1]
         self.bn = nn.BatchNorm2d(
             packed_channels,
@@ -426,12 +443,21 @@ class Flux2AutoencoderKL(nn.Module):
         sf_files = sorted(path.glob("*.safetensors"))
         if not sf_files:
             raise FileNotFoundError(f"No .safetensors files found in {path}")
+        target_dev = torch.device(device) if isinstance(device, str) else device
         state_dict = {}
         for sf in sf_files:
-            state_dict.update(load_safetensors(str(sf), device="cpu"))
+            raw = load_safetensors(str(sf), device="cpu")
+            for k, v in raw.items():
+                if v.is_floating_point():
+                    t_dtype = torch.float32 if k.startswith("bn.") else dtype
+                    state_dict[k] = v.to(device=target_dev, dtype=t_dtype)
+                else:
+                    state_dict[k] = v.to(device=target_dev)
+            del raw
         if "bn.num_batches_tracked" not in state_dict:
-            state_dict["bn.num_batches_tracked"] = torch.tensor(0, dtype=torch.long)
-
+            state_dict["bn.num_batches_tracked"] = torch.tensor(
+                0, dtype=torch.long, device=target_dev
+            )
         model = cls.from_config_dir(path)
         if "decoder.conv_out.weight" in state_dict:
             actual_dec_ch0 = int(state_dict["decoder.conv_out.weight"].shape[1])
@@ -439,9 +465,8 @@ class Flux2AutoencoderKL(nn.Module):
             if actual_dec_ch0 != expected_dec_ch0 and actual_dec_ch0 == 96:
                 model.config.decoder_block_out_channels = (96, 192, 384, 384)
                 model = cls(config=model.config)
-
         model.load_state_dict(state_dict, strict=True, assign=True)
-        model.to(device=device, dtype=dtype)
+        model.to(device=target_dev, dtype=dtype)
         model.eval().requires_grad_(False)
         return model
 
@@ -466,7 +491,7 @@ class Flux2AutoencoderKL(nn.Module):
             eps = self.config.batch_norm_eps
             std = (self.bn.running_var.float() + eps).sqrt().to(z).view(1, -1, 1, 1)
             mean = self.bn.running_mean.float().to(z).view(1, -1, 1, 1)
-            z = z * std + mean
+            z = torch.addcmul(mean, z, std)
             del std, mean
             b, c, h, w = z.shape
             z = (

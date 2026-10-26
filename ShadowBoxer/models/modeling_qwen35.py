@@ -25,6 +25,7 @@ _FP8_DTYPES: Set[torch.dtype] = {
 }
 
 _STRICTLY_UPPER_MASK_CACHE: OrderedDict[Tuple[int, str], torch.Tensor] = OrderedDict()
+_EYE_MATRIX_CACHE: OrderedDict[Tuple[int, torch.dtype, str], torch.Tensor] = OrderedDict()
 
 
 def _resolve_compute_dtype(
@@ -62,6 +63,21 @@ def _get_strictly_upper_mask(chunk_size: int, device: torch.device) -> torch.Ten
     while len(_STRICTLY_UPPER_MASK_CACHE) > 8:
         _STRICTLY_UPPER_MASK_CACHE.popitem(last=False)
     return mask
+
+
+def _get_eye_matrix(
+    size: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    key = (size, dtype, str(device))
+    cached = _EYE_MATRIX_CACHE.get(key)
+    if cached is not None:
+        _EYE_MATRIX_CACHE.move_to_end(key)
+        return cached
+    eye = torch.eye(size, dtype=dtype, device=device)
+    _EYE_MATRIX_CACHE[key] = eye
+    while len(_EYE_MATRIX_CACHE) > 8:
+        _EYE_MATRIX_CACHE.popitem(last=False)
+    return eye
 
 
 @dataclass
@@ -244,21 +260,45 @@ def _causal_conv1d_fn(
     bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
 ) -> torch.Tensor:
-    _, hidden_size, seq_len = hidden_states.shape
-    padding = weight.shape[-1] - 1
+    seq_len = hidden_states.shape[-1]
     w_dtype = _resolve_compute_dtype(weight, hidden_states.dtype)
-    w_conv = weight.to(w_dtype).unsqueeze(1)
-    b_conv = bias.to(w_dtype) if bias is not None else None
-    out = F.conv1d(
-        hidden_states.to(w_dtype),
-        weight=w_conv,
-        bias=b_conv,
-        padding=padding,
-        groups=hidden_size,
-    )[:, :, :seq_len]
+    w = weight.squeeze(1) if weight.ndim == 3 else weight
+    w = w if w.dtype == w_dtype else w.to(w_dtype)
+    k_size = w.shape[-1]
+
+    x = hidden_states.transpose(1, 2)
+    if x.dtype != w_dtype:
+        x = x.to(w_dtype)
+
+    out = x * w[:, k_size - 1]
+    for tap in range(1, min(k_size, seq_len)):
+        out[:, tap:, :].addcmul_(x[:, :-tap, :], w[:, k_size - 1 - tap])
+
+    if bias is not None:
+        out = out + bias.to(w_dtype)
     if activation:
         out = _act_fn(out, activation)
-    return out.to(hidden_states.dtype)
+    return out.to(hidden_states.dtype).transpose(1, 2)
+
+
+def _invert_unit_lower_triangular_block(u_blk: torch.Tensor) -> torch.Tensor:
+    b_sz = u_blk.shape[-1]
+    eye = _get_eye_matrix(b_sz, u_blk.dtype, u_blk.device)
+    a = -u_blk.tril(-1)
+    inv = eye + a
+    if b_sz == 16:
+        a2 = a @ a
+        a4 = a2 @ a2
+        a8 = a4 @ a4
+        return ((inv @ (eye + a2)) @ (eye + a4)) @ (eye + a8)
+
+    cur = a
+    step = 1
+    while step < b_sz:
+        cur = cur @ cur
+        inv = inv @ (eye + cur)
+        step <<= 1
+    return inv
 
 
 def _solve_unit_lower_triangular(
@@ -266,13 +306,8 @@ def _solve_unit_lower_triangular(
 ) -> torch.Tensor:
     n = ut_system.shape[-1]
     if n <= 16 or (n & (n - 1)) != 0:
-        mat = -ut_system.tril(-1)
-        for i in range(1, n):
-            row = mat[..., i, :i].clone()
-            sub = mat[..., :i, :i].clone()
-            mat[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-        mat = mat + torch.eye(n, dtype=ut_system.dtype, device=ut_system.device)
-        return mat @ rhs
+        inv_mat = _invert_unit_lower_triangular_block(ut_system)
+        return inv_mat @ rhs
 
     block_size = 16
     num_blocks = n // block_size
@@ -281,14 +316,7 @@ def _solve_unit_lower_triangular(
         *batch_shape, num_blocks, block_size, num_blocks, block_size
     )
     u_diag = u_blocks.diagonal(dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
-    mat_diag = -u_diag.tril(-1)
-    for i in range(1, block_size):
-        row = mat_diag[..., i, :i].clone()
-        sub = mat_diag[..., :i, :i].clone()
-        mat_diag[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    inv_blocks = mat_diag + torch.eye(
-        block_size, dtype=ut_system.dtype, device=ut_system.device
-    )
+    inv_blocks = _invert_unit_lower_triangular_block(u_diag)
 
     cur_size = block_size
     cur_num = num_blocks
@@ -307,9 +335,15 @@ def _solve_unit_lower_triangular(
         u21 = u_sub.diagonal(dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
         t21 = -(t22 @ (u21 @ t11))
 
-        top = torch.cat([t11, torch.zeros_like(t11)], dim=-1)
-        bot = torch.cat([t21, t22], dim=-1)
-        inv_blocks = torch.cat([top, bot], dim=-2)
+        next_inv = torch.zeros(
+            (*batch_shape, half_num, cur_size * 2, cur_size * 2),
+            dtype=ut_system.dtype,
+            device=ut_system.device,
+        )
+        next_inv[..., :cur_size, :cur_size] = t11
+        next_inv[..., cur_size:, :cur_size] = t21
+        next_inv[..., cur_size:, cur_size:] = t22
+        inv_blocks = next_inv
         cur_size *= 2
         cur_num = half_num
 
@@ -331,6 +365,12 @@ def _chunk_gated_delta_rule(
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
     padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)
+
+    if chunk_size == 64:
+        if sequence_length <= 16:
+            chunk_size = 16
+        elif sequence_length <= 32:
+            chunk_size = 32
 
     query, key, value, beta, decay = [
         x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
@@ -1160,6 +1200,7 @@ class Qwen3_5TextModel(nn.Module):
     def _apply(self, fn, recurse: bool = True):
         super()._apply(fn, recurse=recurse)
         _STRICTLY_UPPER_MASK_CACHE.clear()
+        _EYE_MATRIX_CACHE.clear()
         return self
 
     def forward(
@@ -1232,6 +1273,7 @@ class Qwen3_5Model(nn.Module):
         self.visual.clear_caches()
         self.rope_deltas = None
         _STRICTLY_UPPER_MASK_CACHE.clear()
+        _EYE_MATRIX_CACHE.clear()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.embed_tokens
