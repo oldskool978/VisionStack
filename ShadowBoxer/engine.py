@@ -551,7 +551,7 @@ def build_box_aperture_mask(
         ly1 = uy1 * h_lat
         lx0 = ux0 * w_lat
         lx1 = ux1 * w_lat
-        dy = torch.maximum(torch.maximum(ly0 - yy, yy - lx0 * 0.0 - ly1), torch.zeros_like(yy))
+        dy = torch.maximum(torch.maximum(ly0 - yy, yy - ly1), torch.zeros_like(yy))
         dx = torch.maximum(torch.maximum(lx0 - xx, xx - lx1), torch.zeros_like(xx))
         dist = torch.sqrt(dy * dy + dx * dx)
         box_m = 0.5 * (1.0 + torch.cos(math.pi * (dist / feather).clamp(0.0, 1.0)))

@@ -171,7 +171,6 @@ def _attention(
     q = _rotate(q, rope).transpose(1, 2)
     k = _rotate(k, rope).transpose(1, 2)
     v = v.transpose(1, 2)
-
     q_in = q if q.dtype == v.dtype else q.to(v.dtype)
     k_in = k if k.dtype == v.dtype else k.to(v.dtype)
     v_in = v
@@ -181,36 +180,40 @@ def _attention(
         total_ref = sum(ref_token_lengths)
         if total_ref > 0:
             text_start = target_tokens + total_ref
-            out_buf = torch.empty_like(q_in)
+            q_c = q_in.contiguous()
+            k_c = k_in.contiguous()
+            v_c = v_in.contiguous()
+            del q_in, k_in, v_in, q, k, v
+            out_buf = torch.empty_like(q_c, memory_format=torch.contiguous_format)
 
             q_main = torch.cat(
-                (q_in[:, :, :target_tokens, :], q_in[:, :, text_start:, :]), dim=2
+                (q_c[:, :, :target_tokens, :], q_c[:, :, text_start:, :]), dim=2
             )
             out_main = F.scaled_dot_product_attention(
-                q_main, k_in, v_in, attn_mask=None
+                q_main, k_c, v_c, attn_mask=None
             )
             out_buf[:, :, :target_tokens, :].copy_(out_main[:, :, :target_tokens, :])
             out_buf[:, :, text_start:, :].copy_(out_main[:, :, target_tokens:, :])
             del q_main, out_main
 
-            k_text = k_in[:, :, text_start:, :]
-            v_text = v_in[:, :, text_start:, :]
+            k_text = k_c[:, :, text_start:, :]
+            v_text = v_c[:, :, text_start:, :]
             cursor = target_tokens
             for r_len in ref_token_lengths:
                 next_cursor = cursor + r_len
-                q_ref = q_in[:, :, cursor:next_cursor, :]
+                q_ref = q_c[:, :, cursor:next_cursor, :]
                 if next_cursor == text_start:
-                    k_ref = k_in[:, :, cursor:, :]
-                    v_ref = v_in[:, :, cursor:, :]
+                    k_ref = k_c[:, :, cursor:, :]
+                    v_ref = v_c[:, :, cursor:, :]
                     out_ref = F.scaled_dot_product_attention(
                         q_ref, k_ref, v_ref, attn_mask=None
                     )
                 else:
                     k_ref = torch.cat(
-                        (k_in[:, :, cursor:next_cursor, :], k_text), dim=2
+                        (k_c[:, :, cursor:next_cursor, :], k_text), dim=2
                     )
                     v_ref = torch.cat(
-                        (v_in[:, :, cursor:next_cursor, :], v_text), dim=2
+                        (v_c[:, :, cursor:next_cursor, :], v_text), dim=2
                     )
                     out_ref = F.scaled_dot_product_attention(
                         q_ref, k_ref, v_ref, attn_mask=None
@@ -220,6 +223,7 @@ def _attention(
                 del out_ref
                 cursor = next_cursor
 
+            del q_c, k_c, v_c
             return out_buf.transpose(1, 2).flatten(2)
 
     return (
@@ -332,6 +336,7 @@ class _Block(nn.Module):
         q = self.q_norm(_linear(self.proj["q"], y).unflatten(-1, (self.heads, -1)))
         k = self.k_norm(_linear(self.proj["k"], y).unflatten(-1, (self.heads, -1)))
         v = _linear(self.proj["v"], y).unflatten(-1, (self.heads, -1))
+        del y
         attn_out = _attention(
             q,
             k,
@@ -341,13 +346,18 @@ class _Block(nn.Module):
             attn_mask=attn_mask,
             iso_kv_spec=iso_kv_spec,
         )
+        del q, k, v
         x = x + _linear(self.proj["o"], attn_out) * gate_a
+        del attn_out
 
         y = self.norm2(x) * scale_f_p1 + shift_f
         if y.dtype != dtype:
             y = y.to(dtype)
         hidden, gate = _linear(self.proj["ffn_up_gate"], y).chunk(2, -1)
-        return x + _linear(self.proj["ffn_down"], _situ(hidden, gate)) * gate_f
+        del y
+        act = _situ(hidden, gate)
+        del hidden, gate
+        return x + _linear(self.proj["ffn_down"], act) * gate_f
 
 
 class _RoPE(nn.Module):
@@ -538,6 +548,7 @@ class _RoPE(nn.Module):
         if cached is not None:
             self._phase_cache.move_to_end(cache_key)
             return cached
+
         phase = self._compute_phase(
             height, width, text_length, device, ref_shapes, bbox_key
         )
@@ -576,6 +587,7 @@ class MOSSImageTransformer(nn.Module):
             freq_dim = config.freq_dim
             latent_channels = config.latent_channels
             rope_base = config.rope_base
+
         if dim % num_heads or (dim // num_heads) % 8 or freq_dim % 2:
             raise ValueError(
                 "Require dim divisible by heads, head_dim divisible by 8, and even freq_dim."
@@ -603,10 +615,8 @@ class MOSSImageTransformer(nn.Module):
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
-
         self._lora_backups: Dict[str, torch.Tensor] = {}
         self._active_lora_tag: Optional[str] = None
-
         self._isolated_mask_cache: OrderedDict[
             Tuple[int, Tuple[int, ...], int, str], torch.Tensor
         ] = OrderedDict()
@@ -705,7 +715,6 @@ class MOSSImageTransformer(nn.Module):
             self.unfuse_lora()
         if abs(scale) < 1e-7:
             return 0
-
         param_dict = dict(self.named_parameters())
         down_keys = [
             k
@@ -762,7 +771,6 @@ class MOSSImageTransformer(nn.Module):
                 else:
                     param.data.copy_((param.data.float() + delta).to(param.dtype))
                 fused_count += 1
-
         self._active_lora_tag = target_tag
         self._mod_zero_cache.clear()
         self.clear_transient_caches()
@@ -841,7 +849,6 @@ class MOSSImageTransformer(nn.Module):
         )
         mod = _linear(self.shared_block_modulation, mod_in).view(batch, 6, -1)
         head = _linear(self.video_head_modulation, head_in).view(batch, 2, -1)
-
         self._time_mod_cache[cache_key] = (timestep, mod, head)
         while len(self._time_mod_cache) > 4:
             self._time_mod_cache.popitem(last=False)
@@ -1041,7 +1048,6 @@ class MOSSImageTransformer(nn.Module):
         reference_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> Union[TransformerOutput, Tuple[torch.Tensor, ...]]:
         skip_set = validate_skip_layers(skip_layers, len(self.layers))
-
         if (
             hidden_states.ndim != 4
             or hidden_states.shape[1] != self.config.latent_channels
@@ -1058,7 +1064,6 @@ class MOSSImageTransformer(nn.Module):
         mod, head = self._compute_time_modulation(
             timestep, batch, hidden_states.device
         )
-
         mod_zero: Optional[torch.Tensor] = None
         if reference_latents and reference_zero_timestep:
             mod_zero = self._get_cached_zero_modulation(hidden_states.device)
@@ -1102,30 +1107,43 @@ class MOSSImageTransformer(nn.Module):
             )
             seq_parts.append(text)
             x = torch.cat(seq_parts, 1)
+            del seq_parts, video
 
             mod_i = mod[index : index + 1]
             if mod_zero is not None and total_img_tokens > target_tokens:
                 total_seq = total_img_tokens + text_len
+                mod_i_p1 = mod_i.clone()
+                mod_i_p1[:, 1, :].add_(1.0)
+                mod_i_p1[:, 4, :].add_(1.0)
+                mod_z_p1 = mod_zero.clone()
+                mod_z_p1[:, 1, :].add_(1.0)
+                mod_z_p1[:, 4, :].add_(1.0)
+
                 mod_seq = self._acquire_mod_seq_buf(
                     total_seq, mod_i.device, mod_i.dtype
                 )
-                mod_seq[:, :, :target_tokens, :].copy_(mod_i[:, :, None, :])
+                mod_seq[:, :, :target_tokens, :].copy_(mod_i_p1[:, :, None, :])
                 mod_seq[:, :, target_tokens:total_img_tokens, :].copy_(
-                    mod_zero[:, :, None, :]
+                    mod_z_p1[:, :, None, :]
                 )
-                mod_seq[:, :, total_img_tokens:, :].copy_(mod_i[:, :, None, :])
-                shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod_seq.unbind(1)
+                mod_seq[:, :, total_img_tokens:, :].copy_(mod_i_p1[:, :, None, :])
+                del mod_i_p1, mod_z_p1
+                shift_a, scale_a_p1, gate_a, shift_f, scale_f_p1, gate_f = (
+                    mod_seq.unbind(1)
+                )
             else:
                 shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
                     mod_i[:, :, None, :].unbind(1)
                 )
+                scale_a_p1 = 1 + scale_a
+                scale_f_p1 = 1 + scale_f
 
             active_mod = (
                 shift_a,
-                1 + scale_a,
+                scale_a_p1,
                 gate_a,
                 shift_f,
-                1 + scale_f,
+                scale_f_p1,
                 gate_f,
             )
 

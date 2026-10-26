@@ -25,26 +25,21 @@ import torch
 from engine import MOSSImageEngine
 import schema
 from schema import (
-    BASELINE_ENGINE_DEFAULTS,
-    DEFAULT_LAYOUT_ITEMS,
-    DEFAULT_PRESET_FILENAME,
     GenerationRequest,
     GenerationResponse,
-    SUPPORTED_EDIT_FORMATS,
-    SUPPORTED_FRAMING_MODES,
-    SUPPORTED_INPUT_ROLES,
     SUPPORTED_MODELS,
-    SUPPORTED_PROMPT_MODES,
     SUPPORTED_SOLVERS,
-    get_active_engine_defaults,
-    has_custom_default_preset,
 )
 
-DEFAULT_CONFIG_PATH = ROOT_DIR / DEFAULT_PRESET_FILENAME
+DEFAULT_CONFIG_PATH = ROOT_DIR / "default.json"
 ARTIFACTS_DIR = ROOT_DIR / "artifacts"
 TEST_INPUTS_DIR = ARTIFACTS_DIR / "test_inputs"
 PERMUTATIONS_OUT_DIR = ARTIFACTS_DIR / "permutations"
 SWEEPS_DIR = ARTIFACTS_DIR / "sweeps"
+
+BASELINE_DEFAULTS: Dict[str, Any] = dict(
+    getattr(schema, "BASELINE_ENGINE_DEFAULTS", {})
+)
 
 DEFAULT_POSITIVE_PROMPT = (
     "A wide view of a sleek brushed-steel refrigerator beside a warm walnut kitchen counter "
@@ -56,6 +51,67 @@ DEFAULT_LAYOUT_SUMMARY = (
     "A wide view of a sleek brushed-steel refrigerator beside a warm walnut "
     "kitchen counter with a ceramic bowl of fresh citrus fruit and a handwritten "
     "yellow sticky note on the door."
+)
+
+DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = getattr(
+    schema,
+    "DEFAULT_LAYOUT_ITEMS",
+    getattr(
+        schema,
+        "DEFAULT_LAYOUT_BOXES",
+        [
+            {
+                "category": "refrigerator",
+                "caption": "A sleek brushed-steel refrigerator door with a small yellow sticky note",
+                "bbox": [32, 48, 992, 592],
+                "enabled": True,
+            },
+            {
+                "category": "text",
+                "text": "Remember to test SFT & Base permutations @ 1024x1024",
+                "bbox": [288, 144, 544, 480],
+                "enabled": True,
+            },
+            {
+                "category": "bowl",
+                "caption": "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
+                "bbox": [592, 608, 976, 976],
+                "enabled": True,
+            },
+        ],
+    ),
+)
+
+SUPPORTED_PROMPT_MODES: Tuple[str, ...] = getattr(
+    schema,
+    "SUPPORTED_PROMPT_MODES",
+    ("natural", "layout_json"),
+)
+
+SUPPORTED_EDIT_FORMATS: Tuple[str, ...] = getattr(
+    schema,
+    "SUPPORTED_EDIT_FORMATS",
+    (
+        "standard",
+        "moss_image_edit",
+        "ai_toolkit_isolated",
+        "ai_toolkit_full",
+        "control_color_depth",
+    ),
+)
+
+SUPPORTED_FRAMING_MODES: Tuple[str, ...] = (
+    "inscribed",
+    "cover_crop",
+    "contain",
+    "stretch",
+    "never_crop",
+)
+
+SUPPORTED_INPUT_ROLES: Tuple[str, ...] = getattr(
+    schema,
+    "SUPPORTED_INPUT_ROLES",
+    ("photo_ref", "color_map", "depth_map", "inpaint_mask"),
 )
 
 
@@ -114,7 +170,7 @@ def _graceful_exit(engine: Optional[MOSSImageEngine], code: int = 0) -> None:
 
 
 def build_default_request() -> GenerationRequest:
-    d = get_active_engine_defaults()
+    d = BASELINE_DEFAULTS
     raw_kwargs: Dict[str, Any] = {
         "prompt": str(d.get("prompt", DEFAULT_POSITIVE_PROMPT)),
         "negative_prompt": str(d.get("negative_prompt", "")),
@@ -123,26 +179,22 @@ def build_default_request() -> GenerationRequest:
         "layout_summary": str(d.get("layout_summary", DEFAULT_LAYOUT_SUMMARY)),
         "layout_items": [dict(b) for b in d.get("layout_items", DEFAULT_LAYOUT_ITEMS)],
         "layout_coords_are_pixels": bool(d.get("layout_coords_are_pixels", True)),
-        "preserve_canvas_outside_boxes": bool(
-            d.get("preserve_canvas_outside_boxes", False)
-        ),
         "enable_thinking": bool(d.get("enable_thinking", True)),
         "width": int(d.get("width", 1024)),
         "height": int(d.get("height", 1024)),
         "num_inference_steps": int(d.get("num_inference_steps", 50)),
         "shift": float(d.get("shift", 5.0)),
         "use_v2_grid": bool(d.get("use_v2_grid", True)),
-        "early_solver": str(d.get("early_solver", "heun")),
-        "late_solver": str(d.get("late_solver", "ipndm")),
+        "early_solver": str(d.get("early_solver", "euler")),
+        "late_solver": str(d.get("late_solver", "euler")),
         "handoff_threshold": float(d.get("handoff_threshold", 0.35)),
-        "guidance_scale": float(d.get("guidance_scale", 3.2)),
-        "early_cfg": float(d.get("early_cfg", 3.2)),
-        "late_cfg": float(d.get("late_cfg", 2.8)),
+        "early_cfg": float(d.get("early_cfg", 3.0)),
+        "late_cfg": float(d.get("late_cfg", 3.0)),
         "uncond_skip_layers": list(d.get("uncond_skip_layers", [24])),
         "slg_layers": list(d.get("slg_layers", [])),
         "slg_scale": float(d.get("slg_scale", 0.0)),
-        "slg_start": float(d.get("slg_start", 0.20)),
-        "slg_stop": float(d.get("slg_stop", 0.70)),
+        "slg_start": float(d.get("slg_start", 0.05)),
+        "slg_stop": float(d.get("slg_stop", 0.60)),
         "eta": float(d.get("eta", 0.0)),
         "s_noise": float(d.get("s_noise", 1.0)),
         "seed": int(d.get("seed", 42)),
@@ -212,29 +264,18 @@ def load_or_create_initial_request(
     target = config_path or DEFAULT_CONFIG_PATH
     if target.is_file():
         try:
-            req = GenerationRequest.load_preset(target)
-            if not req.prompt.strip():
-                req.prompt = DEFAULT_POSITIVE_PROMPT
-            if not req.layout_items:
-                req.layout_items = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
+            raw = json.loads(target.read_text(encoding="utf-8"))
+            req = request_from_dict(raw)
             req.validate()
-            return req, f"ShadowBoxer/{target.name} (Active File)"
+            return req, f"Loaded: {target.name}"
         except Exception as e:
             print(f"[!] Warning: Failed to parse {target}: {e}. Using baseline.")
-    banner = (
-        "ShadowBoxer/default.json (Active File)"
-        if has_custom_default_preset()
-        else "Discovered Optimal Baseline (V03 Heun->IPNDM)"
-    )
-    return build_default_request(), banner
+    return build_default_request(), "Discovered Optimal Baseline"
 
 
 def save_request_json(req: GenerationRequest, path: Path) -> None:
-    if hasattr(req, "save_preset") and callable(req.save_preset):
-        req.save_preset(path)
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(request_to_dict(req), indent=2), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(request_to_dict(req), indent=2), encoding="utf-8")
 
 
 load_request_from_json = lambda path: load_or_create_initial_request(path)[0]
@@ -275,10 +316,9 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
         if (req.edit_lora_path and abs(req.edit_lora_scale) > 1e-6)
         else "<Disabled>"
     )
-
     print("\n" + "=" * 92)
     print("               SHADOWBOXER: OPENMOSS ARCHITECTURAL EXPLORATION HARNESS")
-    print(f"                     [{banner_tag}]")
+    print(f"                             [{banner_tag}]")
     print("=" * 92)
     print(" --- MODEL & PROMPT CONDITIONING ---")
     print(f" [M]  Active Model Variant:   {req.model_variant.upper()} ({repo_str})")
@@ -342,7 +382,6 @@ def render_telemetry_report(
         if resp.viztoken_active
         else "FALLBACK TOKENIZER"
     )
-
     print("\n" + "=" * 92)
     print("                          SHADOWBOXER: OPENMOSS TELEMETRY REPORT")
     print("=" * 92)
@@ -423,8 +462,8 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
         np.linspace(-1.0, 1.0, w, dtype=np.float32),
         indexing="ij",
     )
-
     rad = np.sqrt(xx * xx + yy * yy)
+
     ref_a = np.zeros((h, w, 3), dtype=np.uint8)
     ref_a[..., 0] = np.clip((0.55 + 0.40 * np.cos(3.0 * xx)) * 255.0, 0, 255).astype(
         np.uint8
@@ -515,7 +554,6 @@ def run_permutation_suite(
 ) -> List[Dict[str, Any]]:
     staged = stage_test_input_files()
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
-
     active_base = base_req if base_req is not None else build_default_request()
     w = width_override or active_base.width
     h = height_override or active_base.height
@@ -539,13 +577,12 @@ def run_permutation_suite(
         num_inference_steps=eff_steps,
         early_solver="euler",
         late_solver="euler",
-        handoff_threshold=0.35,
         early_cfg=3.0,
         late_cfg=3.0,
+        guidance_scale=3.0,
+        eta=0.0,
         slg_layers=[],
         slg_scale=0.0,
-        eta=0.0,
-        s_noise=1.0,
         init_image_path=None,
         inpaint_mask_path=None,
         control_image_path=None,
@@ -791,7 +828,6 @@ def interactive_loop(
         cmd = choice.lower()
         if not cmd:
             continue
-
         if cmd in ("q", "quit", "exit"):
             print("[+] Exiting ShadowBoxer Harness...")
             _graceful_exit(engine, 0)
@@ -819,15 +855,11 @@ def interactive_loop(
                 print("-" * 92)
             elif cmd == "t":
                 req = build_default_request()
-                active_tag = (
-                    "ShadowBoxer/default.json (Active File)"
-                    if has_custom_default_preset()
-                    else "Discovered Optimal Baseline (V03 Heun->IPNDM)"
-                )
+                active_tag = "Discovered Optimal Baseline (Reset)"
             elif cmd == "d":
                 save_request_json(req, DEFAULT_CONFIG_PATH)
-                active_tag = f"ShadowBoxer/{DEFAULT_CONFIG_PATH.name} (Active File)"
-                print(f"[+] Authoritative default.json updated at {DEFAULT_CONFIG_PATH}")
+                active_tag = f"Saved: {DEFAULT_CONFIG_PATH.name}"
+                print(f"[+] Saved configuration to {DEFAULT_CONFIG_PATH}")
             elif cmd == "s":
                 dest_in = input(
                     "Enter destination JSON path (Default: custom_config.json): "
@@ -923,7 +955,6 @@ def interactive_loop(
                 ).strip()
                 if ec_in:
                     req.early_cfg = float(ec_in)
-                    req.guidance_scale = float(ec_in)
                 if lc_in:
                     req.late_cfg = float(lc_in)
             elif cmd == "9":
@@ -1110,7 +1141,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--cpu_offload", action="store_true")
-    parser.add_argument("--save_preset", type=str, default=None)
     args = parser.parse_args()
 
     cfg_path = Path(args.config) if args.config else None
@@ -1135,14 +1165,6 @@ def main() -> None:
         req.output_path = args.output
     if args.cpu_offload:
         req.cpu_offload = True
-
-    if args.save_preset:
-        target = Path(args.save_preset)
-        if not target.is_absolute():
-            target = ROOT_DIR / target
-        save_request_json(req, target)
-        print(f"[+] Preset exported to {target}")
-        return
 
     if args.stage_inputs and not (args.generate or args.test_permutations):
         stage_test_input_files()
