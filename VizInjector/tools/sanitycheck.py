@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 from pathlib import Path
@@ -28,21 +29,15 @@ if (
     HERMETIC_PYTHON_EXE.exists()
     and Path(sys.executable).resolve() != HERMETIC_PYTHON_EXE.resolve()
 ):
+    tramp_env = os.environ.copy()
+    tramp_env["PYTHONHOME"] = str(BIN_DIR / "python")
+    tramp_env["ROCM_PATH"] = str(BIN_DIR / "python")
     respawn_cmd = [
         str(HERMETIC_PYTHON_EXE.resolve()),
-        "-I",
         str(Path(__file__).resolve()),
     ] + sys.argv[1:]
-    res = subprocess.run(respawn_cmd, check=False)
+    res = subprocess.run(respawn_cmd, env=tramp_env, check=False)
     sys.exit(res.returncode)
-
-os.environ["HSA_OVERRIDE_GFX_VERSION"] = "12.0.0"
-os.environ["ROCM_PATH"] = str(BIN_DIR / "python")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TORCH_BLAS_PREFER_HIPBLASLT"] = "1"
-os.environ["MIOPEN_FIND_MODE"] = "2"
-os.environ["MIOPEN_LOG_LEVEL"] = "0"
-os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -402,7 +397,6 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     test_png = tmp_dir / "test_input_\u591c\u7a7a.png"
     test_vizj = tmp_dir / "test_wire_\u591c\u7a7a.vizj"
-
     grad = np.zeros((512, 512, 3), dtype=np.uint8)
     for y in range(512):
         grad[y, :, 0] = y // 2
@@ -425,7 +419,6 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
         raise RuntimeError(
             f"CLI invocation failed with code {proc.returncode}:\n{proc.stderr}"
         )
-
     assert (
         test_vizj.exists() and test_vizj.stat().st_size > 144
     ), ".vizj wire container was not created"
@@ -442,10 +435,8 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
     reloaded.vit_embeds = torch.randn((256, 4096), dtype=torch.bfloat16)
     reloaded.meta.vae_size = (0, 0)
     reloaded.meta.vit_size = (0, 0)
-
     t1_bytes = client.save_vizj(reloaded, tier=VIZJ_TIER_VAE_LATENT, use_bf16=True)
     t2_bytes = client.save_vizj(reloaded, tier=VIZJ_TIER_DUAL_LATENT, use_bf16=True)
-
     b_t1 = client.load_vizj_bytes(t1_bytes)
     b_t2 = client.load_vizj_bytes(t2_bytes)
     assert b_t1.packed_latents.shape == (1, 128, 32, 32)
@@ -502,6 +493,7 @@ def audit_gate_5_gpu_acceleration_and_latentization(
     rms_after = float(
         torch.sqrt(torch.mean(z_clamped[0, 0:4, 16, 16] ** 2)).item()
     )
+    del z_raw, z_clamped, ratios_before, ratios_after
     assert (
         ratio_err < 1e-6 and rms_after <= 5.5
     ), f"Sub-phase ratio drift={ratio_err}, rms={rms_after}"
@@ -521,7 +513,6 @@ def audit_gate_5_gpu_acceleration_and_latentization(
         test_rgb[..., 2] = np.clip((1.0 - 0.5 * (xx + yy)) * 255.0, 0, 255).astype(
             np.uint8
         )
-
         bundle = client.latentize(
             test_rgb,
             request=VizInjectorRequest(
@@ -536,9 +527,16 @@ def audit_gate_5_gpu_acceleration_and_latentization(
             ).item()
         )
         psnr = 10.0 * math.log10(4.0 / max(mse, 1e-10))
+        lat_shape = tuple(bundle.packed_latents.shape)
+        del decoded, bundle
+        client._local_vae = None
+        del vae
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         assert psnr > 28.0, f"Standalone Flux2VAE roundtrip PSNR too low: {psnr:.2f} dB"
         print(
-            f"  [+] Standalone Flux2VAE Pass   : Latent {tuple(bundle.packed_latents.shape)} | Roundtrip PSNR = {psnr:.2f} dB"
+            f"  [+] Standalone Flux2VAE Pass   : Latent {lat_shape} | Roundtrip PSNR = {psnr:.2f} dB"
         )
     else:
         print(

@@ -37,8 +37,6 @@ def _resolve_cache_dir() -> Path:
     return (ROOT_DIR / ".hf_cache").resolve()
 
 
-os.environ.pop("TORCH_BLAS_PREFER_HIPBLASLT", None)
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 CACHE_DIR = _resolve_cache_dir()
 MIOPEN_CACHE_DIR = CACHE_DIR / "miopen"
 MIOPEN_DB_DIR = MIOPEN_CACHE_DIR / "db"
@@ -47,29 +45,6 @@ TMP_DIR = Path(os.environ.get("TMP") or (ROOT_DIR / "artifacts" / "tmp")).resolv
 
 for _d in (CACHE_DIR, MIOPEN_DB_DIR, MIOPEN_KERNELS_DIR, TMP_DIR):
     _d.mkdir(parents=True, exist_ok=True)
-
-os.environ["HF_HOME"] = str(CACHE_DIR)
-os.environ["TRANSFORMERS_CACHE"] = str(CACHE_DIR / "transformers")
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR / "hub")
-os.environ["TORCH_HOME"] = str(CACHE_DIR / "torch")
-os.environ["TORCH_EXTENSIONS_DIR"] = str(CACHE_DIR / "torch_extensions")
-os.environ["TRITON_CACHE_DIR"] = str(CACHE_DIR / "triton")
-os.environ["TMP"] = str(TMP_DIR)
-os.environ["TEMP"] = str(TMP_DIR)
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["MIOPEN_USER_DB_PATH"] = str(MIOPEN_DB_DIR)
-os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = str(MIOPEN_KERNELS_DIR)
-os.environ["MIOPEN_FIND_MODE"] = "2"
-os.environ["MIOPEN_LOG_LEVEL"] = "0"
-os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
-os.environ["AMD_LOG_LEVEL"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-    "garbage_collection_threshold:0.8,max_split_size_mb:128"
-)
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = (
-    "garbage_collection_threshold:0.8,max_split_size_mb:128"
-)
 
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
@@ -132,34 +107,11 @@ _SPLITMIX64_C2 = 0xBF58476D1CE4E5B9
 _SPLITMIX64_C3 = 0x94D049BB133111EB
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 _MASK63 = 0x7FFFFFFFFFFFFFFF
+
 _VRAM_TRIM_THRESHOLD_BYTES = int(25.6 * (1024**3))
 _MIN_RECLAIMABLE_CACHE_BYTES = 16 * (1024**2)
-
+_MAX_INACTIVE_SPLIT_BYTES = 256 * (1024**2)
 _GENERATOR_CACHE: Dict[str, torch.Generator] = {}
-
-
-class _PDHVal(ctypes.Union):
-    _fields_ = [
-        ("longValue", ctypes.c_long),
-        ("doubleValue", ctypes.c_double),
-        ("largeValue", ctypes.c_longlong),
-        ("AnsiStringValue", ctypes.c_char_p),
-        ("WideStringValue", ctypes.c_wchar_p),
-    ]
-
-
-class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
-    _fields_ = [
-        ("CStatus", ctypes.c_ulong),
-        ("value", _PDHVal),
-    ]
-
-
-class _PDH_FMT_COUNTERVALUE_ITEM(ctypes.Structure):
-    _fields_ = [
-        ("szName", ctypes.c_wchar_p),
-        ("FmtValue", _PDH_FMT_COUNTERVALUE),
-    ]
 
 
 class _DXGI_ADAPTER_DESC1(ctypes.Structure):
@@ -174,6 +126,29 @@ class _DXGI_ADAPTER_DESC1(ctypes.Structure):
         ("SharedSystemMemory", ctypes.c_size_t),
         ("AdapterLuid", ctypes.c_longlong),
         ("Flags", ctypes.c_uint),
+    ]
+
+
+class _DXGI_QUERY_VIDEO_MEMORY_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Budget", ctypes.c_ulonglong),
+        ("CurrentUsage", ctypes.c_ulonglong),
+        ("AvailableForReservation", ctypes.c_ulonglong),
+        ("CurrentReservation", ctypes.c_ulonglong),
+    ]
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
     ]
 
 
@@ -198,6 +173,10 @@ class WDDMMemorySnapshot:
     pt_reserved_gb: float
     pt_reclaimable_gb: float
     is_spilling: bool
+    pt_inactive_split_gb: float = 0.0
+    contiguous_avail_gb: float = 0.0
+    host_total_gb: float = 0.0
+    host_avail_gb: float = 0.0
 
 
 class WDDMMemoryGuard:
@@ -209,11 +188,7 @@ class WDDMMemoryGuard:
         self.dedicated_total_gb = 0.0
         self.shared_budget_gb = 0.0
         self.shared_baseline_gb = 0.0
-        self._pdh = None
-        self._h_query = ctypes.c_void_p()
-        self._h_dedicated = ctypes.c_void_p()
-        self._h_shared = ctypes.c_void_p()
-
+        self._adapter3 = ctypes.c_void_p()
         if sys.platform == "win32" and self.device.type == "cuda":
             self._init_win32_telemetry()
 
@@ -226,6 +201,22 @@ class WDDMMemoryGuard:
         func = ctypes.WINFUNCTYPE(ctypes.c_long, *argtypes)(func_addr)
         return int(func(ptr, *args))
 
+    @staticmethod
+    def _query_host_ram_gb() -> Tuple[float, float]:
+        if sys.platform != "win32":
+            return 0.0, 0.0
+        try:
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) != 0:
+                return (
+                    float(stat.ullTotalPhys) / (1024**3),
+                    float(stat.ullAvailPhys) / (1024**3),
+                )
+        except Exception:
+            pass
+        return 0.0, 0.0
+
     def _init_win32_telemetry(self) -> None:
         try:
             iid_factory1 = _GUID(
@@ -233,6 +224,12 @@ class WDDMMemoryGuard:
                 0xF26F,
                 0x4DBA,
                 (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
+            )
+            iid_adapter3 = _GUID(
+                0x645967A4,
+                0x1392,
+                0x4310,
+                (ctypes.c_ubyte * 8)(0xA7, 0x98, 0x80, 0x53, 0xCE, 0x3E, 0x93, 0xFD),
             )
             factory = ctypes.c_void_p()
             if (
@@ -257,7 +254,6 @@ class WDDMMemoryGuard:
                 )
                 if hr < 0:
                     break
-
                 desc = _DXGI_ADAPTER_DESC1()
                 self._call_com(
                     adapter,
@@ -265,8 +261,6 @@ class WDDMMemoryGuard:
                     [ctypes.c_void_p, ctypes.POINTER(_DXGI_ADAPTER_DESC1)],
                     ctypes.byref(desc),
                 )
-                self._call_com(adapter, 2, [ctypes.c_void_p])
-
                 if not (desc.Flags & 2) and desc.DedicatedVideoMemory > 0:
                     if hw_seen == target_hw_idx:
                         high = (desc.AdapterLuid >> 32) & 0xFFFFFFFF
@@ -275,104 +269,106 @@ class WDDMMemoryGuard:
                         self.adapter_name = str(desc.Description)
                         self.dedicated_total_gb = desc.DedicatedVideoMemory / (1024**3)
                         self.shared_budget_gb = desc.SharedSystemMemory / (1024**3)
+                        adapter3 = ctypes.c_void_p()
+                        hr_qi = self._call_com(
+                            adapter,
+                            0,
+                            [
+                                ctypes.c_void_p,
+                                ctypes.POINTER(_GUID),
+                                ctypes.POINTER(ctypes.c_void_p),
+                            ],
+                            ctypes.byref(iid_adapter3),
+                            ctypes.byref(adapter3),
+                        )
+                        if hr_qi >= 0 and adapter3.value:
+                            self._adapter3 = adapter3
+                            self.active = True
+                        self._call_com(adapter, 2, [ctypes.c_void_p])
                         break
                     hw_seen += 1
+                self._call_com(adapter, 2, [ctypes.c_void_p])
                 adapter_idx += 1
 
             self._call_com(factory, 2, [ctypes.c_void_p])
-            if not self.luid_key:
-                return
-
-            pdh = ctypes.windll.pdh
-            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(self._h_query)) != 0:
-                return
-
-            add_fn = getattr(pdh, "PdhAddEnglishCounterW", pdh.PdhAddCounterW)
-            p_ded = "\\GPU Adapter Memory(*)\\Dedicated Usage"
-            p_shr = "\\GPU Adapter Memory(*)\\Shared Usage"
-            if (
-                add_fn(self._h_query, p_ded, 0, ctypes.byref(self._h_dedicated)) != 0
-                or add_fn(self._h_query, p_shr, 0, ctypes.byref(self._h_shared)) != 0
-            ):
-                pdh.PdhCloseQuery(self._h_query)
-                self._h_query = ctypes.c_void_p()
-                return
-
-            self._pdh = pdh
-            self.active = True
-            _, shr_used = self._read_pdh_counters()
-            self.shared_baseline_gb = shr_used
+            if self.active:
+                _, shr_used = self._query_video_memory_info()
+                self.shared_baseline_gb = shr_used
         except Exception:
             self.active = False
 
-    def _extract_counter_gb(self, h_counter: ctypes.c_void_p) -> float:
-        if not self.active or self._pdh is None or not h_counter.value:
-            return 0.0
-        dw_buf_size = ctypes.c_ulong(0)
-        dw_item_count = ctypes.c_ulong(0)
-        self._pdh.PdhGetFormattedCounterArrayW(
-            h_counter,
-            0x00000400,
-            ctypes.byref(dw_buf_size),
-            ctypes.byref(dw_item_count),
-            None,
+    def _query_video_memory_info(self) -> Tuple[float, float]:
+        if not self.active or not self._adapter3.value:
+            return 0.0, 0.0
+        local_info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
+        non_local_info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
+        ded_gb = 0.0
+        shr_gb = 0.0
+        hr_local = self._call_com(
+            self._adapter3,
+            14,
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_int,
+                ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO),
+            ],
+            0,
+            0,
+            ctypes.byref(local_info),
         )
-        if dw_buf_size.value == 0 or dw_item_count.value == 0:
-            return 0.0
-
-        buf = (ctypes.c_char * dw_buf_size.value)()
-        if (
-            self._pdh.PdhGetFormattedCounterArrayW(
-                h_counter,
-                0x00000400,
-                ctypes.byref(dw_buf_size),
-                ctypes.byref(dw_item_count),
-                buf,
-            )
-            != 0
-        ):
-            return 0.0
-
-        items = ctypes.cast(
-            buf,
-            ctypes.POINTER(_PDH_FMT_COUNTERVALUE_ITEM * dw_item_count.value),
-        ).contents
-        total_gb = 0.0
-        target_token = f"luid_{self.luid_key}"
-        for item in items:
-            if item.szName and target_token in item.szName.lower():
-                total_gb += float(item.FmtValue.value.largeValue) / (1024**3)
-        return total_gb
-
-    def _read_pdh_counters(self) -> Tuple[float, float]:
-        if not self.active or self._pdh is None or not self._h_query.value:
-            return 0.0, 0.0
-        if self._pdh.PdhCollectQueryData(self._h_query) != 0:
-            return 0.0, 0.0
-        ded_gb = self._extract_counter_gb(self._h_dedicated)
-        shr_gb = self._extract_counter_gb(self._h_shared)
+        if hr_local >= 0:
+            ded_gb = float(local_info.CurrentUsage) / (1024**3)
+        hr_non_local = self._call_com(
+            self._adapter3,
+            14,
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_int,
+                ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO),
+            ],
+            0,
+            1,
+            ctypes.byref(non_local_info),
+        )
+        if hr_non_local >= 0:
+            shr_gb = float(non_local_info.CurrentUsage) / (1024**3)
+            if non_local_info.Budget > 0:
+                self.shared_budget_gb = float(non_local_info.Budget) / (1024**3)
         return ded_gb, shr_gb
 
     def recalibrate_baseline(self) -> None:
         if self.active:
-            _, shr_used = self._read_pdh_counters()
+            _, shr_used = self._query_video_memory_info()
             self.shared_baseline_gb = shr_used
 
     def poll(self) -> WDDMMemorySnapshot:
         pt_alloc_bytes = 0
         pt_res_bytes = 0
+        pt_split_bytes = 0
         if self.device.type == "cuda" and torch.cuda.is_available():
             pt_alloc_bytes = torch.cuda.memory_allocated(self.device)
             pt_res_bytes = torch.cuda.memory_reserved(self.device)
+            try:
+                stats = torch.cuda.memory_stats(self.device)
+                pt_split_bytes = int(
+                    stats.get("inactive_split_bytes.all.current", 0)
+                )
+            except Exception:
+                pt_split_bytes = 0
 
         pt_alloc_gb = pt_alloc_bytes / (1024**3)
         pt_res_gb = pt_res_bytes / (1024**3)
         pt_reclaim_gb = max(0.0, pt_res_gb - pt_alloc_gb)
+        pt_split_gb = pt_split_bytes / (1024**3)
+        host_total_gb, host_avail_gb = self._query_host_ram_gb()
 
         if self.active:
-            ded_used, shr_used = self._read_pdh_counters()
+            ded_used, shr_used = self._query_video_memory_info()
             ded_avail = max(0.0, self.dedicated_total_gb - ded_used)
             shr_delta = max(0.0, shr_used - self.shared_baseline_gb)
+            contig_avail = ded_avail + max(0.0, pt_reclaim_gb - pt_split_gb)
             is_spilling = shr_delta > 0.25 or ded_avail < 1.25
             return WDDMMemorySnapshot(
                 dedicated_total_gb=self.dedicated_total_gb,
@@ -385,6 +381,10 @@ class WDDMMemoryGuard:
                 pt_reserved_gb=pt_res_gb,
                 pt_reclaimable_gb=pt_reclaim_gb,
                 is_spilling=is_spilling,
+                pt_inactive_split_gb=pt_split_gb,
+                contiguous_avail_gb=contig_avail,
+                host_total_gb=host_total_gb,
+                host_avail_gb=host_avail_gb,
             )
 
         free_b, total_b = (0, 0)
@@ -397,6 +397,7 @@ class WDDMMemoryGuard:
         ded_total = total_b / (1024**3)
         ded_avail = free_b / (1024**3)
         ded_used = max(0.0, ded_total - ded_avail)
+        contig_avail = ded_avail + max(0.0, pt_reclaim_gb - pt_split_gb)
         return WDDMMemorySnapshot(
             dedicated_total_gb=ded_total,
             dedicated_used_gb=ded_used,
@@ -408,6 +409,10 @@ class WDDMMemoryGuard:
             pt_reserved_gb=pt_res_gb,
             pt_reclaimable_gb=pt_reclaim_gb,
             is_spilling=False,
+            pt_inactive_split_gb=pt_split_gb,
+            contiguous_avail_gb=contig_avail,
+            host_total_gb=host_total_gb,
+            host_avail_gb=host_avail_gb,
         )
 
     def enforce_stage_budget(
@@ -418,33 +423,33 @@ class WDDMMemoryGuard:
         snap = self.poll()
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return snap
-
         reclaimable_bytes = int(snap.pt_reclaimable_gb * (1024**3))
         reserved_bytes = int(snap.pt_reserved_gb * (1024**3))
-
+        split_bytes = int(snap.pt_inactive_split_gb * (1024**3))
         needs_eviction = (
             force
             or snap.is_spilling
             or (snap.dedicated_avail_gb < required_headroom_gb)
+            or (snap.contiguous_avail_gb < required_headroom_gb)
+            or (split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
             or (reserved_bytes > _VRAM_TRIM_THRESHOLD_BYTES)
         )
         if needs_eviction and (
             force or reclaimable_bytes >= _MIN_RECLAIMABLE_CACHE_BYTES
         ):
             gc.collect()
+            torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
             snap = self.poll()
         return snap
 
     def close(self) -> None:
-        if self.active and self._pdh is not None and self._h_query.value:
+        if self.active and self._adapter3.value:
             try:
-                self._pdh.PdhCloseQuery(self._h_query)
+                self._call_com(self._adapter3, 2, [ctypes.c_void_p])
             except Exception:
                 pass
-        self._h_query = ctypes.c_void_p()
-        self._h_dedicated = ctypes.c_void_p()
-        self._h_shared = ctypes.c_void_p()
+        self._adapter3 = ctypes.c_void_p()
         self.active = False
 
     def __del__(self) -> None:
@@ -524,7 +529,6 @@ def build_box_aperture_mask(
     h_lat = max(1, height // 16)
     w_lat = max(1, width // 16)
     active_boxes: List[Tuple[float, float, float, float]] = []
-
     for item in layout_items:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
@@ -537,7 +541,6 @@ def build_box_aperture_mask(
             )
             if (uy1 - uy0) > 1e-4 and (ux1 - ux0) > 1e-4:
                 active_boxes.append((uy0, ux0, uy1, ux1))
-
     if not active_boxes:
         return None
 
@@ -809,7 +812,6 @@ class BifurcatedFlowMatchScheduler:
     ) -> Tuple[float, float, float, float]:
         if order <= 1 or abs(h_n) < 1e-12 or abs(h_n_1) < 1e-12:
             return (h_n, 0.0, 0.0, 0.0)
-
         max_m = min(int(order), 4)
         if max_m >= 2 and abs(h_n_1) < 1e-12:
             max_m = 1
@@ -823,7 +825,6 @@ class BifurcatedFlowMatchScheduler:
         x2 = -(h_n_1 + h_n_2)
         x3 = -(h_n_1 + h_n_2 + h_n_3)
         nodes = (x0, x1, x2, x3)
-
         abs_h = abs(h_n)
         for m in range(max_m, 1, -1):
             cand = cls._lagrange_ab_weights_for_order(h_n, nodes, m)
@@ -992,7 +993,6 @@ class BifurcatedFlowMatchScheduler:
         progress = self.current_progress
         if progress >= self.handoff_threshold or s_next <= 0.0:
             return torch.zeros_like(ref_tensor)
-
         envelope = max(
             0.0,
             min(1.0, (self.handoff_threshold - progress) / self.handoff_threshold),
@@ -1005,7 +1005,6 @@ class BifurcatedFlowMatchScheduler:
         )
         if renoise <= 0.0:
             return torch.zeros_like(ref_tensor)
-
         gen_dev = generator.device.type if generator is not None else None
         if generator is not None and gen_dev == ref_tensor.device.type:
             noise = torch.randn(
@@ -1018,7 +1017,6 @@ class BifurcatedFlowMatchScheduler:
             noise = torch.randn(
                 ref_tensor.shape, device=ref_tensor.device, dtype=torch.float32
             )
-
         eps_hat = ref_tensor + (1.0 - s_curr) * v_tot
         attenuation = (
             math.sqrt(max(0.0, s_next * s_next - renoise * renoise)) - s_next
@@ -1036,14 +1034,12 @@ class BifurcatedFlowMatchScheduler:
         num_passes = len(self._step_configs)
         if self._step_index is None or self._step_index >= num_passes:
             self.reset()
-
         v = (
             model_output[0].float()
             if isinstance(model_output, (tuple, list))
             else model_output.float()
         )
         sample_f32 = sample.float()
-
         cfg = self._step_configs[self._step_index]
         mode = cfg["mode"]
         s_curr = cfg["s_curr"]
@@ -1094,7 +1090,6 @@ class BifurcatedFlowMatchScheduler:
                     dx = dx + c3 * self._history[-3]
             else:
                 dx = dt * v
-
             if is_early and self.eta > 0.0 and s_next > 0.0:
                 disp = self._calc_sde_dispersion(
                     sample_f32, v, s_curr, s_next, generator=generator
@@ -1102,7 +1097,6 @@ class BifurcatedFlowMatchScheduler:
                 prev_sample = sample_f32 + dx + disp
             else:
                 prev_sample = sample_f32 + dx
-
             if solver in ("ipndm", "multitree") and self.ipndm_max_order > 1:
                 self._push_history(v)
 
@@ -1310,7 +1304,6 @@ class ReferenceVisionCache:
         self._cache.move_to_end(key)
         while len(self._cache) > self.max_entries:
             self._cache.popitem(last=False)
-
         if vae_key is not None and pinned_rec.packed_latents is not None:
             self._vae_cache[vae_key] = (
                 pinned_rec.packed_latents,
@@ -1360,14 +1353,12 @@ class EngineProgressReporter:
             self.stage_start = now
             self.last_render = 0.0
             self.last_count = 0
-
         self.last_count = current
         is_final = current >= total
         if not is_final and (now - self.last_render < self.render_interval):
             return
         self.last_render = now
         self._render_bar(stage, current, total, now)
-
         if is_final:
             self._finish_stage(now)
 
@@ -1378,7 +1369,6 @@ class EngineProgressReporter:
         remaining_units = max(0, total - current)
         eta = (remaining_units / rate) if rate > 0.0 else 0.0
         time_str = f"[{_format_seconds(elapsed)}<{_format_seconds(eta)}"
-
         if stage == "context":
             prefix = "[1/3 Qwen3.5 Context]"
             rate_str = f"{rate:5.1f} seq/s" if rate > 0 else "  --.- seq/s"
@@ -1433,7 +1423,6 @@ def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
     direct_path = Path(repo_or_path)
     if direct_path.exists():
         return direct_path.resolve()
-
     repo_str = str(repo_or_path).replace("\\", "/")
     hub_candidates = [
         CACHE_DIR / "hub",
@@ -1457,7 +1446,6 @@ def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
             )
             if snapshots:
                 return snapshots[0].resolve()
-
     raise FileNotFoundError(
         f"Cached snapshot not found for '{repo_or_path}' in {CACHE_DIR / 'hub'}. Run download_model.py first."
     )
@@ -1473,7 +1461,6 @@ def load_sharded_safetensors_into(
         sf_files = sorted(set(model_dir.glob("*.safetensors")))
         if not sf_files:
             raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
-
         state_dict: Dict[str, torch.Tensor] = {}
         for sf_path in sf_files:
             raw = load_safetensors(str(sf_path), device="cpu")
@@ -1497,11 +1484,9 @@ def load_sharded_safetensors_into(
                 else:
                     state_dict[clean_key] = v.to(device=device)
             del raw
-
         target_module.load_state_dict(state_dict, strict=True, assign=True)
         del state_dict
         gc.collect()
-
         for name, param in target_module.named_parameters():
             if param.device != device:
                 if param.is_floating_point():
@@ -1517,7 +1502,6 @@ def load_sharded_safetensors_into(
                         param.data = param.data.to(device=device)
                 else:
                     param.data = param.data.to(device=device)
-
         for name, buf in target_module.named_buffers():
             if buf.is_floating_point():
                 if (
@@ -1538,12 +1522,10 @@ def compute_image_telemetry(pil_img: Image.Image) -> Tuple[float, float, float, 
     luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
     mean_luma = float(np.mean(luma))
     rms_contrast = float(np.std(luma))
-
     luma_u8 = np.clip(np.round(luma * 255.0), 0, 255).astype(np.uint8)
     hist = np.bincount(luma_u8.ravel(), minlength=256).astype(np.float64)
     probs = hist[hist > 0] / float(luma_u8.size)
     entropy = float(-np.sum(probs * np.log2(probs)))
-
     if luma.shape[0] >= 3 and luma.shape[1] >= 3:
         lap = (
             luma[:-2, 1:-1]
@@ -1589,13 +1571,11 @@ def pack_vision_patches_32px(
     w_vis = max(32, (int(round(w_in * scale)) // 32) * 32)
     if (w_in, h_in) != (w_vis, h_vis):
         img = img.resize((w_vis, h_vis), resample=Image.Resampling.BICUBIC)
-
     arr = np.asarray(img, dtype=np.float32) / 255.0
     mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
     std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
     normed = (arr - mean) / std
     chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
-
     grid_h = h_vis // 16
     grid_w = w_vis // 16
     merge = 2
@@ -1638,6 +1618,7 @@ class MOSSImageEngine:
         self.embed_cache = PromptEmbedCache(max_entries=32)
         self.ref_cache = ReferenceVisionCache(max_entries=32)
         self.memory_guard = WDDMMemoryGuard(self.device)
+
         self.vizinjector: Optional[Any] = None
         if HAS_VIZINJECTOR and VizInjectorClient is not None:
             try:
@@ -1652,6 +1633,7 @@ class MOSSImageEngine:
                 )
             except Exception:
                 self.vizinjector = None
+
         self._loaded_repo_id: Optional[str] = None
         self._current_offload_state: Optional[bool] = None
         self._warmed_up: bool = False
@@ -1696,6 +1678,7 @@ class MOSSImageEngine:
             self.text_encoder.clear_caches()
         if torch.cuda.is_available():
             gc.collect()
+            self._sync_device()
             torch.cuda.empty_cache()
 
     def prepare_for_exit(self) -> None:
@@ -1732,9 +1715,11 @@ class MOSSImageEngine:
                     except Exception:
                         pass
                 self.tokenizer = None
+
             self.embed_cache.clear()
             self.ref_cache.clear()
             _GENERATOR_CACHE.clear()
+
             if self.transformer is not None:
                 try:
                     self.transformer.unfuse_lora()
@@ -1749,6 +1734,7 @@ class MOSSImageEngine:
                     pass
                 self.text_encoder = None
             self.vae = None
+
             self._loaded_repo_id = None
             self._current_offload_state = None
             self._warmed_up = False
@@ -1802,7 +1788,6 @@ class MOSSImageEngine:
                 )
 
             target_device = torch.device("cpu") if cpu_offload else self.device
-
             if (
                 self.transformer is not None
                 and self.text_encoder is not None
@@ -1815,9 +1800,7 @@ class MOSSImageEngine:
                         self.transformer.to(target_device)
                         self.transformer.clear_caches()
                         self._current_offload_state = cpu_offload
-                        if torch.cuda.is_available():
-                            gc.collect()
-                            torch.cuda.empty_cache()
+                        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
                         self.memory_guard.recalibrate_baseline()
                         return
                     self._current_offload_state = cpu_offload
@@ -1844,10 +1827,7 @@ class MOSSImageEngine:
                 self.transformer.clear_caches()
                 del self.transformer
                 self.transformer = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
+                self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
                 with _MetaWeightInitMode():
                     self.transformer = MOSSImageTransformer.from_config_dir(
                         transformer_dir
@@ -1861,9 +1841,7 @@ class MOSSImageEngine:
                 self.transformer.clear_caches()
                 self.transformer.eval().requires_grad_(False)
                 self._loaded_repo_id = target_repo_id
-                if torch.cuda.is_available():
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
                 self.memory_guard.recalibrate_baseline()
                 logging.info(
                     "Hot-swap completed in %.2fs (Shared Qwen3.5 & Flux2-VAE retained).",
@@ -1876,9 +1854,8 @@ class MOSSImageEngine:
                 self.transformer = None
                 self.text_encoder = None
                 self.vae = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+
+            self._trim_reserved_vram(force=True, required_headroom_gb=26.5)
 
             t_start = time.perf_counter()
             tokenizer_dir = root_path / "tokenizer"
@@ -1902,6 +1879,7 @@ class MOSSImageEngine:
                 te_dir, self.text_encoder, device=target_device, dtype=self.dtype
             )
             self.text_encoder.eval().requires_grad_(False)
+            self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
 
             logging.info(
                 "Loading Sovereign MOSSImageTransformer (42-Layer DiT) from %s",
@@ -1918,6 +1896,7 @@ class MOSSImageEngine:
                 dtype=self.dtype,
             )
             self.transformer.eval().requires_grad_(False)
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.50)
 
             logging.info(
                 "Loading Sovereign Flux2AutoencoderKL (FP32) from %s", vae_dir
@@ -1931,9 +1910,7 @@ class MOSSImageEngine:
 
             self._loaded_repo_id = target_repo_id
             self._current_offload_state = cpu_offload
-            if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             self.memory_guard.recalibrate_baseline()
             logging.info(
                 "MOSSImageEngine initialized (%s) in %.2fs.",
@@ -2201,6 +2178,7 @@ class MOSSImageEngine:
                 del img_splits
                 self.text_encoder.visual.clear_caches()
                 self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
                 vit_embeds=vit_embeds,
@@ -2315,8 +2293,8 @@ class MOSSImageEngine:
             max_sequence_length=max_sequence_length,
             image_patch_counts=patch_counts,
         )
-        vision_signature = tuple(vision_sig_list)
 
+        vision_signature = tuple(vision_sig_list)
         if use_cache:
             cached = self.embed_cache.lookup(
                 tok_list,
@@ -2484,7 +2462,6 @@ class MOSSImageEngine:
         lora_active = self._apply_or_revert_edit_lora(
             request.edit_lora_path, request.edit_lora_scale
         )
-
         if not cpu_offload:
             self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
 
@@ -2499,7 +2476,6 @@ class MOSSImageEngine:
             torch.cuda.reset_peak_memory_stats(self.device)
 
         start_time = time.perf_counter()
-
         explicit_seed = (
             request.seed
             if (request.seed is not None and request.seed >= 0)
@@ -2644,7 +2620,6 @@ class MOSSImageEngine:
                 if r_rec.packed_latents is not None:
                     ref_latents_cpu_list.append(_evacuate_to_cpu(r_rec.packed_latents))
                     ref_bboxes_list.append(norm_box)
-
                 if r_rec.llm_tokens > 0 and (
                     is_box_ref or request.edit_format != "moss_image_edit"
                 ):
@@ -2679,9 +2654,7 @@ class MOSSImageEngine:
 
             if cpu_offload:
                 self.vae.to("cpu")
-                if torch.cuda.is_available():
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             else:
                 self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
 
@@ -2725,12 +2698,9 @@ class MOSSImageEngine:
 
         del ref_records_for_prompt
         self.text_encoder.clear_caches()
-
         if cpu_offload:
             self.text_encoder.to("cpu")
-            if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+            self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
         else:
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
@@ -2887,6 +2857,7 @@ class MOSSImageEngine:
         timesteps = active_scheduler.timesteps
         num_passes = len(timesteps)
         total_nfe = 0
+
         active_ref_latents = ref_latents_list if ref_latents_list else None
         active_ref_bboxes = (
             ref_bboxes_list
@@ -2903,8 +2874,8 @@ class MOSSImageEngine:
 
         if reporter is not None:
             reporter.start_stage("dit", num_passes)
-        dit_t0 = time.perf_counter()
 
+        dit_t0 = time.perf_counter()
         prediction: Optional[torch.Tensor] = None
         conditional: Optional[torch.Tensor] = None
         uncond: Optional[torch.Tensor] = None
@@ -3011,7 +2982,6 @@ class MOSSImageEngine:
                 effective_cb("dit", pass_index + 1, num_passes)
 
         dit_elapsed = time.perf_counter() - dit_t0
-
         if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
             early_steps = active_scheduler._early_steps
             late_steps = active_scheduler._late_steps
@@ -3045,9 +3015,7 @@ class MOSSImageEngine:
 
         if cpu_offload:
             self.transformer.to("cpu")
-            if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
             self.vae.to(self.device)
         else:
             self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
@@ -3065,9 +3033,7 @@ class MOSSImageEngine:
 
         if cpu_offload:
             self.vae.to("cpu")
-            if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
         else:
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
 
@@ -3085,8 +3051,8 @@ class MOSSImageEngine:
                 pil_images[0]
             )
         del decoded_cpu
-        effective_cb("vae", len(pil_images), len(pil_images))
 
+        effective_cb("vae", len(pil_images), len(pil_images))
         if reporter is not None:
             reporter.close()
 
@@ -3108,7 +3074,6 @@ class MOSSImageEngine:
             extra_paths.append(str(ep))
 
         step_ms = (dit_elapsed * 1000.0) / float(max(1, early_steps + late_steps))
-
         return GenerationResponse(
             output_path=str(out_path),
             additional_paths=extra_paths,

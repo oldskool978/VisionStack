@@ -200,22 +200,42 @@ def _locate_ffmpeg_binary() -> Optional[Path]:
 
 
 def resolve_local_vae_dir() -> Optional[Path]:
-    hub_dir = ROOT_DIR / ".hf_cache" / "hub"
-    if not hub_dir.is_dir():
-        return None
-    for repo_dir in sorted(hub_dir.glob("models--*")):
-        snap_root = repo_dir / "snapshots"
-        if not snap_root.is_dir():
+    hub_candidates: List[Path] = []
+    env_hub = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if env_hub and env_hub.strip():
+        hub_candidates.append(Path(env_hub).resolve())
+    env_hf = os.environ.get("HF_HOME")
+    if env_hf and env_hf.strip():
+        hub_candidates.append((Path(env_hf) / "hub").resolve())
+    hub_candidates.extend(
+        [
+            (ROOT_DIR.parent / ".hf_cache" / "hub").resolve(),
+            (ROOT_DIR / ".hf_cache" / "hub").resolve(),
+            (HERE_DIR.parent / ".hf_cache" / "hub").resolve(),
+        ]
+    )
+    seen = set()
+    for hub_dir in hub_candidates:
+        if hub_dir in seen or not hub_dir.is_dir():
             continue
-        snaps = sorted(
-            [p for p in snap_root.iterdir() if p.is_dir()],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for s in snaps:
-            vae_dir = s / "vae"
-            if vae_dir.is_dir() and list(vae_dir.glob("*.safetensors")):
-                return vae_dir.resolve()
+        seen.add(hub_dir)
+        for repo_dir in sorted(hub_dir.glob("models--*")):
+            snap_root = repo_dir / "snapshots"
+            if not snap_root.is_dir():
+                continue
+            snaps = sorted(
+                [p for p in snap_root.iterdir() if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for s in snaps:
+                vae_dir = s / "vae"
+                if vae_dir.is_dir():
+                    sf_files = [
+                        sf for sf in vae_dir.glob("*.safetensors") if sf.exists()
+                    ]
+                    if sf_files:
+                        return vae_dir.resolve()
     return None
 
 
@@ -230,6 +250,7 @@ class VizInjectorClient:
             for d in [
                 self.dll_path.parent,
                 ROOT_DIR / "bin" / "sysroot" / "bin",
+                ROOT_DIR / "bin" / "ffmpeg",
             ]:
                 if d.is_dir() and hasattr(os, "add_dll_directory"):
                     try:
@@ -345,7 +366,7 @@ class VizInjectorClient:
         vae_dir = resolve_local_vae_dir()
         if vae_dir is None:
             raise FileNotFoundError(
-                f"Standalone Flux2AutoencoderKL not found in {ROOT_DIR / '.hf_cache'}. Run python tools/download_vae.py first."
+                "Standalone Flux2AutoencoderKL not found in HF_HOME. Run python tools/download_vae.py first."
             )
         target_dev = (
             device if torch.cuda.is_available() else torch.device("cpu")
@@ -541,7 +562,6 @@ class VizInjectorClient:
         if ch == 3:
             alpha = np.full((h, w, 1), 255, dtype=np.uint8)
             rgba_array = np.concatenate([rgba_array, alpha], axis=2)
-
         contig = np.ascontiguousarray(rgba_array, dtype=np.uint8)
         c_ptr = contig.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         c_cfg = self._build_c_config(req)
@@ -572,7 +592,6 @@ class VizInjectorClient:
             return self.condition_rgba8(
                 np.asarray(source.convert("RGBA"), dtype=np.uint8), req
             )
-
         if isinstance(source, (str, Path)):
             p = Path(source)
             if not p.is_file():
@@ -603,7 +622,9 @@ class VizInjectorClient:
     @torch.inference_mode()
     def latentize(
         self,
-        source: Union[str, Path, bytes, np.ndarray, Image.Image, ConditionedVisionBundle],
+        source: Union[
+            str, Path, bytes, np.ndarray, Image.Image, ConditionedVisionBundle
+        ],
         vae_module: Optional[Any] = None,
         vision_module: Optional[Any] = None,
         request: Optional[VizInjectorRequest] = None,
@@ -619,7 +640,9 @@ class VizInjectorClient:
         else:
             bundle = self.condition_image(source, req)
 
-        active_vae = vae_module if vae_module is not None else self.get_or_load_local_vae()
+        active_vae = (
+            vae_module if vae_module is not None else self.get_or_load_local_vae()
+        )
         if bundle.vae_tensor is not None and active_vae is not None:
             vae_dev = next(active_vae.parameters()).device
             vae_dtype = next(active_vae.parameters()).dtype
@@ -705,10 +728,18 @@ class VizInjectorClient:
         if bundle.packed_latents is not None:
             if use_bf16:
                 hdr.vae_dtype = VIZJ_DTYPE_BF16
-                t_vae_cpu = bundle.packed_latents.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+                t_vae_cpu = (
+                    bundle.packed_latents.detach()
+                    .to(device="cpu", dtype=torch.bfloat16)
+                    .contiguous()
+                )
             else:
                 hdr.vae_dtype = VIZJ_DTYPE_FP32
-                t_vae_cpu = bundle.packed_latents.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                t_vae_cpu = (
+                    bundle.packed_latents.detach()
+                    .to(device="cpu", dtype=torch.float32)
+                    .contiguous()
+                )
             vae_ptr_arg = ctypes.c_void_p(t_vae_cpu.data_ptr())
             vae_nbytes = t_vae_cpu.numel() * t_vae_cpu.element_size()
 
@@ -717,7 +748,11 @@ class VizInjectorClient:
         vit_nbytes = 0
         if tier == VIZJ_TIER_DUAL_LATENT and bundle.vit_embeds is not None:
             hdr.vit_dtype = VIZJ_DTYPE_BF16
-            t_vit_cpu = bundle.vit_embeds.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+            t_vit_cpu = (
+                bundle.vit_embeds.detach()
+                .to(device="cpu", dtype=torch.bfloat16)
+                .contiguous()
+            )
             vit_ptr_arg = ctypes.c_void_p(t_vit_cpu.data_ptr())
             vit_nbytes = t_vit_cpu.numel() * t_vit_cpu.element_size()
 
@@ -725,7 +760,11 @@ class VizInjectorClient:
         mask_ptr_arg: Optional[ctypes.c_void_p] = None
         mask_nbytes = 0
         if bundle.latent_mask is not None:
-            t_mask_cpu = bundle.latent_mask.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            t_mask_cpu = (
+                bundle.latent_mask.detach()
+                .to(device="cpu", dtype=torch.float32)
+                .contiguous()
+            )
             mask_ptr_arg = ctypes.c_void_p(t_mask_cpu.data_ptr())
             mask_nbytes = t_mask_cpu.numel() * t_mask_cpu.element_size()
 
@@ -744,7 +783,6 @@ class VizInjectorClient:
         )
         if rc != 0 or not out_ptr:
             raise RuntimeError(f"Failed packing .vizj container (code {rc})")
-
         try:
             blob = ctypes.string_at(out_ptr, int(out_len.value))
         finally:
@@ -764,12 +802,10 @@ class VizInjectorClient:
         req = request if request is not None else VizInjectorRequest()
         in_arr = np.frombuffer(container_bytes, dtype=np.uint8)
         in_ptr = in_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
-
         hdr = CVizContainerHeader()
         vae_ptr = ctypes.c_void_p()
         vit_ptr = ctypes.c_void_p()
         mask_ptr = ctypes.c_void_p()
-
         rc = self.lib.vizinjector_unpack_vizj_buffer(
             in_ptr,
             len(container_bytes),
@@ -854,7 +890,11 @@ class VizInjectorClient:
 
         vit_w = int(hdr.vit_width)
         vit_h = int(hdr.vit_height)
-        if (vit_w == 0 or vit_h == 0) and int(hdr.grid_thw[1]) > 0 and int(hdr.grid_thw[2]) > 0:
+        if (
+            (vit_w == 0 or vit_h == 0)
+            and int(hdr.grid_thw[1]) > 0
+            and int(hdr.grid_thw[2]) > 0
+        ):
             vit_h = int(hdr.grid_thw[1]) * 16
             vit_w = int(hdr.grid_thw[2]) * 16
 
@@ -906,12 +946,12 @@ class VizInjectorClient:
             decoded_tensor = decoded_tensor.unsqueeze(0)
         b, c, h, w = decoded_tensor.shape
         if c != 3:
-            raise ValueError(f"Expected 3-channel RGB tensor, got shape {decoded_tensor.shape}")
-
+            raise ValueError(
+                f"Expected 3-channel RGB tensor, got shape {decoded_tensor.shape}"
+            )
         cpu_f32 = decoded_tensor.detach().cpu().float().contiguous().numpy()
         pil_list: List[Image.Image] = []
         telem_list: List[VizInjectorTelemetry] = []
-
         for i in range(b):
             sample = np.ascontiguousarray(cpu_f32[i], dtype=np.float32)
             out_rgb8 = np.empty((h, w, 3), dtype=np.uint8)

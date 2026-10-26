@@ -39,26 +39,15 @@ for _d in (
 ):
     _d.mkdir(parents=True, exist_ok=True)
 
-os.environ.pop("TORCH_BLAS_PREFER_HIPBLASLT", None)
 tempfile.tempdir = str(TMP_DIR)
-os.environ["TEMP"] = str(TMP_DIR)
-os.environ["TMP"] = str(TMP_DIR)
-os.environ["TMPDIR"] = str(TMP_DIR)
-os.environ["PIP_CACHE_DIR"] = str(PIP_CACHE_DIR)
-os.environ["LOCALAPPDATA"] = str(LOCAL_APPDATA_DIR)
-os.environ["APPDATA"] = str(ROAMING_APPDATA_DIR)
-os.environ["HF_HOME"] = str(HF_CACHE_DIR)
-os.environ["TORCH_HOME"] = str(HF_CACHE_DIR / "torch")
-os.environ["PYTHONIOENCODING"] = "utf-8"
-os.environ["PYTHONUTF8"] = "1"
-os.environ["PYTHONNOUSERSITE"] = "1"
 
+ALLOC_CONF_POLICY = "garbage_collection_threshold:0.8"
 DEFAULT_PYTHON_VERSION = "3.12.8"
 FALLBACK_MATRIX = {
     "1": "3.11.9",
     "2": "3.12.8",
     "3": "3.13.2",
-    "4": "3.14.7",
+    "4": "3.14.9",
 }
 STANDALONE_RELEASE = "20241016"
 
@@ -194,39 +183,6 @@ def resolve_dynamic_python_matrix() -> dict[str, str]:
     return matrix
 
 
-def _install_c10_env_sanitizer(target_dir: Path) -> None:
-    site_packages = (
-        target_dir / "Lib" / "site-packages"
-        if os.name == "nt"
-        else next(target_dir.glob("lib/python*/site-packages"), None)
-    )
-    if site_packages is None or not site_packages.is_dir():
-        return
-    sanitizer_code = (
-        "import os\n"
-        "_C10_BOOL_FLAGS = (\n"
-        "    'TORCH_BLAS_PREFER_HIPBLASLT',\n"
-        "    'TORCH_USE_HIP_DSA',\n"
-        "    'CUDA_LAUNCH_BLOCKING',\n"
-        "    'HIP_LAUNCH_BLOCKING',\n"
-        "    'TORCH_SHOW_CPP_STACKTRACES',\n"
-        ")\n"
-        "for _k in _C10_BOOL_FLAGS:\n"
-        "    _v = os.environ.get(_k)\n"
-        "    if _v is not None and _v not in ('0', '1'):\n"
-        "        _norm = _v.strip().lower()\n"
-        "        if _norm in ('1', 'true', 'yes', 'on'):\n"
-        "            os.environ[_k] = '1'\n"
-        "        elif _norm in ('0', 'false', 'no', 'off'):\n"
-        "            os.environ[_k] = '0'\n"
-        "        else:\n"
-        "            os.environ.pop(_k, None)\n"
-    )
-    (site_packages / "sitecustomize.py").write_text(
-        sanitizer_code, encoding="utf-8"
-    )
-
-
 def build_hermetic_env(target_sandbox: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     passthrough_keys = (
@@ -274,38 +230,44 @@ def build_hermetic_env(target_sandbox: Path) -> dict[str, str]:
         env["PATH"] = ":".join(base_os_paths)
         env["PIP_CONFIG_FILE"] = "/dev/null"
 
-    env["PYTHONHOME"] = str(target_sandbox)
-    env["PYTHONNOUSERSITE"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    env["PIP_NO_USER"] = "1"
-    env["PIP_USER"] = "0"
-    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-    env["TEMP"] = str(TMP_DIR)
-    env["TMP"] = str(TMP_DIR)
-    env["TMPDIR"] = str(TMP_DIR)
-    env["PIP_CACHE_DIR"] = str(PIP_CACHE_DIR)
-    env["LOCALAPPDATA"] = str(LOCAL_APPDATA_DIR)
-    env["APPDATA"] = str(ROAMING_APPDATA_DIR)
-    env["XDG_CACHE_HOME"] = str(CACHE_DIR)
-    env["XDG_CONFIG_HOME"] = str(ROOT_DIR / ".config")
-    env["XDG_DATA_HOME"] = str(ROOT_DIR / ".local" / "share")
-    env["HF_HOME"] = str(HF_CACHE_DIR)
-    env["TORCH_HOME"] = str(HF_CACHE_DIR / "torch")
-    env["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR / "transformers")
-    env["HUGGINGFACE_HUB_CACHE"] = str(HF_CACHE_DIR / "hub")
-    env["MIOPEN_USER_DB_PATH"] = str(HF_CACHE_DIR / "miopen" / "db")
-    env["MIOPEN_CUSTOM_CACHE_DIR"] = str(HF_CACHE_DIR / "miopen" / "kernels")
-    env["TORCHINDUCTOR_CACHE_DIR"] = str(HF_CACHE_DIR / "torch_inductor")
-    env["TRITON_CACHE_DIR"] = str(HF_CACHE_DIR / "triton")
-    env["MIOPEN_FIND_MODE"] = "2"
-    env["MIOPEN_LOG_LEVEL"] = "0"
-    env["MIOPEN_ENABLE_LOGGING"] = "0"
-    env["AMD_LOG_LEVEL"] = "0"
-    env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    env["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
-    env["ROCM_PATH"] = str(target_sandbox)
+    defaults = {
+        "PYTHONHOME": str(target_sandbox),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "PIP_NO_USER": "1",
+        "PIP_USER": "0",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "TEMP": str(TMP_DIR),
+        "TMP": str(TMP_DIR),
+        "TMPDIR": str(TMP_DIR),
+        "PIP_CACHE_DIR": str(PIP_CACHE_DIR),
+        "LOCALAPPDATA": str(LOCAL_APPDATA_DIR),
+        "APPDATA": str(ROAMING_APPDATA_DIR),
+        "XDG_CACHE_HOME": str(CACHE_DIR),
+        "XDG_CONFIG_HOME": str(ROOT_DIR / ".config"),
+        "XDG_DATA_HOME": str(ROOT_DIR / ".local" / "share"),
+        "HF_HOME": str(HF_CACHE_DIR),
+        "TORCH_HOME": str(HF_CACHE_DIR / "torch"),
+        "TRANSFORMERS_CACHE": str(HF_CACHE_DIR / "transformers"),
+        "HUGGINGFACE_HUB_CACHE": str(HF_CACHE_DIR / "hub"),
+        "MIOPEN_USER_DB_PATH": str(HF_CACHE_DIR / "miopen" / "db"),
+        "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
+        "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
+        "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
+        "MIOPEN_FIND_MODE": "1",
+        "MIOPEN_LOG_LEVEL": "0",
+        "MIOPEN_ENABLE_LOGGING": "0",
+        "AMD_LOG_LEVEL": "0",
+        "TORCH_BLAS_PREFER_HIPBLASLT": "1",
+        "HSA_ENABLE_SDMA": "1",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "PYTORCH_CUDA_ALLOC_CONF": ALLOC_CONF_POLICY,
+        "PYTORCH_HIP_ALLOC_CONF": ALLOC_CONF_POLICY,
+        "ROCM_PATH": str(target_sandbox),
+    }
+    for k, v in defaults.items():
+        env[k] = os.environ.get(k) or v
     return env
 
 
@@ -342,6 +304,14 @@ def query_dxgi_adapters_win32() -> list[dict]:
                 ("Flags", ctypes.c_uint),
             ]
 
+        class DXGI_QUERY_VIDEO_MEMORY_INFO(ctypes.Structure):
+            _fields_ = [
+                ("Budget", ctypes.c_ulonglong),
+                ("CurrentUsage", ctypes.c_ulonglong),
+                ("AvailableForReservation", ctypes.c_ulonglong),
+                ("CurrentReservation", ctypes.c_ulonglong),
+            ]
+
         class GUID(ctypes.Structure):
             _fields_ = [
                 ("Data1", ctypes.c_ulong),
@@ -361,6 +331,12 @@ def query_dxgi_adapters_win32() -> list[dict]:
             0xF26F,
             0x4DBA,
             (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
+        )
+        iid_dxgi_adapter3 = GUID(
+            0x645967A4,
+            0x1392,
+            0x4310,
+            (ctypes.c_ubyte * 8)(0xA7, 0x98, 0x80, 0x53, 0xCE, 0x3E, 0x93, 0xFD),
         )
         factory = ctypes.c_void_p()
         if (
@@ -392,12 +368,75 @@ def query_dxgi_adapters_win32() -> list[dict]:
                 ctypes.byref(desc),
             )
             if not (desc.Flags & 2):
+                vram_total_gb = desc.DedicatedVideoMemory / (1024**3)
+                vram_used_gb = 0.0
+                svram_budget_gb = desc.SharedSystemMemory / (1024**3)
+                svram_used_gb = 0.0
+                adapter3 = ctypes.c_void_p()
+                if (
+                    call_com(
+                        adapter,
+                        0,
+                        [
+                            ctypes.c_void_p,
+                            ctypes.POINTER(GUID),
+                            ctypes.POINTER(ctypes.c_void_p),
+                        ],
+                        ctypes.byref(iid_dxgi_adapter3),
+                        ctypes.byref(adapter3),
+                    )
+                    >= 0
+                    and adapter3.value
+                ):
+                    local_info = DXGI_QUERY_VIDEO_MEMORY_INFO()
+                    non_local_info = DXGI_QUERY_VIDEO_MEMORY_INFO()
+                    if (
+                        call_com(
+                            adapter3,
+                            14,
+                            [
+                                ctypes.c_void_p,
+                                ctypes.c_uint,
+                                ctypes.c_int,
+                                ctypes.POINTER(DXGI_QUERY_VIDEO_MEMORY_INFO),
+                            ],
+                            0,
+                            0,
+                            ctypes.byref(local_info),
+                        )
+                        >= 0
+                    ):
+                        vram_used_gb = local_info.CurrentUsage / (1024**3)
+                    if (
+                        call_com(
+                            adapter3,
+                            14,
+                            [
+                                ctypes.c_void_p,
+                                ctypes.c_uint,
+                                ctypes.c_int,
+                                ctypes.POINTER(DXGI_QUERY_VIDEO_MEMORY_INFO),
+                            ],
+                            0,
+                            1,
+                            ctypes.byref(non_local_info),
+                        )
+                        >= 0
+                    ):
+                        svram_used_gb = non_local_info.CurrentUsage / (1024**3)
+                        if non_local_info.Budget > 0:
+                            svram_budget_gb = non_local_info.Budget / (1024**3)
+                    call_com(adapter3, 2, [ctypes.c_void_p])
                 adapters.append(
                     {
                         "name": str(desc.Description),
                         "vendor_id": desc.VendorId,
                         "device_id": desc.DeviceId,
-                        "vram_gb": desc.DedicatedVideoMemory / (1024**3),
+                        "vram_gb": vram_total_gb,
+                        "vram_used_gb": vram_used_gb,
+                        "vram_avail_gb": max(0.0, vram_total_gb - vram_used_gb),
+                        "svram_budget_gb": svram_budget_gb,
+                        "svram_used_gb": svram_used_gb,
                     }
                 )
             call_com(adapter, 2, [ctypes.c_void_p])
@@ -544,7 +583,6 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         and site_packages is not None
         and (site_packages / "pip").is_dir()
     ):
-        _install_c10_env_sanitizer(target_dir)
         print_status(
             f"Reusing existing hermetic base interpreter at {target_dir.name}.",
             "INFO",
@@ -561,7 +599,9 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         archive_path = DOWNLOADS_DIR / archive_name
         if not archive_path.is_file():
             print_status(f"Streaming standalone Windows runtime ({version})...")
-            ctx = urllib.request.Request(url, headers={"User-Agent": "ShadowBoxVenv/2.0"})
+            ctx = urllib.request.Request(
+                url, headers={"User-Agent": "ShadowBoxVenv/2.0"}
+            )
             with urllib.request.urlopen(ctx, timeout=60) as response, open(
                 archive_path, "wb"
             ) as out_file:
@@ -577,7 +617,12 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
                 for line in orig_lines
                 if line.strip().endswith(".zip")
             ]
-            payload_paths = core_zips + [".", "Lib/site-packages", "import site"]
+            payload_paths = core_zips + [
+                "..",
+                ".",
+                "Lib/site-packages",
+                "import site",
+            ]
             pth_file.write_text("\n".join(payload_paths) + "\n", encoding="utf-8")
         executable = target_dir / "python.exe"
     else:
@@ -594,7 +639,9 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         archive_path = DOWNLOADS_DIR / archive_name
         if not archive_path.is_file():
             print_status(f"Streaming standalone POSIX runtime ({version})...")
-            ctx = urllib.request.Request(url, headers={"User-Agent": "ShadowBoxVenv/2.0"})
+            ctx = urllib.request.Request(
+                url, headers={"User-Agent": "ShadowBoxVenv/2.0"}
+            )
             with urllib.request.urlopen(ctx, timeout=60) as response, open(
                 archive_path, "wb"
             ) as out_file:
@@ -607,7 +654,6 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
             source_extracted.rename(target_dir)
         executable = target_dir / "bin" / "python"
 
-    _install_c10_env_sanitizer(target_dir)
     hermetic_env = build_hermetic_env(target_dir)
     pip_bootstrapper = TMP_DIR / "get-pip.py"
     v_parts = version.split(".")
@@ -615,7 +661,9 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         pip_url = f"https://bootstrap.pypa.io/pip/{v_parts[0]}.{v_parts[1]}/get-pip.py"
     else:
         pip_url = "https://bootstrap.pypa.io/get-pip.py"
-    pip_ctx = urllib.request.Request(pip_url, headers={"User-Agent": "ShadowBoxVenv/2.0"})
+    pip_ctx = urllib.request.Request(
+        pip_url, headers={"User-Agent": "ShadowBoxVenv/2.0"}
+    )
     with urllib.request.urlopen(pip_ctx, timeout=60) as response, open(
         pip_bootstrapper, "wb"
     ) as out_file:
@@ -962,10 +1010,139 @@ def condition_pytorch_runtime(
     return hsa_override_used
 
 
+def inject_hermetic_sitecustomize(target_dir: Path, hsa_override: str = "") -> None:
+    if os.name == "nt":
+        site_packages_dirs = [target_dir / "Lib" / "site-packages"]
+        for pth_file in target_dir.glob("*._pth"):
+            orig_lines = pth_file.read_text(encoding="utf-8").splitlines()
+            core_zips = [
+                line.strip()
+                for line in orig_lines
+                if line.strip().endswith(".zip")
+            ]
+            payload_paths = core_zips + [
+                "..",
+                ".",
+                "Lib/site-packages",
+                "import site",
+            ]
+            pth_file.write_text("\n".join(payload_paths) + "\n", encoding="utf-8")
+    else:
+        site_packages_dirs = list((target_dir / "lib").glob("python*/site-packages"))
+
+    sitecustomize_code = f"""from __future__ import annotations
+
+import os
+from pathlib import Path
+import sys
+
+_HERE = Path(__file__).resolve()
+_ENV_DIR = _HERE.parents[{2 if os.name == "nt" else 3}]
+_ROOT = _ENV_DIR.parent
+_HF = _ROOT / ".hf_cache"
+_TMP = _ROOT / ".tmp"
+_CACHE = _ROOT / ".cache"
+
+for _d in (
+    _HF,
+    _HF / "miopen" / "db",
+    _HF / "miopen" / "kernels",
+    _HF / "torch_inductor",
+    _HF / "triton",
+    _TMP,
+    _CACHE / "pip",
+):
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _env_default(key: str, val: str) -> None:
+    cur = os.environ.get(key)
+    if cur is None or not cur.strip():
+        os.environ[key] = val
+
+
+_env_default("PYTHONHOME", str(_ENV_DIR))
+_env_default("PYTHONNOUSERSITE", "1")
+_env_default("PYTHONUTF8", "1")
+_env_default("PYTHONIOENCODING", "utf-8")
+_env_default("PIP_NO_USER", "1")
+_env_default("PIP_USER", "0")
+_env_default("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+_env_default("PIP_CACHE_DIR", str(_CACHE / "pip"))
+_env_default("TEMP", str(_TMP))
+_env_default("TMP", str(_TMP))
+_env_default("TMPDIR", str(_TMP))
+_env_default("LOCALAPPDATA", str(_ROOT / ".local_appdata"))
+_env_default("APPDATA", str(_ROOT / ".appdata"))
+_env_default("XDG_CACHE_HOME", str(_CACHE))
+_env_default("XDG_CONFIG_HOME", str(_ROOT / ".config"))
+_env_default("XDG_DATA_HOME", str(_ROOT / ".local" / "share"))
+_env_default("ROCM_PATH", str(_ENV_DIR))
+_env_default("HF_HOME", str(_HF))
+_env_default("TORCH_HOME", str(_HF / "torch"))
+_env_default("TRANSFORMERS_CACHE", str(_HF / "transformers"))
+_env_default("HUGGINGFACE_HUB_CACHE", str(_HF / "hub"))
+_env_default("TORCH_EXTENSIONS_DIR", str(_HF / "torch_extensions"))
+_env_default("MIOPEN_USER_DB_PATH", str(_HF / "miopen" / "db"))
+_env_default("MIOPEN_CUSTOM_CACHE_DIR", str(_HF / "miopen" / "kernels"))
+_env_default("TORCHINDUCTOR_CACHE_DIR", str(_HF / "torch_inductor"))
+_env_default("TRITON_CACHE_DIR", str(_HF / "triton"))
+_env_default("MIOPEN_FIND_MODE", "1")
+_env_default("MIOPEN_LOG_LEVEL", "0")
+_env_default("MIOPEN_ENABLE_LOGGING", "0")
+_env_default("AMD_LOG_LEVEL", "0")
+_env_default("TORCH_BLAS_PREFER_HIPBLASLT", "1")
+_env_default("HSA_ENABLE_SDMA", "1")
+_env_default("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+_env_default("PYTORCH_CUDA_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
+_env_default("PYTORCH_HIP_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
+
+if {repr(bool(hsa_override))}:
+    _env_default("HSA_OVERRIDE_GFX_VERSION", {repr(hsa_override)})
+elif os.environ.get("HSA_OVERRIDE_GFX_VERSION", "") == "":
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+
+_env_bins = [
+    str(_ENV_DIR if sys.platform == "win32" else _ENV_DIR / "bin"),
+    str(_ENV_DIR / "Scripts" if sys.platform == "win32" else _ENV_DIR / "bin"),
+]
+_cur_path = os.environ.get("PATH", "")
+for _b in reversed(_env_bins):
+    if _b not in _cur_path:
+        _cur_path = _b + (os.pathsep + _cur_path if _cur_path else "")
+os.environ["PATH"] = _cur_path
+
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    for _dll_dir in (
+        _ENV_DIR,
+        _ENV_DIR / "Library" / "bin",
+        _ROOT / "ShadowBoxer" / "vizinjector",
+        _ROOT / "ShadowBoxer" / "viztoken",
+        _ROOT / "vizinjector",
+        _ROOT / "viztoken",
+    ):
+        if _dll_dir.is_dir():
+            try:
+                os.add_dll_directory(str(_dll_dir.resolve()))
+            except Exception:
+                pass
+"""
+    for sp_dir in site_packages_dirs:
+        sp_dir.mkdir(parents=True, exist_ok=True)
+        (sp_dir / "sitecustomize.py").write_text(
+            sitecustomize_code, encoding="utf-8"
+        )
+
+
 def generate_environment_anchors(
     target_dir: Path, executable: Path, hsa_override: str = ""
 ) -> None:
-    _install_c10_env_sanitizer(target_dir)
     project_root = target_dir.parent
     rel_env_name = target_dir.name
 
@@ -975,6 +1152,8 @@ def generate_environment_anchors(
     triton_dir = HF_CACHE_DIR / "triton"
     for p in (miopen_db, miopen_kernels, inductor_dir, triton_dir):
         p.mkdir(parents=True, exist_ok=True)
+
+    inject_hermetic_sitecustomize(target_dir, hsa_override=hsa_override)
 
     hsa_bat_line = (
         f'set "HSA_OVERRIDE_GFX_VERSION={hsa_override}"'
@@ -988,7 +1167,7 @@ def generate_environment_anchors(
     hsa_ps1_line = (
         f'$env:HSA_OVERRIDE_GFX_VERSION="{hsa_override}"'
         if hsa_override
-        else "Remove-Item Env:\\HSA_OVERRIDE_GFX_VERSION -ErrorAction SilentlyContinue"
+        else "Remove-Item Env:HSA_OVERRIDE_GFX_VERSION -ErrorAction SilentlyContinue"
     )
     hsa_echo_ps1 = (
         'Write-Host " HSA GFX Override: $env:HSA_OVERRIDE_GFX_VERSION"'
@@ -1017,12 +1196,12 @@ set "PYTHONCASEOK="
 set "VIRTUAL_ENV="
 set "CONDA_PREFIX="
 set "CONDA_DEFAULT_ENV="
-set "TORCH_BLAS_PREFER_HIPBLASLT="
 set "PYTHONNOUSERSITE=1"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "PIP_NO_USER=1"
 set "PIP_USER=0"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "PIP_CONFIG_FILE=NUL"
 set "PYTHONHOME=%ROOT_DIR%{rel_env_name}"
 set "PATH=%ROOT_DIR%{rel_env_name};%ROOT_DIR%{rel_env_name}\\Scripts;%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0"
@@ -1036,17 +1215,20 @@ set "HF_HOME=%ROOT_DIR%.hf_cache"
 set "TORCH_HOME=%ROOT_DIR%.hf_cache\\torch"
 set "TRANSFORMERS_CACHE=%ROOT_DIR%.hf_cache\\transformers"
 set "HUGGINGFACE_HUB_CACHE=%ROOT_DIR%.hf_cache\\hub"
+set "TORCH_EXTENSIONS_DIR=%ROOT_DIR%.hf_cache\\torch_extensions"
 set "MIOPEN_USER_DB_PATH=%ROOT_DIR%.hf_cache\\miopen\\db"
 set "MIOPEN_CUSTOM_CACHE_DIR=%ROOT_DIR%.hf_cache\\miopen\\kernels"
 set "TORCHINDUCTOR_CACHE_DIR=%ROOT_DIR%.hf_cache\\torch_inductor"
 set "TRITON_CACHE_DIR=%ROOT_DIR%.hf_cache\\triton"
-set "MIOPEN_FIND_MODE=2"
+set "MIOPEN_FIND_MODE=1"
 set "MIOPEN_LOG_LEVEL=0"
 set "MIOPEN_ENABLE_LOGGING=0"
 set "AMD_LOG_LEVEL=0"
+set "TORCH_BLAS_PREFER_HIPBLASLT=1"
+set "HSA_ENABLE_SDMA=1"
 set "CUBLAS_WORKSPACE_CONFIG=:4096:8"
-set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-set "PYTORCH_HIP_ALLOC_CONF=expandable_segments:True"
+set "PYTORCH_CUDA_ALLOC_CONF={ALLOC_CONF_POLICY}"
+set "PYTORCH_HIP_ALLOC_CONF={ALLOC_CONF_POLICY}"
 set "ROCM_PATH=%PYTHONHOME%"
 {hsa_bat_line}
 echo =======================================================================
@@ -1055,9 +1237,10 @@ echo  Interpreter: %PYTHONHOME%\\python.exe
 echo  Cache Anchor: %HF_HOME%
 echo  Local Temp: %TEMP%
 echo  Local Pip Cache: %PIP_CACHE_DIR%
-echo  MIOpen Cache: %MIOPEN_CUSTOM_CACHE_DIR% (Find Mode: FAST Heuristic)
+echo  MIOpen Cache: %MIOPEN_CUSTOM_CACHE_DIR% (Find Mode: %MIOPEN_FIND_MODE%)
+echo  Allocator Policy: %PYTORCH_HIP_ALLOC_CONF%
 {hsa_echo_bat}
-echo  Isolation Status: Zero host leakage. All temp/cache local to root.
+echo  Isolation Status: Consolidated Launch Script + Non-Destructive sitecustomize.
 echo =======================================================================
 cmd /k
 """
@@ -1066,17 +1249,17 @@ cmd /k
         ps1_content = f"""# Hermetic Sandbox PowerShell Launcher
 $ErrorActionPreference = "Continue"
 $ROOT_DIR = $PSScriptRoot
-Remove-Item Env:\\PYTHONPATH -ErrorAction SilentlyContinue
-Remove-Item Env:\\PYTHONCASEOK -ErrorAction SilentlyContinue
-Remove-Item Env:\\VIRTUAL_ENV -ErrorAction SilentlyContinue
-Remove-Item Env:\\CONDA_PREFIX -ErrorAction SilentlyContinue
-Remove-Item Env:\\CONDA_DEFAULT_ENV -ErrorAction SilentlyContinue
-Remove-Item Env:\\TORCH_BLAS_PREFER_HIPBLASLT -ErrorAction SilentlyContinue
+$env:PYTHONPATH = ""
+$env:PYTHONCASEOK = ""
+$env:VIRTUAL_ENV = ""
+$env:CONDA_PREFIX = ""
+$env:CONDA_DEFAULT_ENV = ""
 $env:PYTHONNOUSERSITE = "1"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PIP_NO_USER = "1"
 $env:PIP_USER = "0"
+$env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
 $env:PIP_CONFIG_FILE = "NUL"
 $env:PYTHONHOME = "$ROOT_DIR\\{rel_env_name}"
 $sysRoot = $env:SystemRoot
@@ -1091,17 +1274,20 @@ $env:HF_HOME = "$ROOT_DIR\\.hf_cache"
 $env:TORCH_HOME = "$ROOT_DIR\\.hf_cache\\torch"
 $env:TRANSFORMERS_CACHE = "$ROOT_DIR\\.hf_cache\\transformers"
 $env:HUGGINGFACE_HUB_CACHE = "$ROOT_DIR\\.hf_cache\\hub"
+$env:TORCH_EXTENSIONS_DIR = "$ROOT_DIR\\.hf_cache\\torch_extensions"
 $env:MIOPEN_USER_DB_PATH = "$ROOT_DIR\\.hf_cache\\miopen\\db"
 $env:MIOPEN_CUSTOM_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\miopen\\kernels"
 $env:TORCHINDUCTOR_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\torch_inductor"
 $env:TRITON_CACHE_DIR = "$ROOT_DIR\\.hf_cache\\triton"
-$env:MIOPEN_FIND_MODE = "2"
+$env:MIOPEN_FIND_MODE = "1"
 $env:MIOPEN_LOG_LEVEL = "0"
 $env:MIOPEN_ENABLE_LOGGING = "0"
 $env:AMD_LOG_LEVEL = "0"
+$env:TORCH_BLAS_PREFER_HIPBLASLT = "1"
+$env:HSA_ENABLE_SDMA = "1"
 $env:CUBLAS_WORKSPACE_CONFIG = ":4096:8"
-$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
-$env:PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+$env:PYTORCH_CUDA_ALLOC_CONF = "{ALLOC_CONF_POLICY}"
+$env:PYTORCH_HIP_ALLOC_CONF = "{ALLOC_CONF_POLICY}"
 $env:ROCM_PATH = "$env:PYTHONHOME"
 {hsa_ps1_line}
 Write-Host "=======================================================================" -ForegroundColor Cyan
@@ -1110,9 +1296,10 @@ Write-Host " Interpreter: $env:PYTHONHOME\\python.exe"
 Write-Host " Cache Anchor: $env:HF_HOME"
 Write-Host " Local Temp: $env:TEMP"
 Write-Host " Local Pip Cache: $env:PIP_CACHE_DIR"
-Write-Host " MIOpen Cache: $env:MIOPEN_CUSTOM_CACHE_DIR (Find Mode: FAST Heuristic)"
+Write-Host " MIOpen Cache: $env:MIOPEN_CUSTOM_CACHE_DIR (Find Mode: $env:MIOPEN_FIND_MODE)"
+Write-Host " Allocator Policy: $env:PYTORCH_HIP_ALLOC_CONF"
 {hsa_echo_ps1}
-Write-Host " Isolation Status: Zero host leakage. All temp/cache local to root." -ForegroundColor Green
+Write-Host " Isolation Status: Consolidated Launch Script + Non-Destructive sitecustomize." -ForegroundColor Green
 Write-Host "=======================================================================" -ForegroundColor Cyan
 """
         (project_root / "launch_env.ps1").write_text(ps1_content, encoding="utf-8")
@@ -1124,12 +1311,12 @@ unset PYTHONCASEOK
 unset VIRTUAL_ENV
 unset CONDA_PREFIX
 unset CONDA_DEFAULT_ENV
-unset TORCH_BLAS_PREFER_HIPBLASLT
 export PYTHONNOUSERSITE="1"
 export PYTHONUTF8="1"
 export PYTHONIOENCODING="utf-8"
 export PIP_NO_USER="1"
 export PIP_USER="0"
+export PIP_DISABLE_PIP_VERSION_CHECK="1"
 export PIP_CONFIG_FILE="/dev/null"
 export PYTHONHOME="${{ROOT_DIR}}/{rel_env_name}"
 export PATH="${{ROOT_DIR}}/{rel_env_name}:${{ROOT_DIR}}/{rel_env_name}/bin:/usr/local/bin:/usr/bin:/bin"
@@ -1144,17 +1331,20 @@ export HF_HOME="${{ROOT_DIR}}/.hf_cache"
 export TORCH_HOME="${{ROOT_DIR}}/.hf_cache/torch"
 export TRANSFORMERS_CACHE="${{ROOT_DIR}}/.hf_cache/transformers"
 export HUGGINGFACE_HUB_CACHE="${{ROOT_DIR}}/.hf_cache/hub"
+export TORCH_EXTENSIONS_DIR="${{ROOT_DIR}}/.hf_cache/torch_extensions"
 export MIOPEN_USER_DB_PATH="${{ROOT_DIR}}/.hf_cache/miopen/db"
 export MIOPEN_CUSTOM_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/miopen/kernels"
 export TORCHINDUCTOR_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/torch_inductor"
 export TRITON_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/triton"
-export MIOPEN_FIND_MODE="2"
+export MIOPEN_FIND_MODE="1"
 export MIOPEN_LOG_LEVEL="0"
 export MIOPEN_ENABLE_LOGGING="0"
 export AMD_LOG_LEVEL="0"
+export TORCH_BLAS_PREFER_HIPBLASLT="1"
+export HSA_ENABLE_SDMA="1"
 export CUBLAS_WORKSPACE_CONFIG=":4096:8"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export PYTORCH_HIP_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_CUDA_ALLOC_CONF="{ALLOC_CONF_POLICY}"
+export PYTORCH_HIP_ALLOC_CONF="{ALLOC_CONF_POLICY}"
 export ROCM_PATH="${{PYTHONHOME}}"
 {hsa_sh_line}
 echo "======================================================================="
@@ -1163,9 +1353,10 @@ echo " Interpreter: ${{PYTHONHOME}}/bin/python"
 echo " Cache Anchor: ${{HF_HOME}}"
 echo " Local Temp: ${{TEMP}}"
 echo " Local Pip Cache: ${{PIP_CACHE_DIR}}"
-echo " MIOpen Cache: ${{MIOPEN_CUSTOM_CACHE_DIR}} (Find Mode: FAST Heuristic)"
+echo " MIOpen Cache: ${{MIOPEN_CUSTOM_CACHE_DIR}} (Find Mode: ${{MIOPEN_FIND_MODE}})"
+echo " Allocator Policy: ${{PYTORCH_HIP_ALLOC_CONF}}"
 {hsa_echo_sh}
-echo " Isolation Status: Host modules segregated. Anchored relative root."
+echo " Isolation Status: Consolidated Launch Script + Non-Destructive sitecustomize."
 echo "======================================================================="
 exec $SHELL
 """
@@ -1174,7 +1365,8 @@ exec $SHELL
         launcher_sh.chmod(0o755)
 
     print_status(
-        "Hermetic launchers deployed: launch_env.bat, launch_env.ps1", "SUCCESS"
+        "Consolidated launch scripts & catch-all sitecustomize deployed.",
+        "SUCCESS",
     )
 
 
@@ -1187,20 +1379,33 @@ def run_hardware_acceptance_gate(
         test_env["HSA_OVERRIDE_GFX_VERSION"] = hsa_override
     else:
         test_env.pop("HSA_OVERRIDE_GFX_VERSION", None)
+
+    if sys.platform == "win32":
+        adapters = query_dxgi_adapters_win32()
+        for idx, ad in enumerate(adapters):
+            print_status(
+                f"[DXGI ADAPTER {idx}] {ad['name']} | Dedicated VRAM: "
+                f"{ad['vram_avail_gb']:.2f}/{ad['vram_gb']:.2f} GB Avail | "
+                f"Shared SoC Used: {ad['svram_used_gb']:.2f}/{ad['svram_budget_gb']:.2f} GB",
+                "SUCCESS",
+            )
+
     test_code = (
-        "import sys, torch\n"
+        "import os, sys, torch\n"
         "device = 'cuda' if torch.cuda.is_available() else 'mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu'\n"
         "backend = getattr(torch.version, 'hip', None) or getattr(torch.version, 'cuda', None) or ('mps' if device == 'mps' else 'cpu')\n"
         "name = torch.cuda.get_device_name(0) if device == 'cuda' else ('Apple Silicon' if device == 'mps' else 'Host CPU')\n"
         "print(f'[ACCEPTANCE] Interpreter: {sys.executable} (Python {sys.version.split()[0]})')\n"
         "print(f'[ACCEPTANCE] Device: {device.upper()} | Backend: {backend} | GPU: {name}')\n"
-        "x = torch.randn((256, 256), device=device, dtype=torch.float32)\n"
-        "y = torch.mm(x, x.T)\n"
+        "print(f'[ACCEPTANCE] Runtime Flags: MIOPEN_FIND_MODE={os.environ.get(\"MIOPEN_FIND_MODE\")} | HIPBLASLT={os.environ.get(\"TORCH_BLAS_PREFER_HIPBLASLT\")} | ALLOC_CONF={os.environ.get(\"PYTORCH_HIP_ALLOC_CONF\")}')\n"
+        "x = torch.randn((512, 512), device=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32)\n"
+        "y = torch.mm(x, x.T).float()\n"
+        "if device == 'cuda': torch.cuda.synchronize()\n"
         "assert torch.isfinite(y).all(), 'Non-finite tensor output detected'\n"
-        "print(f'[ACCEPTANCE] GEMM Compute Verification PASSED on {device.upper()}.')\n"
+        "print(f'[ACCEPTANCE] BF16/FP32 hipBLASLt GEMM Verification PASSED on {device.upper()}.')\n"
     )
     res = subprocess.run(
-        [str(executable), "-I", "-c", test_code],
+        [str(executable), "-c", test_code],
         env=test_env,
         stdin=subprocess.DEVNULL,
         text=True,
@@ -1213,6 +1418,15 @@ def run_hardware_acceptance_gate(
         print_status(
             f"Acceptance test diagnostic output:\n{res.stderr.strip()}", "WARN"
         )
+
+
+def _find_existing_sandbox() -> Path | None:
+    candidates = sorted(
+        [p for p in ROOT_DIR.glob("py_env_*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
 
 
 def main() -> None:
@@ -1231,11 +1445,37 @@ def main() -> None:
         help="Execute hands-free without interactive prompts.",
     )
     parser.add_argument(
+        "--launchers-only",
+        action="store_true",
+        help="Regenerate sitecustomize.py, launch_env.bat, and launch_env.ps1 for the active py_env_* sandbox and run acceptance check.",
+    )
+    parser.add_argument(
         "--hermetic-internal",
         action="store_true",
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
+
+    if args.launchers_only:
+        existing_sandbox = _find_existing_sandbox()
+        if existing_sandbox is None:
+            print_status("No existing py_env_* directory found.", "ERROR")
+            sys.exit(1)
+        exe = (
+            existing_sandbox / "python.exe"
+            if os.name == "nt"
+            else existing_sandbox / "bin" / "python"
+        )
+        isolated_env = build_hermetic_env(existing_sandbox)
+        _, llvm_target = resolve_hardware_matrix()
+        hsa_override = HSA_OVERRIDES.get(llvm_target, "")
+        generate_environment_anchors(
+            existing_sandbox, exe, hsa_override=hsa_override
+        )
+        run_hardware_acceptance_gate(
+            exe, isolated_env, hsa_override=hsa_override
+        )
+        return
 
     if not args.hermetic_internal:
         print_status("=" * 72)

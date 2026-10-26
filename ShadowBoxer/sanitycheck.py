@@ -90,8 +90,8 @@ def gate_1_native_subsystems() -> None:
     )
     vt_dir = ROOT_DIR / "viztoken"
     vi_dir = ROOT_DIR / "vizinjector"
-
     is_win = sys.platform == "win32"
+
     vt_required = (
         ("viztoken.dll", "viztoken-cli.exe", "qwen35.ranks.bin", "viztoken.py")
         if is_win
@@ -135,7 +135,6 @@ def gate_1_native_subsystems() -> None:
         _assert(
             tok.has_fast_tables, "SWISS5 fast tables not active in qwen35.ranks.bin"
         )
-
         raw_p1 = "A brushed-steel refrigerator with sticky note 'OPENMOSS'"
         raw_p2 = "A brushed-steel refrigerator with sticky note 'AGENTIC PASS 2'"
         p1 = render_qwen35_chat_prompt(
@@ -194,7 +193,6 @@ def gate_1_native_subsystems() -> None:
         print(
             f"  [+] VizInjector Backend      : {viz.backend_name} (Vulkan Active: {viz.vulkan_active})"
         )
-
         yy, xx = np.meshgrid(
             np.linspace(-1.0, 1.0, 512, dtype=np.float32),
             np.linspace(-1.0, 1.0, 512, dtype=np.float32),
@@ -321,6 +319,7 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             "Expected initial neg miss",
         )
         p_cache.insert(neg_tokens, h_neg)
+
         _ = p_cache.lookup(neg_tokens, dev, is_negative=True)
         _assert(
             p_cache.pos_hits == 0,
@@ -346,7 +345,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             hit_mm is not None and hit_mm.device.type == dev.type,
             "Multimodal prompt cache lookup failed",
         )
-
     print(
         f"  [+] PromptEmbedCache         : Pinned={stored_cpu.is_pinned() if has_gpu else 'CPU'} | NonInferenceCPU=True | PrefixSplice={p_cache.last_common_prefix_len} tok"
     )
@@ -385,7 +383,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
                 viz_meta=None,
             )
             pinned_rec = r_cache.insert(key_v7, rec_in, vae_key=vae_key_v7)
-
         if has_gpu:
             _assert(
                 pinned_rec.packed_latents is not None
@@ -561,7 +558,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         )
         _assert(dit._mod_seq_buf is not None, "_mod_seq_buf was not allocated")
         buf_ptr_1 = dit._mod_seq_buf.data_ptr()
-
         _assert(
             len(dit._mod_zero_cache) == 1, "Zero-timestep modulation was not cached"
         )
@@ -622,7 +618,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             dit._mod_seq_buf is None,
             "clear_transient_caches must release _mod_seq_buf between turns",
         )
-
     print(
         f"  [+] MOSSImageTransformer     : Meta-Init + Box-4D-RoPE + FlashIsoKV (diff={iso_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
     )
@@ -706,10 +701,13 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         pix = torch.randn((16, 3, 2, 16, 16), device=dev, dtype=dtype)
         g_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=dev)
 
-        ut = torch.randn((1, 2, 1, 16, 16), device=dev, dtype=torch.float32).tril(-1)
-        ut = ut + torch.eye(16, device=dev, dtype=torch.float32)
-        rhs_a = torch.randn((1, 2, 1, 16, 32), device=dev, dtype=torch.float32)
-        rhs_b = torch.randn((1, 2, 1, 16, 32), device=dev, dtype=torch.float32)
+        ut = (
+            torch.randn((1, 2, 1, 64, 64), device=dev, dtype=torch.float32).tril(-1)
+            * 0.05
+        )
+        ut = ut + torch.eye(64, device=dev, dtype=torch.float32)
+        rhs_a = torch.randn((1, 2, 1, 64, 32), device=dev, dtype=torch.float32)
+        rhs_b = torch.randn((1, 2, 1, 64, 32), device=dev, dtype=torch.float32)
         sol_a = _solve_unit_lower_triangular(ut, rhs_a)
         sol_b = _solve_unit_lower_triangular(ut, rhs_b)
         sol_cat_a, sol_cat_b = torch.split(
@@ -721,7 +719,11 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             float((sol_a - sol_cat_a).abs().max().item()),
             float((sol_b - sol_cat_b).abs().max().item()),
         )
-        _assert(tri_diff < 1e-6, f"Batched triangular solver drift: {tri_diff}")
+        res_err = float(((ut @ sol_a) - rhs_a).abs().max().item())
+        _assert(
+            tri_diff < 1e-5 and res_err < 1e-4,
+            f"Block-recursive triangular solver drift: cat_diff={tri_diff}, res_err={res_err}",
+        )
 
         q_out = qwen(
             input_ids=in_ids,
@@ -755,7 +757,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         "Qwen3_5Model.clear_caches() must flush _geom_cache and _STRICTLY_UPPER_MASK_CACHE",
     )
     print(
-        f"  [+] Qwen3_5Model Hybrid      : BatchedTriSolve (diff={tri_diff:.1e}) + CachedViTGeom + MaskCacheEvict Verified"
+        f"  [+] Qwen3_5Model Hybrid      : BlockRecTriSolve (diff={tri_diff:.1e}, res={res_err:.1e}) + CachedViTGeom + MaskCacheEvict Verified"
     )
 
     e4m3_dtype = getattr(torch, "float8_e4m3fn", None)
@@ -966,11 +968,11 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     _assert(
         "bf16" in DTYPE_MAP and "fp16" in DTYPE_LOOKUP,
         "Refinery DTYPE_MAP/DTYPE_LOOKUP missing",
     )
-
     with torch.inference_mode():
         w = torch.randn((64, 128), device=dev, dtype=torch.float32) * 0.25
         q_bf16 = refineTensor(
@@ -1019,11 +1021,18 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     guard = WDDMMemoryGuard(dev)
     snap = guard.enforce_stage_budget(required_headroom_gb=2.50, force=False)
     _assert(
-        snap.dedicated_total_gb >= 0.0 and snap.dedicated_avail_gb >= 0.0,
+        snap.dedicated_total_gb >= 0.0
+        and snap.dedicated_avail_gb >= 0.0
+        and snap.contiguous_avail_gb >= 0.0
+        and snap.pt_inactive_split_gb >= 0.0
+        and snap.host_avail_gb >= 0.0,
         f"Invalid WDDMMemoryGuard snapshot: {snap}",
     )
     print(
-        f"  [+] WDDMMemoryGuard          : Active={guard.active} ({guard.adapter_name}) | Avail={snap.dedicated_avail_gb:.2f}/{snap.dedicated_total_gb:.2f} GB | SpillDelta=+{snap.shared_delta_gb:.2f} GB"
+        f"  [+] WDDMMemoryGuard (DXGI3)  : Active={guard.active} ({guard.adapter_name}) | "
+        f"Avail={snap.dedicated_avail_gb:.2f}/{snap.dedicated_total_gb:.2f} GB "
+        f"(Contig={snap.contiguous_avail_gb:.2f} GB) | HostAvail={snap.host_avail_gb:.2f} GB | "
+        f"SpillDelta=+{snap.shared_delta_gb:.2f} GB"
     )
     guard.close()
 

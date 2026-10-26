@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -12,42 +14,56 @@ import time
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BIN_DIR = ROOT_DIR / "bin"
 IS_WIN = sys.platform == "win32"
-
 HERMETIC_PYTHON_EXE = BIN_DIR / "python" / ("python.exe" if IS_WIN else "bin/python")
+
 if (
     HERMETIC_PYTHON_EXE.exists()
     and Path(sys.executable).resolve() != HERMETIC_PYTHON_EXE.resolve()
 ):
+    tramp_env = os.environ.copy()
+    tramp_env["PYTHONHOME"] = str(BIN_DIR / "python")
+    tramp_env["ROCM_PATH"] = str(BIN_DIR / "python")
     respawn_cmd = [
         str(HERMETIC_PYTHON_EXE.resolve()),
-        "-I",
         str(Path(__file__).resolve()),
     ] + sys.argv[1:]
-    res = subprocess.run(respawn_cmd)
+    res = subprocess.run(respawn_cmd, env=tramp_env, check=False)
     sys.exit(res.returncode)
 
-CACHE_DIR = ROOT_DIR / ".hf_cache"
-os.environ["HF_HOME"] = str(CACHE_DIR)
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR / "hub")
-os.environ["HSA_OVERRIDE_GFX_VERSION"] = "12.0.0"
-os.environ["ROCM_PATH"] = str(BIN_DIR / "python")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["MIOPEN_FIND_MODE"] = "2"
+
+def _resolve_cache_dir() -> Path:
+    env_hf = os.environ.get("HF_HOME")
+    if env_hf and env_hf.strip():
+        return Path(env_hf).resolve()
+    parent_cache = (ROOT_DIR.parent / ".hf_cache").resolve()
+    if parent_cache.exists():
+        return parent_cache
+    return (ROOT_DIR / ".hf_cache").resolve()
+
+
+CACHE_DIR = _resolve_cache_dir()
+os.environ.setdefault("HF_HOME", str(CACHE_DIR))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(CACHE_DIR / "hub"))
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+for _noisy_logger in ("httpx", "httpx2", "httpcore", "httpcore2", "urllib3"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
 import torch
 
 from python.modeling_vae import Flux2AutoencoderKL
 
 DEFAULT_REPO_ID = "OpenMOSS-Team/MOSS-Image-SFT"
+_FLOAT_ST_DTYPES = {"F64", "F32", "F16", "BF16", "F8_E4M3", "F8_E5M2"}
 
 
 def resolve_local_vae_dir(repo_id: str = DEFAULT_REPO_ID) -> Path | None:
-    hub_dir = CACHE_DIR / "hub"
+    hub_dir = Path(os.environ.get("HUGGINGFACE_HUB_CACHE") or (CACHE_DIR / "hub")).resolve()
     repo_folder = hub_dir / ("models--" + repo_id.replace("/", "--")) / "snapshots"
     if not repo_folder.is_dir():
         return None
@@ -58,9 +74,24 @@ def resolve_local_vae_dir(repo_id: str = DEFAULT_REPO_ID) -> Path | None:
     )
     for snap in snapshots:
         vae_dir = snap / "vae"
-        if vae_dir.is_dir() and list(vae_dir.glob("*.safetensors")):
-            return vae_dir.resolve()
+        if vae_dir.is_dir():
+            sf_files = [sf for sf in vae_dir.glob("*.safetensors") if sf.exists()]
+            if sf_files:
+                return vae_dir.resolve()
     return None
+
+
+def _inspect_vae_shard(sf_path: Path) -> tuple[bool, int]:
+    needs_conversion = False
+    tensor_count = 0
+    resolved_sf = sf_path.resolve(strict=True)
+    with safe_open(str(resolved_sf), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            tensor_count += 1
+            st_dtype = f.get_slice(key).get_dtype()
+            if st_dtype in _FLOAT_ST_DTYPES and st_dtype != "F32":
+                needs_conversion = True
+    return needs_conversion, tensor_count
 
 
 def download_and_condition_vae(
@@ -84,14 +115,23 @@ def download_and_condition_vae(
 
     tensor_count = 0
     for sf_path in sf_files:
-        raw = load_safetensors(str(sf_path), device="cpu")
-        conditioned = {}
-        for k, v in raw.items():
-            conditioned[k] = v.to(torch.float32) if v.is_floating_point() else v
-            tensor_count += 1
+        needs_conv, count = _inspect_vae_shard(sf_path)
+        tensor_count += count
+        if not needs_conv:
+            continue
+        resolved_sf = sf_path.resolve(strict=True)
+        raw = load_safetensors(str(resolved_sf), device="cpu")
+        conditioned = {
+            k: (v.to(torch.float32) if v.is_floating_point() else v)
+            for k, v in raw.items()
+        }
         tmp_path = sf_path.with_suffix(".safetensors.tmp")
         save_safetensors(conditioned, str(tmp_path))
+        if sf_path.is_symlink():
+            sf_path.unlink(missing_ok=True)
         tmp_path.replace(sf_path)
+        del raw, conditioned
+        gc.collect()
 
     elapsed = time.perf_counter() - t0
     manifest = {
@@ -119,8 +159,13 @@ def download_and_condition_vae(
         rec = vae.decode_packed_latents(lat)
         torch.cuda.synchronize()
         assert torch.isfinite(lat).all() and torch.isfinite(rec).all()
+        lat_shape = tuple(lat.shape)
+        del vae, dummy_img, lat, rec
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         print(
-            f"[+] Warmup complete in {time.perf_counter() - t_w:.2f}s | Latent shape: {tuple(lat.shape)}"
+            f"[+] Warmup complete in {time.perf_counter() - t_w:.2f}s | Latent shape: {lat_shape}"
         )
 
     return vae_dir

@@ -24,7 +24,6 @@ import zlib
 
 TOOLS_DIR = Path(__file__).parent.resolve()
 BASE_DIR = TOOLS_DIR.parent
-
 BIN_DIR = BASE_DIR / "bin"
 SYSROOT_DIR = BIN_DIR / "sysroot"
 SOURCES_DIR = BIN_DIR / "sources"
@@ -39,17 +38,31 @@ TMP_DIR = ENV_CACHE_DIR / "tmp"
 DOWNLOADS_DIR = ENV_CACHE_DIR / "downloads"
 WHEELS_DIR = DOWNLOADS_DIR / "wheels"
 PIP_CACHE_DIR = ENV_CACHE_DIR / "pip"
-HF_CACHE_DIR = BASE_DIR / ".hf_cache"
 LOCAL_APPDATA_DIR = ENV_CACHE_DIR / "local_appdata"
 ROAMING_APPDATA_DIR = ENV_CACHE_DIR / "appdata"
+
+
+def _resolve_hf_cache_dir() -> Path:
+    env_hf = os.environ.get("HF_HOME")
+    if env_hf and env_hf.strip():
+        return Path(env_hf).resolve()
+    parent_hf = (BASE_DIR.parent / ".hf_cache").resolve()
+    if parent_hf.exists():
+        return parent_hf
+    return (BASE_DIR / ".hf_cache").resolve()
+
+
+HF_CACHE_DIR = _resolve_hf_cache_dir()
+PARENT_WHEELS_DIR = (BASE_DIR.parent / ".cache" / "downloads" / "wheels").resolve()
 
 HOST_OS = sys.platform
 HOST_ARCH = platform.machine().lower()
 IS_WIN = HOST_OS == "win32"
 IS_MAC = HOST_OS == "darwin"
 IS_LINUX = HOST_OS.startswith("linux")
-
 HTTPS = "https" + "://"
+
+ALLOC_CONF_POLICY = "garbage_collection_threshold:0.8"
 
 CLANG_EXE = BIN_DIR / "llvm" / "bin" / ("clang.exe" if IS_WIN else "clang")
 CLANG_CL_EXE = BIN_DIR / "llvm" / "bin" / ("clang-cl.exe" if IS_WIN else "clang-cl")
@@ -60,6 +73,7 @@ NASM_EXE = BIN_DIR / "nasm" / ("nasm.exe" if IS_WIN else "nasm")
 GIT_CMD_EXE = BIN_DIR / "git" / "cmd" / ("git.exe" if IS_WIN else "git")
 FFMPEG_EXE = FFMPEG_DIR / ("ffmpeg.exe" if IS_WIN else "ffmpeg")
 HERMETIC_PYTHON_EXE = PYTHON_DIR / ("python.exe" if IS_WIN else "bin/python")
+
 REQUIREMENTS_FILE = BASE_DIR / "requirements.txt"
 LOCK_FILE = PYTHON_DIR / "constraints.lock"
 
@@ -121,8 +135,6 @@ AMD_STAGING_FAMILY_MAP = {
 }
 
 HSA_OVERRIDES = {
-    "gfx1201": "12.0.0",
-    "gfx1200": "12.0.0",
     "gfx1150": "11.5.0",
     "gfx1151": "11.5.0",
     "gfx1152": "11.5.0",
@@ -247,7 +259,6 @@ def get_isolated_env() -> dict[str, str]:
         d.mkdir(parents=True, exist_ok=True)
 
     tempfile.tempdir = str(TMP_DIR)
-
     env: dict[str, str] = {}
     for os_var in (
         "SYSTEMROOT",
@@ -312,13 +323,34 @@ def get_isolated_env() -> dict[str, str]:
     env["XDG_CACHE_HOME"] = str(ENV_CACHE_DIR)
     env["XDG_CONFIG_HOME"] = str(ENV_CACHE_DIR / "config")
     env["XDG_DATA_HOME"] = str(ENV_CACHE_DIR / "share")
-    env["HF_HOME"] = str(HF_CACHE_DIR)
-    env["TORCH_HOME"] = str(HF_CACHE_DIR / "torch")
-    env["MIOPEN_USER_DB_PATH"] = str(HF_CACHE_DIR / "miopen" / "db")
-    env["MIOPEN_CUSTOM_CACHE_DIR"] = str(HF_CACHE_DIR / "miopen" / "kernels")
-    env["TORCHINDUCTOR_CACHE_DIR"] = str(HF_CACHE_DIR / "torch_inductor")
-    env["TRITON_CACHE_DIR"] = str(HF_CACHE_DIR / "triton")
     env["ROCM_PATH"] = str(PYTHON_DIR)
+
+    contract_defaults = {
+        "HF_HOME": str(HF_CACHE_DIR),
+        "TORCH_HOME": str(HF_CACHE_DIR / "torch"),
+        "TRANSFORMERS_CACHE": str(HF_CACHE_DIR / "transformers"),
+        "HUGGINGFACE_HUB_CACHE": str(HF_CACHE_DIR / "hub"),
+        "MIOPEN_USER_DB_PATH": str(HF_CACHE_DIR / "miopen" / "db"),
+        "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
+        "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
+        "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
+        "MIOPEN_FIND_MODE": "1",
+        "MIOPEN_LOG_LEVEL": "0",
+        "MIOPEN_ENABLE_LOGGING": "0",
+        "AMD_LOG_LEVEL": "0",
+        "TORCH_BLAS_PREFER_HIPBLASLT": "1",
+        "HSA_ENABLE_SDMA": "1",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "PYTORCH_CUDA_ALLOC_CONF": ALLOC_CONF_POLICY,
+        "PYTORCH_HIP_ALLOC_CONF": ALLOC_CONF_POLICY,
+    }
+    for k, v in contract_defaults.items():
+        cur = os.environ.get(k)
+        env[k] = cur if (cur is not None and cur.strip()) else v
+
+    if os.environ.get("HSA_OVERRIDE_GFX_VERSION", "").strip():
+        env["HSA_OVERRIDE_GFX_VERSION"] = os.environ["HSA_OVERRIDE_GFX_VERSION"].strip()
+
     return env
 
 
@@ -463,7 +495,6 @@ def resolve_github_repo_snapshot(
                 candidate = f"{HTTPS}github.com/{repo}/archive/refs/tags/{tag}.zip"
                 if probe_url(candidate):
                     return tag, candidate
-
         candidate_tags: list[str] = []
         try:
             refs_data = fetch_json(
@@ -481,7 +512,6 @@ def resolve_github_repo_snapshot(
                             candidate_tags.append(t_name)
         except Exception:
             pass
-
         if not candidate_tags:
             try:
                 tags_data = fetch_json(
@@ -495,7 +525,6 @@ def resolve_github_repo_snapshot(
                             candidate_tags.append(t_name)
             except Exception:
                 pass
-
         if candidate_tags:
             candidate_tags.sort(key=parse_semver, reverse=True)
             for best_tag in candidate_tags[:5]:
@@ -504,7 +533,6 @@ def resolve_github_repo_snapshot(
                 )
                 if probe_url(candidate):
                     return best_tag, candidate
-
     default_branch = "main"
     try:
         repo_meta = fetch_json(f"{HTTPS}api.github.com/repos/{repo}", timeout=15)
@@ -512,7 +540,6 @@ def resolve_github_repo_snapshot(
             default_branch = repo_meta["default_branch"]
     except Exception:
         pass
-
     for branch in dict.fromkeys([default_branch, "main", "master"]):
         try:
             commit_data = fetch_json(
@@ -526,16 +553,13 @@ def resolve_github_repo_snapshot(
                         return sha, candidate
         except Exception:
             continue
-
     cached = read_version_marker(target_dir)
     if cached:
         return cached, ""
-
     for branch in ("main", "master"):
         candidate = f"{HTTPS}github.com/{repo}/archive/refs/heads/{branch}.zip"
         if probe_url(candidate):
             return branch, candidate
-
     raise RuntimeError(f"Unable to dynamically resolve upstream snapshot for {repo}")
 
 
@@ -558,7 +582,6 @@ def unpack_archive(
     safe_rmtree(extract_dir)
     extract_dir.mkdir(parents=True, exist_ok=True)
     archive_str = str(archive_path)
-
     if archive_str.endswith((".zip", ".vsix", ".nupkg")):
         with zipfile.ZipFile(archive_path, "r") as zip_ref:
             for member in zip_ref.infolist():
@@ -583,7 +606,6 @@ def unpack_archive(
                     if f_src is not None:
                         with f_src, open(target_str, "wb") as f_dst:
                             shutil.copyfileobj(f_src, f_dst)
-
     if flatten_single_dir:
         entries = list(extract_dir.iterdir())
         if len(entries) == 1 and entries[0].is_dir():
@@ -609,6 +631,7 @@ def query_dxgi_adapters_win32() -> list[dict]:
     if not IS_WIN:
         return []
     try:
+
         class DXGI_ADAPTER_DESC1(ctypes.Structure):
             _fields_ = [
                 ("Description", ctypes.c_wchar * 128),
@@ -651,7 +674,6 @@ def query_dxgi_adapters_win32() -> list[dict]:
             != 0
         ):
             return []
-
         adapters = []
         idx = 0
         while True:
@@ -693,10 +715,8 @@ def resolve_hardware_matrix() -> tuple[str, str]:
     if IS_MAC:
         uname = safe_subprocess(["uname", "-m"])
         return ("MPS", "") if "arm64" in uname else ("CPU", "")
-
     has_nvidia, has_amd, has_intel = False, False, False
     detected_amd_targets = []
-
     if IS_WIN:
         dxgi_devices = query_dxgi_adapters_win32()
         for dev in dxgi_devices:
@@ -756,7 +776,6 @@ def resolve_hardware_matrix() -> tuple[str, str]:
                 detected_amd_targets.append(gfx_match.group(0))
             else:
                 detected_amd_targets.append("gfx1201")
-
     if has_nvidia:
         smi = safe_subprocess(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]
@@ -779,14 +798,11 @@ def resolve_hardware_matrix() -> tuple[str, str]:
             except Exception:
                 pass
         return "CUDA_12_6", ""
-
     if has_amd:
         best_target = detected_amd_targets[0] if detected_amd_targets else "gfx1201"
         return "ROCM", best_target
-
     if has_intel:
         return "INTEL_XPU", ""
-
     return "CPU", ""
 
 
@@ -801,7 +817,6 @@ def scan_ast_dependencies() -> list[str]:
         folder_path = BASE_DIR / folder
         if folder_path.exists():
             scan_targets.extend(folder_path.rglob("*.py"))
-
     discovered_roots: set[str] = {
         "numpy",
         "PIL",
@@ -809,7 +824,6 @@ def scan_ast_dependencies() -> list[str]:
         "safetensors",
         "huggingface_hub",
     }
-
     for py_file in scan_targets:
         if not py_file.exists():
             continue
@@ -829,7 +843,6 @@ def scan_ast_dependencies() -> list[str]:
                             discovered_roots.add(root_mod)
         except Exception:
             pass
-
     third_party_packages: set[str] = set()
     for mod in discovered_roots:
         if mod in stdlib_names or mod in LOCAL_MODULE_EXCLUSIONS:
@@ -840,7 +853,6 @@ def scan_ast_dependencies() -> list[str]:
             continue
         pypi_name = IMPORT_TO_PYPI_MAP.get(mod, mod)
         third_party_packages.add(pypi_name)
-
     merged_packages = sorted(third_party_packages, key=str.lower)
     req_content = (
         "# AUTO-SYNTHESIZED BY VIZINJECTOR AST DEPENDENCY SCANNER\n"
@@ -906,7 +918,6 @@ def resolve_python_runtime(requested_version: str | None = None) -> tuple[str, s
                 best_ver, best_url = matching_assets[0]
                 if best_url and probe_url(best_url):
                     return best_ver, best_url
-
     cached = read_version_marker(PYTHON_DIR)
     if HERMETIC_PYTHON_EXE.exists():
         if not cached:
@@ -923,7 +934,6 @@ def resolve_python_runtime(requested_version: str | None = None) -> tuple[str, s
             cached = res.stdout.strip() or "local"
             write_version_marker(PYTHON_DIR, cached)
         return cached, ""
-
     raise RuntimeError("Failed to dynamically resolve upstream Python runtime.")
 
 
@@ -932,7 +942,6 @@ def bootstrap_hermetic_python(
 ) -> None:
     isolated_env = get_isolated_env()
     py_ver, py_url = resolve_python_runtime(requested_version)
-
     if py_url and not is_version_current(
         PYTHON_DIR, py_ver, HERMETIC_PYTHON_EXE, force
     ):
@@ -957,7 +966,6 @@ def bootstrap_hermetic_python(
             safe_rmtree(temp_ext)
             archive_path.unlink(missing_ok=True)
             os.chmod(HERMETIC_PYTHON_EXE, 0o755)
-
         pip_bootstrapper = TMP_DIR / "get-pip.py"
         fetch_payload(f"{HTTPS}bootstrap.pypa.io/get-pip.py", pip_bootstrapper)
         subprocess.run(
@@ -989,7 +997,6 @@ def salvage_cached_wheels() -> None:
                 shutil.copy2(whl, dest)
             except Exception:
                 pass
-
     http_cache = PIP_CACHE_DIR / "http-v2"
     if not http_cache.exists():
         return
@@ -1028,26 +1035,29 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
     discovered_pkgs = scan_ast_dependencies()
     profile, llvm_target = resolve_hardware_matrix()
     hsa_override = HSA_OVERRIDES.get(llvm_target, "")
-
     torch_marker = PYTHON_DIR / ".torch_profile"
     expected_profile_tag = f"{profile}:{llvm_target}"
-
     salvage_cached_wheels()
 
-    pip_base = [
-        str(HERMETIC_PYTHON_EXE),
-        "-I",
-        "-m",
-        "pip",
-        "install",
-        "--no-warn-script-location",
-        "--no-compile",
-        "--progress-bar",
-        "off",
-        "--no-cache-dir",
-        "--find-links",
-        str(WHEELS_DIR),
-    ]
+    find_links_args = ["--find-links", str(WHEELS_DIR)]
+    if PARENT_WHEELS_DIR.is_dir() and PARENT_WHEELS_DIR != WHEELS_DIR:
+        find_links_args.extend(["--find-links", str(PARENT_WHEELS_DIR)])
+
+    pip_base = (
+        [
+            str(HERMETIC_PYTHON_EXE),
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--no-warn-script-location",
+            "--no-compile",
+            "--progress-bar",
+            "off",
+            "--no-cache-dir",
+        ]
+        + find_links_args
+    )
 
     if (
         force
@@ -1063,7 +1073,6 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
             stdin=subprocess.DEVNULL,
             check=True,
         )
-
         if profile == "ROCM":
             family = AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
             index_url = f"{HTTPS}rocm.nightlies.amd.com/v2-staging/{family}/"
@@ -1171,7 +1180,6 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
                 stdin=subprocess.DEVNULL,
                 check=True,
             )
-
         torch_marker.write_text(f"{expected_profile_tag}\n", encoding="utf-8")
     else:
         log_info(f"Hardware-aligned PyTorch runtime converged ({expected_profile_tag}).")
@@ -1185,7 +1193,6 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
         stdin=subprocess.DEVNULL,
         check=True,
     )
-
     freeze_res = subprocess.run(
         [str(HERMETIC_PYTHON_EXE), "-I", "-m", "pip", "freeze"],
         env=isolated_env,
@@ -1233,7 +1240,6 @@ def resolve_nasm_url() -> tuple[str, str]:
                 return ver, candidate_url
     except Exception as exc:
         log_warn(f"NASM index query failed: {exc}")
-
     cached = read_version_marker(BIN_DIR / "nasm")
     if cached and NASM_EXE.exists():
         return cached, ""
@@ -1250,7 +1256,6 @@ def resolve_fftw_url() -> tuple[str, str]:
                 return ver, candidate_url
     except Exception as exc:
         log_warn(f"FFTW index query failed: {exc}")
-
     cached = read_version_marker(SOURCES_DIR / "fftw3")
     if cached and (SOURCES_DIR / "fftw3" / "CMakeLists.txt").exists():
         return cached, ""
@@ -1329,7 +1334,6 @@ def resolve_upstream_tool_urls() -> dict[str, tuple[str, str]]:
 def hydrate_host_tools(force: bool = False) -> None:
     log_stage("Resolving and Converging Upstream Host Toolchains")
     tools_map = resolve_upstream_tool_urls()
-
     git_tag, git_url = tools_map["git"]
     if IS_WIN and git_tag:
         if git_url and not is_version_current(
@@ -1342,7 +1346,6 @@ def hydrate_host_tools(force: bool = False) -> None:
             write_version_marker(BIN_DIR / "git", git_tag)
         else:
             log_info(f"MinGit converged ({git_tag}).")
-
     cmake_tag, cmake_url = tools_map["cmake"]
     if cmake_url and not is_version_current(
         BIN_DIR / "cmake", cmake_tag, CMAKE_EXE, force
@@ -1362,7 +1365,6 @@ def hydrate_host_tools(force: bool = False) -> None:
         write_version_marker(BIN_DIR / "cmake", cmake_tag)
     else:
         log_info(f"CMake converged ({cmake_tag}).")
-
     ninja_tag, ninja_url = tools_map["ninja"]
     if ninja_url and not is_version_current(
         BIN_DIR / "ninja", ninja_tag, NINJA_EXE, force
@@ -1376,7 +1378,6 @@ def hydrate_host_tools(force: bool = False) -> None:
         write_version_marker(BIN_DIR / "ninja", ninja_tag)
     else:
         log_info(f"Ninja converged ({ninja_tag}).")
-
     llvm_tag, llvm_url = tools_map["llvm"]
     llvm_marker = CLANG_CL_EXE if IS_WIN else CLANG_EXE
     if llvm_url and not is_version_current(
@@ -1397,7 +1398,6 @@ def hydrate_host_tools(force: bool = False) -> None:
         write_version_marker(BIN_DIR / "llvm", llvm_tag)
     else:
         log_info(f"LLVM/Clang converged ({llvm_tag}).")
-
     nasm_tag, nasm_url = tools_map["nasm"]
     if nasm_url and not is_version_current(
         BIN_DIR / "nasm", nasm_tag, NASM_EXE, force
@@ -1425,7 +1425,6 @@ def hydrate_host_tools(force: bool = False) -> None:
         write_version_marker(nasm_dest, nasm_tag)
     else:
         log_info(f"NASM converged ({nasm_tag}).")
-
     ff_tag, ff_url = tools_map["ffmpeg"]
     ff_bins = {"ffmpeg.exe", "ffprobe.exe"} if IS_WIN else {"ffmpeg", "ffprobe"}
     if ff_url and not is_version_current(FFMPEG_DIR, ff_tag, FFMPEG_EXE, force):
@@ -1587,7 +1586,6 @@ def audit_sdk_fakeroot() -> bool:
     )
     if not stdio_headers:
         return False
-
     found_libs = {anchor: False for anchor in SDK_REQUIRED_ANCHORS}
     for lib_path in (
         (WINSDK_DIR / "Windows Kits").rglob("*.lib")
@@ -1608,7 +1606,6 @@ def audit_msvc_fakeroot() -> bool:
     )
     if not vcruntime_headers:
         return False
-
     found_libs = {anchor: False for anchor in MSVC_REQUIRED_ANCHORS}
     for lib_path in (
         (WINSDK_DIR / "VC").rglob("*.lib")
@@ -1629,23 +1626,18 @@ def hydrate_winsdk(force: bool = False) -> None:
     raw_sdk_version = nuget_specs[0][1]
     clean_sdk_version = normalize_numeric_version(raw_sdk_version)
     sdk_composite_tag = "|".join(f"{p}:{v}" for p, v, _ in nuget_specs)
-
     vs_channel_ver, vs_manifest_url = discover_latest_vs_channel()
-
     sdk_valid = audit_sdk_fakeroot()
     msvc_valid = audit_msvc_fakeroot()
     current_sdk_tag = read_version_marker(WINSDK_DIR, ".sdk_version")
     current_msvc_tag = read_version_marker(WINSDK_DIR, ".msvc_version")
-
     sdk_needs_update = force or not sdk_valid or (current_sdk_tag != sdk_composite_tag)
     msvc_needs_update = force or not msvc_valid or (current_msvc_tag != vs_channel_ver)
-
     if not sdk_needs_update and not msvc_needs_update:
         log_info(
             f"Windows SDK ({raw_sdk_version}) and MSVC Channel ({vs_channel_ver}) converged."
         )
         return
-
     if sdk_needs_update:
         log_stage(
             f"Hydrating Windows SDK ({raw_sdk_version} -> {clean_sdk_version}) via NuGet Flatcontainer"
@@ -1658,7 +1650,6 @@ def hydrate_winsdk(force: bool = False) -> None:
         )
         os.makedirs(to_unc_path(sdk_inc_target), exist_ok=True)
         os.makedirs(to_unc_path(sdk_lib_target), exist_ok=True)
-
         header_buckets = ["ucrt", "um", "shared", "winrt", "cppwinrt"]
         for pkg_id, pkg_ver, url in nuget_specs:
             nupkg_path = TMP_DIR / f"{pkg_id}.{pkg_ver}.nupkg"
@@ -1719,10 +1710,8 @@ def hydrate_winsdk(force: bool = False) -> None:
             finally:
                 safe_rmtree(ext_dir)
                 nupkg_path.unlink(missing_ok=True)
-
         _decontaminate_sdk_um_libs()
         write_version_marker(WINSDK_DIR, sdk_composite_tag, ".sdk_version")
-
     if msvc_needs_update:
         catalog = stream_vs_manifest_catalog(vs_manifest_url)
         catalog_packages = catalog.get("packages", [])
@@ -1745,7 +1734,6 @@ def hydrate_winsdk(force: bool = False) -> None:
             raise RuntimeError(
                 "No Microsoft.VC CRT header packages found in upstream Visual Studio catalog."
             )
-
         all_crt_headers.sort(
             key=lambda p: (
                 _extract_vc_toolset_ver(p.get("id", "")),
@@ -1762,7 +1750,6 @@ def hydrate_winsdk(force: bool = False) -> None:
             if id_ver_match
             else best_header_pkg.get("version", vs_channel_ver)
         )
-
         target_prefix = f"microsoft.vc.{msvc_version.lower()}.crt."
         crt_headers_pkgs = [
             p
@@ -1780,7 +1767,6 @@ def hydrate_winsdk(force: bool = False) -> None:
                 "payloads"
             ):
                 crt_libs_pkgs.append(pkg)
-
         log_stage(
             f"Hydrating Latest MSVC Toolset ({msvc_version}) [{len(crt_headers_pkgs)} header pkg, {len(crt_libs_pkgs)} x64 lib pkgs]"
         )
@@ -1792,18 +1778,15 @@ def hydrate_winsdk(force: bool = False) -> None:
         )
         os.makedirs(to_unc_path(msvc_inc_target), exist_ok=True)
         os.makedirs(to_unc_path(msvc_lib_target), exist_ok=True)
-
         for pkg in crt_headers_pkgs:
             extract_and_stage_vs_payload(pkg, "crt_headers", msvc_inc_target)
         for pkg in crt_libs_pkgs:
             extract_and_stage_vs_payload(pkg, "crt_libs", msvc_lib_target)
-
         if not audit_msvc_fakeroot():
             raise RuntimeError(
                 "MSVC CRT hydration incomplete: mandatory CRT headers or libraries missing."
             )
         write_version_marker(WINSDK_DIR, vs_channel_ver, ".msvc_version")
-
     write_version_marker(WINSDK_DIR, f"{vs_channel_ver}:{clean_sdk_version}")
 
 
@@ -1814,7 +1797,6 @@ def hydrate_sources(force: bool = False) -> None:
     SOURCES_DIR.mkdir(parents=True, exist_ok=True)
     sysroot_inc = SYSROOT_DIR / "include"
     sysroot_inc.mkdir(parents=True, exist_ok=True)
-
     vk_headers_dir = SOURCES_DIR / "vulkan_headers"
     vkh_tag, vkh_url = resolve_github_repo_snapshot(
         "KhronosGroup/Vulkan-Headers", vk_headers_dir
@@ -1835,7 +1817,6 @@ def hydrate_sources(force: bool = False) -> None:
         log_info(f"Vulkan-Headers converged ({vkh_tag}).")
         if not (sysroot_inc / "vulkan" / "vulkan.h").exists():
             copy_tree_contents(vk_headers_dir / "include", sysroot_inc)
-
     vk_loader_dir = SOURCES_DIR / "vulkan_loader"
     paired_loader_url = f"{HTTPS}github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/{vkh_tag}.zip"
     if probe_url(paired_loader_url):
@@ -1854,7 +1835,6 @@ def hydrate_sources(force: bool = False) -> None:
         write_version_marker(vk_loader_dir, vkl_tag)
     else:
         log_info(f"Vulkan-Loader converged ({vkl_tag}).")
-
     shaderc_dir = SOURCES_DIR / "shaderc"
     sc_tag, sc_url = resolve_github_repo_snapshot("google/shaderc", shaderc_dir)
     shaderc_updated = False
@@ -1869,7 +1849,6 @@ def hydrate_sources(force: bool = False) -> None:
         shaderc_updated = True
     else:
         log_info(f"Shaderc converged ({sc_tag}).")
-
     shaderc_tp = shaderc_dir / "third_party"
     if (
         shaderc_updated
@@ -1891,7 +1870,6 @@ def hydrate_sources(force: bool = False) -> None:
             env=sync_env,
             check=True,
         )
-
     blis_dir = SOURCES_DIR / "blis"
     blis_tag, blis_url = resolve_github_repo_snapshot("amd/blis", blis_dir)
     if blis_url and not is_version_current(
@@ -1904,7 +1882,6 @@ def hydrate_sources(force: bool = False) -> None:
         write_version_marker(blis_dir, blis_tag)
     else:
         log_info(f"AMD AOCL-BLIS converged ({blis_tag}).")
-
     fftw_dir = SOURCES_DIR / "fftw3"
     fftw_ver, fftw_url = resolve_fftw_url()
     if fftw_url and not is_version_current(
@@ -1917,7 +1894,6 @@ def hydrate_sources(force: bool = False) -> None:
         write_version_marker(fftw_dir, fftw_ver)
     else:
         log_info(f"FFTW3 converged ({fftw_ver}).")
-
     webp_dir = SOURCES_DIR / "libwebp"
     webp_tag, webp_url = resolve_github_repo_snapshot(
         "webmproject/libwebp", webp_dir
@@ -1932,7 +1908,6 @@ def hydrate_sources(force: bool = False) -> None:
         write_version_marker(webp_dir, webp_tag)
     else:
         log_info(f"libwebp converged ({webp_tag}).")
-
     spng_dir = SOURCES_DIR / "libspng"
     spng_tag, spng_url = resolve_github_repo_snapshot(
         "randy408/libspng", spng_dir
@@ -1947,7 +1922,6 @@ def hydrate_sources(force: bool = False) -> None:
         write_version_marker(spng_dir, spng_tag)
     else:
         log_info(f"libspng converged ({spng_tag}).")
-
     miniz_dir = SOURCES_DIR / "miniz"
     miniz_tag, miniz_url = resolve_github_repo_snapshot(
         "richgel999/miniz", miniz_dir
@@ -1962,7 +1936,6 @@ def hydrate_sources(force: bool = False) -> None:
         write_version_marker(miniz_dir, miniz_tag)
     else:
         log_info(f"miniz converged ({miniz_tag}).")
-
     stb_dir = SOURCES_DIR / "stb"
     stb_tag, stb_url = resolve_github_repo_snapshot(
         "nothings/stb", stb_dir, prefer_default_branch=True
@@ -1996,6 +1969,7 @@ def orchestrate_hermetic_runtime_environment(hsa_override: str = "") -> None:
         site_packages_dirs = list((PYTHON_DIR / "lib").glob("python*/site-packages"))
 
     sitecustomize_code = f"""from __future__ import annotations
+
 import os
 from pathlib import Path
 import sys
@@ -2005,25 +1979,48 @@ _ROOT = _HERE.parents[{4 if IS_WIN else 5}]
 _BIN = _ROOT / "bin"
 _PY = _BIN / "python"
 _CACHE = _ROOT / ".forge_cache" / "env"
-_HF = _ROOT / ".hf_cache"
 
-os.environ.setdefault("PYTHONNOUSERSITE", "1")
-os.environ.setdefault("PYTHONUTF8", "1")
-os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-os.environ.setdefault("ROCM_PATH", str(_PY))
-os.environ.setdefault("HF_HOME", str(_HF))
-os.environ.setdefault("TORCH_HOME", str(_HF / "torch"))
-os.environ.setdefault("MIOPEN_USER_DB_PATH", str(_HF / "miopen" / "db"))
-os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", str(_HF / "miopen" / "kernels"))
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_HF / "torch_inductor"))
-os.environ.setdefault("TRITON_CACHE_DIR", str(_HF / "triton"))
-os.environ.setdefault("MIOPEN_FIND_MODE", "2")
-os.environ.setdefault("MIOPEN_LOG_LEVEL", "0")
-os.environ.setdefault("MIOPEN_ENABLE_LOGGING", "0")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
+_env_hf = os.environ.get("HF_HOME")
+if _env_hf and _env_hf.strip():
+    _HF = Path(_env_hf).resolve()
+elif (_ROOT.parent / ".hf_cache").exists():
+    _HF = (_ROOT.parent / ".hf_cache").resolve()
+else:
+    _HF = (_ROOT / ".hf_cache").resolve()
+
+
+def _env_default(key: str, val: str) -> None:
+    cur = os.environ.get(key)
+    if cur is None or not cur.strip():
+        os.environ[key] = val
+
+
+_env_default("PYTHONNOUSERSITE", "1")
+_env_default("PYTHONUTF8", "1")
+_env_default("PYTHONIOENCODING", "utf-8")
+_env_default("ROCM_PATH", str(_PY))
+_env_default("HF_HOME", str(_HF))
+_env_default("TORCH_HOME", str(_HF / "torch"))
+_env_default("TRANSFORMERS_CACHE", str(_HF / "transformers"))
+_env_default("HUGGINGFACE_HUB_CACHE", str(_HF / "hub"))
+_env_default("MIOPEN_USER_DB_PATH", str(_HF / "miopen" / "db"))
+_env_default("MIOPEN_CUSTOM_CACHE_DIR", str(_HF / "miopen" / "kernels"))
+_env_default("TORCHINDUCTOR_CACHE_DIR", str(_HF / "torch_inductor"))
+_env_default("TRITON_CACHE_DIR", str(_HF / "triton"))
+_env_default("MIOPEN_FIND_MODE", "1")
+_env_default("MIOPEN_LOG_LEVEL", "0")
+_env_default("MIOPEN_ENABLE_LOGGING", "0")
+_env_default("AMD_LOG_LEVEL", "0")
+_env_default("TORCH_BLAS_PREFER_HIPBLASLT", "1")
+_env_default("HSA_ENABLE_SDMA", "1")
+_env_default("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+_env_default("PYTORCH_CUDA_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
+_env_default("PYTORCH_HIP_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
+
 if {repr(bool(hsa_override))}:
-    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", {repr(hsa_override)})
+    _env_default("HSA_OVERRIDE_GFX_VERSION", {repr(hsa_override)})
+elif os.environ.get("HSA_OVERRIDE_GFX_VERSION", "") == "":
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
 
 _hermetic_bins = [
     str(_PY if sys.platform == "win32" else _PY / "bin"),
@@ -2037,7 +2034,9 @@ _hermetic_bins = [
     str(_BIN / "sysroot" / "bin"),
 ]
 _cur_path = os.environ.get("PATH", "")
-os.environ["PATH"] = os.pathsep.join(_hermetic_bins + ([_cur_path] if _cur_path else []))
+os.environ["PATH"] = os.pathsep.join(
+    _hermetic_bins + ([_cur_path] if _cur_path else [])
+)
 
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -2073,7 +2072,7 @@ def main() -> None:
         "--python",
         type=str,
         default=None,
-        help="Target Python version override (e.g. 3.12.8 or 3.14.7)",
+        help="Target Python version override (e.g. 3.12.8 or 3.14.10)",
     )
     parser.add_argument(
         "-f",
@@ -2087,7 +2086,6 @@ def main() -> None:
         help="Purge all hydrated toolchains, sources, and caches",
     )
     args, _ = parser.parse_known_args()
-
     if args.clean:
         clean_hydration()
         return
@@ -2106,7 +2104,7 @@ def main() -> None:
             f"Detaching from host Python ({sys.version.split()[0]}). Trampolining into hermetic runtime: {target_exe}"
         )
         isolated_env = get_isolated_env()
-        cmd = [str(target_exe), "-I", str(Path(__file__).resolve())] + sys.argv[1:]
+        cmd = [str(target_exe), str(Path(__file__).resolve())] + sys.argv[1:]
         res = subprocess.run(cmd, env=isolated_env)
         sys.exit(res.returncode)
 

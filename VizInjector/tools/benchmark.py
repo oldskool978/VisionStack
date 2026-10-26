@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -21,21 +22,15 @@ if (
     HERMETIC_PYTHON_EXE.exists()
     and Path(sys.executable).resolve() != HERMETIC_PYTHON_EXE.resolve()
 ):
+    tramp_env = os.environ.copy()
+    tramp_env["PYTHONHOME"] = str(BIN_DIR / "python")
+    tramp_env["ROCM_PATH"] = str(BIN_DIR / "python")
     respawn_cmd = [
         str(HERMETIC_PYTHON_EXE.resolve()),
-        "-I",
         str(Path(__file__).resolve()),
     ] + sys.argv[1:]
-    res = subprocess.run(respawn_cmd)
+    res = subprocess.run(respawn_cmd, env=tramp_env, check=False)
     sys.exit(res.returncode)
-
-os.environ["HSA_OVERRIDE_GFX_VERSION"] = "12.0.0"
-os.environ["ROCM_PATH"] = str(BIN_DIR / "python")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TORCH_BLAS_PREFER_HIPBLASLT"] = "1"
-os.environ["MIOPEN_FIND_MODE"] = "2"
-os.environ["MIOPEN_LOG_LEVEL"] = "0"
-os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -130,7 +125,6 @@ def benchmark_1_radiometric_photon_conservation(
     lin_hi[..., 2] = 0.5 + 0.48 * np.sin(90.0 * (xx**2 - yy**2))
 
     gt_lin_lo = lin_hi.reshape(512, 2, 512, 2, 3).mean(axis=(1, 3))
-
     srgb_hi_u8 = np.clip(np.round(linear_to_srgb_np(lin_hi) * 255.0), 0, 255).astype(
         np.uint8
     )
@@ -206,8 +200,8 @@ def benchmark_2_geometric_isotropy_and_dual_pathway(
     r2 = (xx - cx) ** 2 + (yy - cy) ** 2
     src_rgb = np.zeros((h_in, w_in, 3), dtype=np.uint8)
     src_rgb[r2 <= (220.0**2)] = 255
-
     pil_src = Image.fromarray(src_rgb, mode="RGB")
+
     up_vae, _, _ = upstream_pil_condition(pil_src, 1024, 1024)
     up_mask = (up_vae[0, 0].numpy() > 0.0).astype(np.float64)
     u_ys, u_xs = np.nonzero(up_mask)
@@ -439,19 +433,28 @@ def benchmark_5_vae_roundtrip_and_subphase(
     viz_rec = vae.decode_packed_latents(viz_b.packed_latents)
     _, viz_telem = client.postprocess_to_pil(viz_rec)
 
+    up_sharp = float(up_telem[0].laplacian_sharpness)
+    up_ent = float(up_telem[0].shannon_entropy_bits)
+    viz_sharp = float(viz_telem[0].laplacian_sharpness)
+    viz_ent = float(viz_telem[0].shannon_entropy_bits)
+
+    del up_vae_in, up_lat, up_rec, viz_rec, viz_b
+    client._local_vae = None
+    del vae
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
     print(
-        f"  [Upstream -> Flux2VAE  ] Decoded Sharpness = {up_telem[0].laplacian_sharpness:6.4f} | Entropy = {up_telem[0].shannon_entropy_bits:5.3f} bits"
+        f"  [Upstream -> Flux2VAE  ] Decoded Sharpness = {up_sharp:6.4f} | Entropy = {up_ent:5.3f} bits"
     )
     print(
-        f"  [VizInjector -> Flux2VAE] Decoded Sharpness = {viz_telem[0].laplacian_sharpness:6.4f} | Entropy = {viz_telem[0].shannon_entropy_bits:5.3f} bits"
+        f"  [VizInjector -> Flux2VAE] Decoded Sharpness = {viz_sharp:6.4f} | Entropy = {viz_ent:5.3f} bits"
     )
     return {
-        "upstream_decoded_sharpness": round(
-            up_telem[0].laplacian_sharpness, 4
-        ),
-        "vizinjector_decoded_sharpness": round(
-            viz_telem[0].laplacian_sharpness, 4
-        ),
+        "upstream_decoded_sharpness": round(up_sharp, 4),
+        "vizinjector_decoded_sharpness": round(viz_sharp, 4),
     }
 
 
@@ -499,7 +502,6 @@ def benchmark_6_compute_throughput(
     b_vk.packed_latents = torch.randn((1, 128, 64, 64), dtype=torch.float32)
     b_vk.vit_embeds = torch.randn((576, 4096), dtype=torch.bfloat16)
     vizj_t2 = client.save_vizj(b_vk, tier=VIZJ_TIER_DUAL_LATENT, use_bf16=True)
-
     t0 = time.perf_counter()
     for _ in range(iters * 5):
         _ = client.load_vizj_bytes(vizj_t2)
@@ -542,35 +544,35 @@ def main() -> None:
         "        VIZINJECTOR VS. UPSTREAM PARADIGM: QUALITATIVE & COMPUTE SUPREMACY BENCHMARK"
     )
     print("=" * 90)
-
     client = VizInjectorClient(prefer_vulkan=True)
-    report: Dict[str, Any] = {
-        "backend": client.backend_name,
-        "vulkan_active": client.vulkan_active,
-        "suites": {},
-    }
-
-    report["suites"]["radiometric"] = benchmark_1_radiometric_photon_conservation(
-        client
-    )
-    report["suites"]["isotropy"] = benchmark_2_geometric_isotropy_and_dual_pathway(
-        client
-    )
-    report["suites"]["alpha_cutout"] = benchmark_3_cutout_alpha_border_fidelity(
-        client
-    )
-    report["suites"]["control_and_masks"] = benchmark_4_control_maps_and_masks(
-        client
-    )
-    report["suites"]["vae_roundtrip"] = benchmark_5_vae_roundtrip_and_subphase(
-        client
-    )
-    report["suites"]["throughput"] = benchmark_6_compute_throughput(client)
+    try:
+        report: Dict[str, Any] = {
+            "backend": client.backend_name,
+            "vulkan_active": client.vulkan_active,
+            "suites": {},
+        }
+        report["suites"]["radiometric"] = benchmark_1_radiometric_photon_conservation(
+            client
+        )
+        report["suites"]["isotropy"] = benchmark_2_geometric_isotropy_and_dual_pathway(
+            client
+        )
+        report["suites"]["alpha_cutout"] = benchmark_3_cutout_alpha_border_fidelity(
+            client
+        )
+        report["suites"]["control_and_masks"] = benchmark_4_control_maps_and_masks(
+            client
+        )
+        report["suites"]["vae_roundtrip"] = benchmark_5_vae_roundtrip_and_subphase(
+            client
+        )
+        report["suites"]["throughput"] = benchmark_6_compute_throughput(client)
+    finally:
+        client.close()
 
     out_file = Path(args.json_out)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
     print("\n" + "=" * 90)
     print(f"[+] BENCHMARK COMPLETE. Full telemetry written to: {out_file}")
     print("=" * 90)

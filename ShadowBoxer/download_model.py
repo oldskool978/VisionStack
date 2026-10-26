@@ -32,12 +32,9 @@ def _resolve_cache_dir() -> Path:
     return (ROOT_DIR / ".hf_cache").resolve()
 
 
-os.environ.pop("TORCH_BLAS_PREFER_HIPBLASLT", None)
 CACHE_DIR = _resolve_cache_dir()
-os.environ["HF_HOME"] = str(CACHE_DIR)
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR / "hub")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("HF_HOME", str(CACHE_DIR))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(CACHE_DIR / "hub"))
 
 import torch
 from huggingface_hub import snapshot_download
@@ -85,13 +82,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+for _noisy_logger in ("httpx", "httpx2", "httpcore", "httpcore2", "urllib3"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 MODEL_REGISTRY: Dict[str, str] = {
     "sft": "OpenMOSS-Team/MOSS-Image-SFT",
     "base": "OpenMOSS-Team/MOSS-Image-Base",
 }
 EDIT_LORA_REPO_ID = "chinoll/Moss-Image-Edit"
-
 SHARED_SUBSYSTEMS: Tuple[str, ...] = (
     "text_encoder",
     "vae",
@@ -222,7 +220,8 @@ def inspect_shard_header(
     preserved_count = 0
     has_non_bf16_quantizable = False
 
-    with safe_open(str(sf_path), framework="pt", device="cpu") as f:
+    resolved_sf = sf_path.resolve(strict=True)
+    with safe_open(str(resolved_sf), framework="pt", device="cpu") as f:
         for key in f.keys():
             if is_dead_key(key):
                 needs_modification = True
@@ -280,7 +279,6 @@ def purge_unreferenced_artifacts(snapshot_path: Path) -> None:
     assets_dir = snapshot_path / "assets"
     if assets_dir.exists() and assets_dir.is_dir():
         shutil.rmtree(assets_dir, ignore_errors=True)
-
     safetensor_stems = {p.stem for p in snapshot_path.rglob("*.safetensors")}
     for bin_file in list(snapshot_path.rglob("*.bin")) + list(
         snapshot_path.rglob("*.pt")
@@ -336,7 +334,8 @@ def condition_subsystem_shards(
                 subsystem_dir.name,
                 sf_path.name,
             )
-            state_dict = load_safetensors(str(sf_path), device="cpu")
+            resolved_sf = sf_path.resolve(strict=True)
+            state_dict = load_safetensors(str(resolved_sf), device="cpu")
             processed_dict: Dict[str, torch.Tensor] = {}
             shard_modified = False
 
@@ -355,26 +354,34 @@ def condition_subsystem_shards(
                     preserved_count += 1
                     continue
 
-                if target_dtype is not None and is_quantizable(key, sf_path, tensor):
-                    if tensor.dtype != target_dtype:
-                        if quant_engine == "dto_ca" and HAS_REFINERY:
-                            refined = refineTensor(
-                                origin_tensor=tensor,
-                                target_dtype=target_dtype,
-                                fp8_dtypes=FP8_DTYPES,
-                                dtype_map=DTYPE_LOOKUP,
-                                original_on_disk_dtype=tensor.dtype,
-                                target_device=compute_device,
-                            )
-                            processed_dict[key] = refined.cpu()
+                if is_quantizable(key, sf_path, tensor):
+                    if target_dtype is not None:
+                        if tensor.dtype != target_dtype:
+                            if quant_engine == "dto_ca" and HAS_REFINERY:
+                                refined = refineTensor(
+                                    origin_tensor=tensor,
+                                    target_dtype=target_dtype,
+                                    fp8_dtypes=FP8_DTYPES,
+                                    dtype_map=DTYPE_LOOKUP,
+                                    original_on_disk_dtype=tensor.dtype,
+                                    target_device=compute_device,
+                                )
+                                processed_dict[key] = refined.cpu()
+                            else:
+                                processed_dict[key] = quantize_clean_rtn(
+                                    tensor, target_dtype, compute_device
+                                )
+                            shard_modified = True
                         else:
-                            processed_dict[key] = quantize_clean_rtn(
-                                tensor, target_dtype, compute_device
-                            )
-                        shard_modified = True
+                            processed_dict[key] = tensor
+                        quantized_count += 1
                     else:
-                        processed_dict[key] = tensor
-                    quantized_count += 1
+                        if tensor.dtype != torch.bfloat16:
+                            processed_dict[key] = tensor.to(torch.bfloat16)
+                            shard_modified = True
+                        else:
+                            processed_dict[key] = tensor
+                        preserved_count += 1
                 else:
                     processed_dict[key] = tensor
                     preserved_count += 1
@@ -382,15 +389,20 @@ def condition_subsystem_shards(
             if shard_modified:
                 tmp_path = sf_path.with_suffix(".safetensors.tmp")
                 save_safetensors(processed_dict, str(tmp_path))
+                if sf_path.is_symlink():
+                    sf_path.unlink(missing_ok=True)
                 tmp_path.replace(sf_path)
 
             del state_dict, processed_dict
             gc.collect()
 
-    if compute_device.type == "cuda":
-        torch.cuda.synchronize()
     if HAS_REFINERY:
         clear_refinery_cache()
+    if compute_device.type == "cuda" and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
     return quantized_count, preserved_count, stripped_count
 
 
@@ -400,14 +412,19 @@ def link_or_copy_shared_subsystem(src_sub: Path, dst_sub: Path) -> int:
         return 0
     dst_sub.mkdir(parents=True, exist_ok=True)
     for src_file in src_sub.rglob("*"):
-        if not src_file.is_file():
+        if src_file.is_dir():
             continue
-        real_src = src_file.resolve()
+        try:
+            real_src = src_file.resolve(strict=True)
+        except OSError:
+            continue
         if not real_src.is_file():
             continue
+
         rel = src_file.relative_to(src_sub)
         dst_file = dst_sub / rel
         dst_file.parent.mkdir(parents=True, exist_ok=True)
+
         if dst_file.exists() or dst_file.is_symlink():
             try:
                 if (
@@ -417,9 +434,13 @@ def link_or_copy_shared_subsystem(src_sub: Path, dst_sub: Path) -> int:
                 ):
                     linked_files += 1
                     continue
-                dst_file.unlink(missing_ok=True)
             except OSError:
                 pass
+            try:
+                dst_file.unlink()
+            except OSError:
+                pass
+
         try:
             os.link(real_src, dst_file)
         except OSError:
@@ -464,20 +485,11 @@ def restore_pristine_shards_if_needed(
             manifest_mismatch = True
 
     unlinked_count = 0
-    for sub_name in ("transformer", "text_encoder", "vae"):
+    for sub_name in ("transformer", "text_encoder"):
         sub_dir = snap / sub_name
         if not sub_dir.is_dir():
             continue
         for sf_path in sorted(sub_dir.glob("*.safetensors")):
-            if sf_path.is_symlink() and not sf_path.exists():
-                try:
-                    sf_path.unlink(missing_ok=True)
-                    unlinked_count += 1
-                except OSError:
-                    pass
-                continue
-            if sub_name == "vae":
-                continue
             try:
                 _, _, _, has_non_bf16 = inspect_shard_header(
                     sf_path, sub_name, target_dtype
@@ -486,15 +498,14 @@ def restore_pristine_shards_if_needed(
                 has_non_bf16 = True
             if has_non_bf16 and (manifest_mismatch or target_dtype is None):
                 try:
-                    sf_path.unlink(missing_ok=True)
+                    sf_path.unlink()
                     unlinked_count += 1
                 except OSError:
                     pass
-
     if unlinked_count > 0:
         manifest_file.unlink(missing_ok=True)
         logging.info(
-            "Unlinked %d stale or quantized shard(s) in %s to restore pristine BF16 blobs.",
+            "Unlinked %d previously quantized shard(s) in %s to restore pristine BF16 blobs.",
             unlinked_count,
             repo_id,
         )
@@ -532,9 +543,9 @@ def find_donor_snapshot(
                 and (snap / "vae").is_dir()
             ):
                 te_shards = sorted((snap / "text_encoder").glob("*.safetensors"))
-                if len(te_shards) == 4 and all(s.resolve().is_file() for s in te_shards):
+                if len(te_shards) == 4 and all(s.exists() for s in te_shards):
                     needs_mod, _, _, _ = inspect_shard_header(
-                        te_shards[0].resolve(), "text_encoder", target_dtype
+                        te_shards[0], "text_encoder", target_dtype
                     )
                     if not needs_mod:
                         return snap
@@ -734,7 +745,6 @@ def prompt_acquisition_menu() -> Tuple[str, str, str, str, bool]:
             print("-" * 84)
             e_choice = input("Select quantization engine [1-2] (Default: 2): ").strip()
             quant_engine = "clean_rtn" if e_choice == "1" else "dto_ca"
-
         print("\n" + "-" * 84)
         print(" [1] GPU (CUDA/ROCm) - Hardware-accelerated tensor conditioning")
         print(" [2] CPU (System RAM)- Zero VRAM allocation execution")

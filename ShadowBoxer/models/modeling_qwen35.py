@@ -264,19 +264,57 @@ def _causal_conv1d_fn(
 def _solve_unit_lower_triangular(
     ut_system: torch.Tensor, rhs: torch.Tensor
 ) -> torch.Tensor:
-    try:
-        return torch.linalg.solve_triangular(
-            ut_system, rhs, upper=False, unitriangular=True
-        )
-    except Exception:
-        chunk_size = ut_system.shape[-1]
+    n = ut_system.shape[-1]
+    if n <= 16 or (n & (n - 1)) != 0:
         mat = -ut_system.tril(-1)
-        for i in range(1, chunk_size):
+        for i in range(1, n):
             row = mat[..., i, :i].clone()
             sub = mat[..., :i, :i].clone()
             mat[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-        mat = mat + torch.eye(chunk_size, dtype=mat.dtype, device=mat.device)
+        mat = mat + torch.eye(n, dtype=ut_system.dtype, device=ut_system.device)
         return mat @ rhs
+
+    block_size = 16
+    num_blocks = n // block_size
+    batch_shape = ut_system.shape[:-2]
+    u_blocks = ut_system.reshape(
+        *batch_shape, num_blocks, block_size, num_blocks, block_size
+    )
+    u_diag = u_blocks.diagonal(dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
+    mat_diag = -u_diag.tril(-1)
+    for i in range(1, block_size):
+        row = mat_diag[..., i, :i].clone()
+        sub = mat_diag[..., :i, :i].clone()
+        mat_diag[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    inv_blocks = mat_diag + torch.eye(
+        block_size, dtype=ut_system.dtype, device=ut_system.device
+    )
+
+    cur_size = block_size
+    cur_num = num_blocks
+    while cur_num > 1:
+        half_num = cur_num // 2
+        inv_reshaped = inv_blocks.reshape(
+            *batch_shape, half_num, 2, cur_size, cur_size
+        )
+        t11 = inv_reshaped[..., 0, :, :]
+        t22 = inv_reshaped[..., 1, :, :]
+
+        u_part = ut_system.reshape(
+            *batch_shape, half_num, 2, cur_size, half_num, 2, cur_size
+        )
+        u_sub = u_part[..., 1, :, :, 0, :]
+        u21 = u_sub.diagonal(dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
+        t21 = -(t22 @ (u21 @ t11))
+
+        top = torch.cat([t11, torch.zeros_like(t11)], dim=-1)
+        bot = torch.cat([t21, t22], dim=-1)
+        inv_blocks = torch.cat([top, bot], dim=-2)
+        cur_size *= 2
+        cur_num = half_num
+
+    mat = inv_blocks.squeeze(-3)
+    return mat @ rhs
 
 
 def _chunk_gated_delta_rule(
@@ -311,7 +349,6 @@ def _chunk_gated_delta_rule(
         value = F.pad(value, (0, 0, 0, pad_size))
         beta = F.pad(beta, (0, pad_size))
         decay = F.pad(decay, (0, pad_size))
-
     total_sequence_length = sequence_length + pad_size
     num_chunks = total_sequence_length // chunk_size
 
@@ -329,6 +366,7 @@ def _chunk_gated_delta_rule(
     cum_decay = decay.cumsum(dim=3)
     del decay
     exp_cum_decay = cum_decay.exp()
+
     pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
     pairwise_decay = pairwise_decay.masked_fill(
         strictly_upper_mask, float("-inf")
@@ -341,6 +379,7 @@ def _chunk_gated_delta_rule(
 
     decayed_k_beta = k_beta * exp_cum_decay.unsqueeze(-1)
     del k_beta
+
     rhs_combined = torch.cat([v_beta, decayed_k_beta], dim=-1)
     del v_beta, decayed_k_beta
     solved_combined = _solve_unit_lower_triangular(ut_system, rhs_combined)
@@ -669,7 +708,6 @@ class Qwen3_5DecoderLayer(nn.Module):
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
         elif self.block_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
-
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -687,6 +725,7 @@ class Qwen3_5DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         if self.block_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states, attention_mask=linear_mask)
         else:
@@ -695,8 +734,8 @@ class Qwen3_5DecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 attention_mask=full_attn_mask,
             )
-        hidden_states = residual + hidden_states
 
+        hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -894,7 +933,6 @@ class Qwen3_5VisionAttention(nn.Module):
                 torch.cat(attn_outputs, dim=1).reshape(seq_length, -1).contiguous()
             )
         del query_states, key_states, value_states
-
         return _linear(self.proj, attn_output)
 
 
@@ -935,7 +973,6 @@ class Qwen3_5VisionModel(nn.Module):
         )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(config)
-
         self.blocks = nn.ModuleList(
             [Qwen3_5VisionBlock(config) for _ in range(config.depth)]
         )
@@ -1135,7 +1172,6 @@ class Qwen3_5TextModel(nn.Module):
     ) -> Qwen3_5ModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1281,7 +1317,6 @@ class Qwen3_5Model(nn.Module):
                 position_ids[:, batch_idx, valid_mask] = llm_pos
             else:
                 position_ids[:, batch_idx] = llm_pos
-
             mrope_deltas.append(llm_pos.max() + 1 - len(cur_ids))
 
         deltas_tensor = torch.tensor(mrope_deltas, device=input_ids.device).unsqueeze(1)
