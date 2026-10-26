@@ -139,7 +139,7 @@ def resolve_dynamic_python_matrix() -> dict[str, str]:
     try:
         req = urllib.request.Request(
             "https://www.python.org/ftp/python/",
-            headers={"User-Agent": "ShadowBoxVenv/2.0"},
+            headers={"User-Agent": "ShadowBoxVenv/3.0"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
@@ -168,7 +168,7 @@ def resolve_dynamic_python_matrix() -> dict[str, str]:
                 probe_url = f"https://www.python.org/ftp/python/{cand}/python-{cand}-embed-amd64.zip"
                 head_req = urllib.request.Request(
                     probe_url,
-                    headers={"User-Agent": "ShadowBoxVenv/2.0"},
+                    headers={"User-Agent": "ShadowBoxVenv/3.0"},
                     method="HEAD",
                 )
                 try:
@@ -183,95 +183,7 @@ def resolve_dynamic_python_matrix() -> dict[str, str]:
     return matrix
 
 
-def build_hermetic_env(target_sandbox: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    passthrough_keys = (
-        "SYSTEMROOT",
-        "SYSTEMDRIVE",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-        "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",
-        "OS",
-        "USERNAME",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "WT_SESSION",
-        "TERM",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    )
-    for k in passthrough_keys:
-        if k in os.environ:
-            env[k] = os.environ[k]
-
-    if os.name == "nt":
-        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
-        base_os_paths = [
-            str(target_sandbox),
-            str(target_sandbox / "Scripts"),
-            os.path.join(sys_root, "System32"),
-            sys_root,
-            os.path.join(sys_root, "System32", "Wbem"),
-            os.path.join(sys_root, "System32", "WindowsPowerShell", "v1.0"),
-        ]
-        env["PATH"] = ";".join(base_os_paths)
-        env["PIP_CONFIG_FILE"] = "NUL"
-    else:
-        base_os_paths = [
-            str(target_sandbox / "bin"),
-            str(target_sandbox),
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]
-        env["PATH"] = ":".join(base_os_paths)
-        env["PIP_CONFIG_FILE"] = "/dev/null"
-
-    defaults = {
-        "PYTHONHOME": str(target_sandbox),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1",
-        "PIP_NO_USER": "1",
-        "PIP_USER": "0",
-        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-        "TEMP": str(TMP_DIR),
-        "TMP": str(TMP_DIR),
-        "TMPDIR": str(TMP_DIR),
-        "PIP_CACHE_DIR": str(PIP_CACHE_DIR),
-        "LOCALAPPDATA": str(LOCAL_APPDATA_DIR),
-        "APPDATA": str(ROAMING_APPDATA_DIR),
-        "XDG_CACHE_HOME": str(CACHE_DIR),
-        "XDG_CONFIG_HOME": str(ROOT_DIR / ".config"),
-        "XDG_DATA_HOME": str(ROOT_DIR / ".local" / "share"),
-        "HF_HOME": str(HF_CACHE_DIR),
-        "TORCH_HOME": str(HF_CACHE_DIR / "torch"),
-        "TRANSFORMERS_CACHE": str(HF_CACHE_DIR / "transformers"),
-        "HUGGINGFACE_HUB_CACHE": str(HF_CACHE_DIR / "hub"),
-        "MIOPEN_USER_DB_PATH": str(HF_CACHE_DIR / "miopen" / "db"),
-        "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
-        "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
-        "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
-        "MIOPEN_FIND_MODE": "1",
-        "MIOPEN_LOG_LEVEL": "0",
-        "MIOPEN_ENABLE_LOGGING": "0",
-        "AMD_LOG_LEVEL": "0",
-        "TORCH_BLAS_PREFER_HIPBLASLT": "1",
-        "HSA_ENABLE_SDMA": "1",
-        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        "PYTORCH_CUDA_ALLOC_CONF": ALLOC_CONF_POLICY,
-        "PYTORCH_HIP_ALLOC_CONF": ALLOC_CONF_POLICY,
-        "ROCM_PATH": str(target_sandbox),
-    }
-    for k, v in defaults.items():
-        env[k] = os.environ.get(k) or v
-    return env
-
-
-def safe_subprocess(cmd: list) -> str:
+def safe_subprocess(cmd: list, env: dict[str, str] | None = None) -> str:
     try:
         kwargs = (
             {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -279,7 +191,12 @@ def safe_subprocess(cmd: list) -> str:
             else {}
         )
         return subprocess.check_output(
-            cmd, stderr=subprocess.DEVNULL, timeout=10, text=True, **kwargs
+            cmd,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            text=True,
+            env=env,
+            **kwargs,
         ).strip()
     except Exception:
         return ""
@@ -567,6 +484,223 @@ def resolve_hardware_matrix() -> tuple[str, str]:
     return "CPU", ""
 
 
+def resolve_rocm_sdk_layout(
+    target_sandbox: Path,
+    executable: Path | None = None,
+    isolated_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    site_packages = (
+        target_sandbox / "Lib" / "site-packages"
+        if os.name == "nt"
+        else next(target_sandbox.glob("lib/python*/site-packages"), None)
+    )
+    rocm_root: Path | None = None
+    rocm_bin: Path | None = None
+    rocm_cmake: Path | None = None
+
+    if executable is not None and executable.is_file():
+        q_root = safe_subprocess(
+            [str(executable), "-I", "-m", "rocm_sdk", "path", "--root"],
+            env=isolated_env,
+        )
+        if q_root and Path(q_root).is_dir():
+            rocm_root = Path(q_root).resolve()
+        q_bin = safe_subprocess(
+            [str(executable), "-I", "-m", "rocm_sdk", "path", "--bin"],
+            env=isolated_env,
+        )
+        if q_bin and Path(q_bin).is_dir():
+            rocm_bin = Path(q_bin).resolve()
+        q_cmake = safe_subprocess(
+            [str(executable), "-I", "-m", "rocm_sdk", "path", "--cmake"],
+            env=isolated_env,
+        )
+        if q_cmake and Path(q_cmake).is_dir():
+            rocm_cmake = Path(q_cmake).resolve()
+
+    if site_packages is not None and site_packages.is_dir():
+        devel_dir = site_packages / "_rocm_sdk_devel"
+        core_dir = site_packages / "_rocm_sdk_core"
+        if rocm_root is None:
+            if (devel_dir / "bin").is_dir():
+                rocm_root = devel_dir.resolve()
+            elif (core_dir / "bin").is_dir():
+                rocm_root = core_dir.resolve()
+        if rocm_root is not None:
+            if rocm_bin is None and (rocm_root / "bin").is_dir():
+                rocm_bin = (rocm_root / "bin").resolve()
+            if rocm_cmake is None and (rocm_root / "lib" / "cmake").is_dir():
+                rocm_cmake = (rocm_root / "lib" / "cmake").resolve()
+
+    if rocm_root is None:
+        rocm_root = target_sandbox.resolve()
+
+    llvm_bin = rocm_root / "lib" / "llvm" / "bin"
+    device_lib = rocm_root / "lib" / "llvm" / "amdgcn" / "bitcode"
+    miopen_sys_db = rocm_root / "share" / "miopen" / "db"
+
+    extra_bins: list[str] = []
+    if rocm_bin is not None and rocm_bin.is_dir():
+        extra_bins.append(str(rocm_bin))
+    if llvm_bin.is_dir():
+        extra_bins.append(str(llvm_bin.resolve()))
+    if site_packages is not None and site_packages.is_dir():
+        for pkg_dir in sorted(site_packages.glob("_rocm_sdk_*")):
+            b_dir = pkg_dir / "bin"
+            if b_dir.is_dir():
+                b_str = str(b_dir.resolve())
+                if b_str not in extra_bins:
+                    extra_bins.append(b_str)
+
+    return {
+        "rocm_root": str(rocm_root),
+        "rocm_bin": str(rocm_bin) if rocm_bin is not None else "",
+        "rocm_cmake": str(rocm_cmake) if rocm_cmake is not None else "",
+        "llvm_bin": str(llvm_bin.resolve()) if llvm_bin.is_dir() else "",
+        "device_lib": str(device_lib.resolve()) if device_lib.is_dir() else "",
+        "miopen_sys_db": (
+            str(miopen_sys_db.resolve()) if miopen_sys_db.is_dir() else ""
+        ),
+        "extra_bins": os.pathsep.join(extra_bins),
+    }
+
+
+def build_hermetic_env(
+    target_sandbox: Path,
+    profile: str = "",
+    llvm_target: str = "",
+    executable: Path | None = None,
+) -> dict[str, str]:
+    if not profile and not llvm_target:
+        profile, llvm_target = resolve_hardware_matrix()
+
+    rocm_layout = resolve_rocm_sdk_layout(target_sandbox, executable=executable)
+    rocm_extra_bins = [
+        p for p in rocm_layout["extra_bins"].split(os.pathsep) if p
+    ]
+
+    env: dict[str, str] = {}
+    passthrough_keys = (
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "OS",
+        "USERNAME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "WT_SESSION",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    for k in passthrough_keys:
+        if k in os.environ:
+            env[k] = os.environ[k]
+
+    if os.name == "nt":
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        base_os_paths = (
+            [
+                str(target_sandbox),
+                str(target_sandbox / "Scripts"),
+            ]
+            + rocm_extra_bins
+            + [
+                os.path.join(sys_root, "System32"),
+                sys_root,
+                os.path.join(sys_root, "System32", "Wbem"),
+                os.path.join(sys_root, "System32", "WindowsPowerShell", "v1.0"),
+            ]
+        )
+        env["PATH"] = ";".join(base_os_paths)
+        env["PIP_CONFIG_FILE"] = "NUL"
+    else:
+        base_os_paths = (
+            [
+                str(target_sandbox / "bin"),
+                str(target_sandbox),
+            ]
+            + rocm_extra_bins
+            + [
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            ]
+        )
+        env["PATH"] = ":".join(base_os_paths)
+        env["PIP_CONFIG_FILE"] = "/dev/null"
+
+    rocm_family = (
+        AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
+        if llvm_target
+        else ""
+    )
+
+    defaults = {
+        "PYTHONHOME": str(target_sandbox),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "PIP_NO_USER": "1",
+        "PIP_USER": "0",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "TEMP": str(TMP_DIR),
+        "TMP": str(TMP_DIR),
+        "TMPDIR": str(TMP_DIR),
+        "PIP_CACHE_DIR": str(PIP_CACHE_DIR),
+        "LOCALAPPDATA": str(LOCAL_APPDATA_DIR),
+        "APPDATA": str(ROAMING_APPDATA_DIR),
+        "XDG_CACHE_HOME": str(CACHE_DIR),
+        "XDG_CONFIG_HOME": str(ROOT_DIR / ".config"),
+        "XDG_DATA_HOME": str(ROOT_DIR / ".local" / "share"),
+        "HF_HOME": str(HF_CACHE_DIR),
+        "TORCH_HOME": str(HF_CACHE_DIR / "torch"),
+        "TRANSFORMERS_CACHE": str(HF_CACHE_DIR / "transformers"),
+        "HUGGINGFACE_HUB_CACHE": str(HF_CACHE_DIR / "hub"),
+        "TORCH_EXTENSIONS_DIR": str(HF_CACHE_DIR / "torch_extensions"),
+        "MIOPEN_USER_DB_PATH": str(HF_CACHE_DIR / "miopen" / "db"),
+        "MIOPEN_CUSTOM_CACHE_DIR": str(HF_CACHE_DIR / "miopen" / "kernels"),
+        "TORCHINDUCTOR_CACHE_DIR": str(HF_CACHE_DIR / "torch_inductor"),
+        "TRITON_CACHE_DIR": str(HF_CACHE_DIR / "triton"),
+        "MIOPEN_FIND_MODE": "1",
+        "MIOPEN_LOG_LEVEL": "0",
+        "MIOPEN_ENABLE_LOGGING": "0",
+        "AMD_LOG_LEVEL": "0",
+        "TORCH_BLAS_PREFER_HIPBLASLT": "1",
+        "HSA_ENABLE_SDMA": "1",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "PYTORCH_ALLOC_CONF": ALLOC_CONF_POLICY,
+        "PYTORCH_CUDA_ALLOC_CONF": ALLOC_CONF_POLICY,
+        "PYTORCH_HIP_ALLOC_CONF": ALLOC_CONF_POLICY,
+        "ROCM_PATH": rocm_layout["rocm_root"],
+        "ROCM_HOME": rocm_layout["rocm_root"],
+        "HIP_PATH": rocm_layout["rocm_root"],
+    }
+    if profile == "ROCM":
+        defaults["HIP_PLATFORM"] = "amd"
+        if llvm_target:
+            defaults["PYTORCH_ROCM_ARCH"] = llvm_target
+        if rocm_family:
+            defaults["ROCM_SDK_TARGET_FAMILY"] = rocm_family
+    if rocm_layout["llvm_bin"]:
+        defaults["HIP_CLANG_PATH"] = rocm_layout["llvm_bin"]
+    if rocm_layout["device_lib"]:
+        defaults["HIP_DEVICE_LIB_PATH"] = rocm_layout["device_lib"]
+    if rocm_layout["rocm_cmake"]:
+        defaults["CMAKE_PREFIX_PATH"] = rocm_layout["rocm_cmake"]
+    if rocm_layout["miopen_sys_db"]:
+        defaults["MIOPEN_SYSTEM_DB_PATH"] = rocm_layout["miopen_sys_db"]
+
+    for k, v in defaults.items():
+        env[k] = os.environ.get(k) or v
+    return env
+
+
 def fetch_runtime(version: str, target_dir: Path) -> Path:
     executable = (
         target_dir / "python.exe"
@@ -600,7 +734,7 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         if not archive_path.is_file():
             print_status(f"Streaming standalone Windows runtime ({version})...")
             ctx = urllib.request.Request(
-                url, headers={"User-Agent": "ShadowBoxVenv/2.0"}
+                url, headers={"User-Agent": "ShadowBoxVenv/3.0"}
             )
             with urllib.request.urlopen(ctx, timeout=60) as response, open(
                 archive_path, "wb"
@@ -640,7 +774,7 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
         if not archive_path.is_file():
             print_status(f"Streaming standalone POSIX runtime ({version})...")
             ctx = urllib.request.Request(
-                url, headers={"User-Agent": "ShadowBoxVenv/2.0"}
+                url, headers={"User-Agent": "ShadowBoxVenv/3.0"}
             )
             with urllib.request.urlopen(ctx, timeout=60) as response, open(
                 archive_path, "wb"
@@ -662,7 +796,7 @@ def fetch_runtime(version: str, target_dir: Path) -> Path:
     else:
         pip_url = "https://bootstrap.pypa.io/get-pip.py"
     pip_ctx = urllib.request.Request(
-        pip_url, headers={"User-Agent": "ShadowBoxVenv/2.0"}
+        pip_url, headers={"User-Agent": "ShadowBoxVenv/3.0"}
     )
     with urllib.request.urlopen(pip_ctx, timeout=60) as response, open(
         pip_bootstrapper, "wb"
@@ -904,11 +1038,36 @@ def stage_and_install_packages(
             inst_res.check_returncode()
 
 
+def initialize_rocm_sdk_devel(
+    executable: Path, isolated_env: dict[str, str], target_sandbox: Path
+) -> None:
+    site_packages = (
+        target_sandbox / "Lib" / "site-packages"
+        if os.name == "nt"
+        else next(target_sandbox.glob("lib/python*/site-packages"), None)
+    )
+    if site_packages is None or not (site_packages / "rocm_sdk").is_dir():
+        return
+    devel_dir = site_packages / "_rocm_sdk_devel"
+    if (devel_dir / "_devel.tar.xz").is_file() or not (devel_dir / "bin").is_dir():
+        print_status(
+            "Materializing TheRock rocm_sdk devel sysroot (rocm_sdk init)...",
+            "INFO",
+        )
+        subprocess.run(
+            [str(executable), "-I", "-m", "rocm_sdk", "init"],
+            env=isolated_env,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+
+
 def condition_pytorch_runtime(
     executable: Path,
     isolated_env: dict[str, str],
     profile: str,
     llvm_target: str,
+    target_sandbox: Path,
 ) -> str:
     print_status(
         f"Hardware Compute Architecture Locked: {profile} ({llvm_target or 'Generic'})",
@@ -932,6 +1091,9 @@ def condition_pytorch_runtime(
 
     if profile == "ROCM":
         family = AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
+        isolated_env["ROCM_SDK_TARGET_FAMILY"] = family
+        if llvm_target:
+            isolated_env["PYTORCH_ROCM_ARCH"] = llvm_target
         index_url = f"https://rocm.nightlies.amd.com/v2-staging/{family}/"
         print_status(f"Locking Sovereign Staging Nightly Index: {index_url}", "SUCCESS")
         if os.name == "nt":
@@ -950,13 +1112,7 @@ def condition_pytorch_runtime(
             index_url=index_url,
             use_pre=True,
         )
-        subprocess.run(
-            [str(executable), "-I", "-m", "rocm_sdk", "init"],
-            env=isolated_env,
-            stdin=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-        )
+        initialize_rocm_sdk_devel(executable, isolated_env, target_sandbox)
     elif profile.startswith("CUDA_"):
         cuda_urls = {
             "CUDA_13_2": "https://download.pytorch.org/whl/nightly/cu132",
@@ -1010,7 +1166,12 @@ def condition_pytorch_runtime(
     return hsa_override_used
 
 
-def inject_hermetic_sitecustomize(target_dir: Path, hsa_override: str = "") -> None:
+def inject_hermetic_sitecustomize(
+    target_dir: Path,
+    profile: str,
+    llvm_target: str,
+    hsa_override: str = "",
+) -> None:
     if os.name == "nt":
         site_packages_dirs = [target_dir / "Lib" / "site-packages"]
         for pth_file in target_dir.glob("*._pth"):
@@ -1030,6 +1191,12 @@ def inject_hermetic_sitecustomize(target_dir: Path, hsa_override: str = "") -> N
     else:
         site_packages_dirs = list((target_dir / "lib").glob("python*/site-packages"))
 
+    rocm_family = (
+        AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
+        if (profile == "ROCM" and llvm_target)
+        else ""
+    )
+
     sitecustomize_code = f"""from __future__ import annotations
 
 import os
@@ -1037,6 +1204,7 @@ from pathlib import Path
 import sys
 
 _HERE = Path(__file__).resolve()
+_SP_DIR = _HERE.parent
 _ENV_DIR = _HERE.parents[{2 if os.name == "nt" else 3}]
 _ROOT = _ENV_DIR.parent
 _HF = _ROOT / ".hf_cache"
@@ -1064,6 +1232,20 @@ def _env_default(key: str, val: str) -> None:
         os.environ[key] = val
 
 
+_ROCM_DEVEL = _SP_DIR / "_rocm_sdk_devel"
+_ROCM_CORE = _SP_DIR / "_rocm_sdk_core"
+if (_ROCM_DEVEL / "bin").is_dir():
+    _ROCM_ROOT = _ROCM_DEVEL.resolve()
+elif (_ROCM_CORE / "bin").is_dir():
+    _ROCM_ROOT = _ROCM_CORE.resolve()
+else:
+    _ROCM_ROOT = _ENV_DIR.resolve()
+
+_LLVM_BIN = _ROCM_ROOT / "lib" / "llvm" / "bin"
+_DEVICE_LIB = _ROCM_ROOT / "lib" / "llvm" / "amdgcn" / "bitcode"
+_ROCM_CMAKE = _ROCM_ROOT / "lib" / "cmake"
+_MIOPEN_SYS_DB = _ROCM_ROOT / "share" / "miopen" / "db"
+
 _env_default("PYTHONHOME", str(_ENV_DIR))
 _env_default("PYTHONNOUSERSITE", "1")
 _env_default("PYTHONUTF8", "1")
@@ -1080,7 +1262,26 @@ _env_default("APPDATA", str(_ROOT / ".appdata"))
 _env_default("XDG_CACHE_HOME", str(_CACHE))
 _env_default("XDG_CONFIG_HOME", str(_ROOT / ".config"))
 _env_default("XDG_DATA_HOME", str(_ROOT / ".local" / "share"))
-_env_default("ROCM_PATH", str(_ENV_DIR))
+
+_env_default("ROCM_PATH", str(_ROCM_ROOT))
+_env_default("ROCM_HOME", str(_ROCM_ROOT))
+_env_default("HIP_PATH", str(_ROCM_ROOT))
+if _LLVM_BIN.is_dir():
+    _env_default("HIP_CLANG_PATH", str(_LLVM_BIN))
+if _DEVICE_LIB.is_dir():
+    _env_default("HIP_DEVICE_LIB_PATH", str(_DEVICE_LIB))
+if _ROCM_CMAKE.is_dir():
+    _env_default("CMAKE_PREFIX_PATH", str(_ROCM_CMAKE))
+if _MIOPEN_SYS_DB.is_dir():
+    _env_default("MIOPEN_SYSTEM_DB_PATH", str(_MIOPEN_SYS_DB))
+
+if {repr(profile == "ROCM")}:
+    _env_default("HIP_PLATFORM", "amd")
+if {repr(bool(llvm_target))}:
+    _env_default("PYTORCH_ROCM_ARCH", {repr(llvm_target)})
+if {repr(bool(rocm_family))}:
+    _env_default("ROCM_SDK_TARGET_FAMILY", {repr(rocm_family)})
+
 _env_default("HF_HOME", str(_HF))
 _env_default("TORCH_HOME", str(_HF / "torch"))
 _env_default("TRANSFORMERS_CACHE", str(_HF / "transformers"))
@@ -1097,6 +1298,7 @@ _env_default("AMD_LOG_LEVEL", "0")
 _env_default("TORCH_BLAS_PREFER_HIPBLASLT", "1")
 _env_default("HSA_ENABLE_SDMA", "1")
 _env_default("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+_env_default("PYTORCH_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
 _env_default("PYTORCH_CUDA_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
 _env_default("PYTORCH_HIP_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
 
@@ -1109,6 +1311,14 @@ _env_bins = [
     str(_ENV_DIR if sys.platform == "win32" else _ENV_DIR / "bin"),
     str(_ENV_DIR / "Scripts" if sys.platform == "win32" else _ENV_DIR / "bin"),
 ]
+if (_ROCM_ROOT / "bin").is_dir():
+    _env_bins.append(str(_ROCM_ROOT / "bin"))
+if _LLVM_BIN.is_dir():
+    _env_bins.append(str(_LLVM_BIN))
+for _pkg_b in sorted(_SP_DIR.glob("_rocm_sdk_*/bin")):
+    if _pkg_b.is_dir() and str(_pkg_b) not in _env_bins:
+        _env_bins.append(str(_pkg_b))
+
 _cur_path = os.environ.get("PATH", "")
 for _b in reversed(_env_bins):
     if _b not in _cur_path:
@@ -1119,14 +1329,17 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
-    for _dll_dir in (
+    _dll_candidates = [
         _ENV_DIR,
         _ENV_DIR / "Library" / "bin",
+        _ROCM_ROOT / "bin",
+        _LLVM_BIN,
         _ROOT / "ShadowBoxer" / "vizinjector",
         _ROOT / "ShadowBoxer" / "viztoken",
         _ROOT / "vizinjector",
         _ROOT / "viztoken",
-    ):
+    ] + list(_SP_DIR.glob("_rocm_sdk_*/bin"))
+    for _dll_dir in _dll_candidates:
         if _dll_dir.is_dir():
             try:
                 os.add_dll_directory(str(_dll_dir.resolve()))
@@ -1141,7 +1354,11 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
 
 
 def generate_environment_anchors(
-    target_dir: Path, executable: Path, hsa_override: str = ""
+    target_dir: Path,
+    executable: Path,
+    profile: str,
+    llvm_target: str,
+    hsa_override: str = "",
 ) -> None:
     project_root = target_dir.parent
     rel_env_name = target_dir.name
@@ -1153,7 +1370,21 @@ def generate_environment_anchors(
     for p in (miopen_db, miopen_kernels, inductor_dir, triton_dir):
         p.mkdir(parents=True, exist_ok=True)
 
-    inject_hermetic_sitecustomize(target_dir, hsa_override=hsa_override)
+    inject_hermetic_sitecustomize(
+        target_dir, profile, llvm_target, hsa_override=hsa_override
+    )
+
+    base_env = build_hermetic_env(
+        target_dir, profile=profile, llvm_target=llvm_target, executable=executable
+    )
+    rocm_layout = resolve_rocm_sdk_layout(
+        target_dir, executable=executable, isolated_env=base_env
+    )
+    rocm_family = (
+        AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
+        if (profile == "ROCM" and llvm_target)
+        else ""
+    )
 
     hsa_bat_line = (
         f'set "HSA_OVERRIDE_GFX_VERSION={hsa_override}"'
@@ -1165,7 +1396,7 @@ def generate_environment_anchors(
     )
 
     hsa_ps1_line = (
-        f'$env:HSA_OVERRIDE_GFX_VERSION="{hsa_override}"'
+        f'$env:HSA_OVERRIDE_GFX_VERSION = "{hsa_override}"'
         if hsa_override
         else "Remove-Item Env:HSA_OVERRIDE_GFX_VERSION -ErrorAction SilentlyContinue"
     )
@@ -1186,7 +1417,14 @@ def generate_environment_anchors(
         else ""
     )
 
+    rocm_extra_bins = [
+        p for p in rocm_layout["extra_bins"].split(os.pathsep) if p
+    ]
+
     if os.name == "nt":
+        extra_bat_paths = (
+            ";".join(rocm_extra_bins) + ";" if rocm_extra_bins else ""
+        )
         bat_content = f"""@echo off
 title Hermetic Sandbox Environment
 color 0b
@@ -1204,7 +1442,17 @@ set "PIP_USER=0"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "PIP_CONFIG_FILE=NUL"
 set "PYTHONHOME=%ROOT_DIR%{rel_env_name}"
-set "PATH=%ROOT_DIR%{rel_env_name};%ROOT_DIR%{rel_env_name}\\Scripts;%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0"
+set "ROCM_PATH={rocm_layout["rocm_root"]}"
+set "ROCM_HOME={rocm_layout["rocm_root"]}"
+set "HIP_PATH={rocm_layout["rocm_root"]}"
+set "HIP_PLATFORM={"amd" if profile == "ROCM" else ""}"
+set "PYTORCH_ROCM_ARCH={llvm_target}"
+set "ROCM_SDK_TARGET_FAMILY={rocm_family}"
+set "HIP_CLANG_PATH={rocm_layout["llvm_bin"]}"
+set "HIP_DEVICE_LIB_PATH={rocm_layout["device_lib"]}"
+set "CMAKE_PREFIX_PATH={rocm_layout["rocm_cmake"]}"
+set "MIOPEN_SYSTEM_DB_PATH={rocm_layout["miopen_sys_db"]}"
+set "PATH=%PYTHONHOME%;%PYTHONHOME%\\Scripts;{extra_bat_paths}%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0"
 set "TEMP=%ROOT_DIR%.tmp"
 set "TMP=%ROOT_DIR%.tmp"
 set "TMPDIR=%ROOT_DIR%.tmp"
@@ -1227,18 +1475,17 @@ set "AMD_LOG_LEVEL=0"
 set "TORCH_BLAS_PREFER_HIPBLASLT=1"
 set "HSA_ENABLE_SDMA=1"
 set "CUBLAS_WORKSPACE_CONFIG=:4096:8"
+set "PYTORCH_ALLOC_CONF={ALLOC_CONF_POLICY}"
 set "PYTORCH_CUDA_ALLOC_CONF={ALLOC_CONF_POLICY}"
 set "PYTORCH_HIP_ALLOC_CONF={ALLOC_CONF_POLICY}"
-set "ROCM_PATH=%PYTHONHOME%"
 {hsa_bat_line}
 echo =======================================================================
 echo  Hermetic Sandbox Shell Active (CMD)
 echo  Interpreter: %PYTHONHOME%\\python.exe
+echo  TheRock ROCm SDK Root: %ROCM_PATH% (Arch: %PYTORCH_ROCM_ARCH% / Family: %ROCM_SDK_TARGET_FAMILY%)
 echo  Cache Anchor: %HF_HOME%
-echo  Local Temp: %TEMP%
-echo  Local Pip Cache: %PIP_CACHE_DIR%
 echo  MIOpen Cache: %MIOPEN_CUSTOM_CACHE_DIR% (Find Mode: %MIOPEN_FIND_MODE%)
-echo  Allocator Policy: %PYTORCH_HIP_ALLOC_CONF%
+echo  Allocator Policy: %PYTORCH_ALLOC_CONF%
 {hsa_echo_bat}
 echo  Isolation Status: Consolidated Launch Script + Non-Destructive sitecustomize.
 echo =======================================================================
@@ -1246,6 +1493,9 @@ cmd /k
 """
         (project_root / "launch_env.bat").write_text(bat_content, encoding="utf-8")
 
+        extra_ps1_paths = (
+            ";".join(rocm_extra_bins) + ";" if rocm_extra_bins else ""
+        )
         ps1_content = f"""# Hermetic Sandbox PowerShell Launcher
 $ErrorActionPreference = "Continue"
 $ROOT_DIR = $PSScriptRoot
@@ -1262,8 +1512,18 @@ $env:PIP_USER = "0"
 $env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
 $env:PIP_CONFIG_FILE = "NUL"
 $env:PYTHONHOME = "$ROOT_DIR\\{rel_env_name}"
+$env:ROCM_PATH = "{rocm_layout["rocm_root"]}"
+$env:ROCM_HOME = "{rocm_layout["rocm_root"]}"
+$env:HIP_PATH = "{rocm_layout["rocm_root"]}"
+$env:HIP_PLATFORM = "{"amd" if profile == "ROCM" else ""}"
+$env:PYTORCH_ROCM_ARCH = "{llvm_target}"
+$env:ROCM_SDK_TARGET_FAMILY = "{rocm_family}"
+$env:HIP_CLANG_PATH = "{rocm_layout["llvm_bin"]}"
+$env:HIP_DEVICE_LIB_PATH = "{rocm_layout["device_lib"]}"
+$env:CMAKE_PREFIX_PATH = "{rocm_layout["rocm_cmake"]}"
+$env:MIOPEN_SYSTEM_DB_PATH = "{rocm_layout["miopen_sys_db"]}"
 $sysRoot = $env:SystemRoot
-$env:PATH = "$ROOT_DIR\\{rel_env_name};$ROOT_DIR\\{rel_env_name}\\Scripts;$sysRoot\\System32;$sysRoot;$sysRoot\\System32\\Wbem;$sysRoot\\System32\\WindowsPowerShell\\v1.0"
+$env:PATH = "$env:PYTHONHOME;$env:PYTHONHOME\\Scripts;{extra_ps1_paths}$sysRoot\\System32;$sysRoot;$sysRoot\\System32\\Wbem;$sysRoot\\System32\\WindowsPowerShell\\v1.0"
 $env:TEMP = "$ROOT_DIR\\.tmp"
 $env:TMP = "$ROOT_DIR\\.tmp"
 $env:TMPDIR = "$ROOT_DIR\\.tmp"
@@ -1286,24 +1546,26 @@ $env:AMD_LOG_LEVEL = "0"
 $env:TORCH_BLAS_PREFER_HIPBLASLT = "1"
 $env:HSA_ENABLE_SDMA = "1"
 $env:CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+$env:PYTORCH_ALLOC_CONF = "{ALLOC_CONF_POLICY}"
 $env:PYTORCH_CUDA_ALLOC_CONF = "{ALLOC_CONF_POLICY}"
 $env:PYTORCH_HIP_ALLOC_CONF = "{ALLOC_CONF_POLICY}"
-$env:ROCM_PATH = "$env:PYTHONHOME"
 {hsa_ps1_line}
 Write-Host "=======================================================================" -ForegroundColor Cyan
 Write-Host " Hermetic Sandbox Active (PowerShell)" -ForegroundColor Cyan
 Write-Host " Interpreter: $env:PYTHONHOME\\python.exe"
+Write-Host " TheRock ROCm SDK Root: $env:ROCM_PATH (Arch: $env:PYTORCH_ROCM_ARCH / Family: $env:ROCM_SDK_TARGET_FAMILY)"
 Write-Host " Cache Anchor: $env:HF_HOME"
-Write-Host " Local Temp: $env:TEMP"
-Write-Host " Local Pip Cache: $env:PIP_CACHE_DIR"
 Write-Host " MIOpen Cache: $env:MIOPEN_CUSTOM_CACHE_DIR (Find Mode: $env:MIOPEN_FIND_MODE)"
-Write-Host " Allocator Policy: $env:PYTORCH_HIP_ALLOC_CONF"
+Write-Host " Allocator Policy: $env:PYTORCH_ALLOC_CONF"
 {hsa_echo_ps1}
 Write-Host " Isolation Status: Consolidated Launch Script + Non-Destructive sitecustomize." -ForegroundColor Green
 Write-Host "=======================================================================" -ForegroundColor Cyan
 """
         (project_root / "launch_env.ps1").write_text(ps1_content, encoding="utf-8")
     else:
+        extra_sh_paths = (
+            ":".join(rocm_extra_bins) + ":" if rocm_extra_bins else ""
+        )
         sh_content = f"""#!/usr/bin/env bash
 ROOT_DIR="$(cd -- "$(dirname -- "${{BASH_SOURCE[0]}}")" &> /dev/null && pwd)"
 unset PYTHONPATH
@@ -1319,7 +1581,17 @@ export PIP_USER="0"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
 export PIP_CONFIG_FILE="/dev/null"
 export PYTHONHOME="${{ROOT_DIR}}/{rel_env_name}"
-export PATH="${{ROOT_DIR}}/{rel_env_name}:${{ROOT_DIR}}/{rel_env_name}/bin:/usr/local/bin:/usr/bin:/bin"
+export ROCM_PATH="{rocm_layout["rocm_root"]}"
+export ROCM_HOME="{rocm_layout["rocm_root"]}"
+export HIP_PATH="{rocm_layout["rocm_root"]}"
+export HIP_PLATFORM="{"amd" if profile == "ROCM" else ""}"
+export PYTORCH_ROCM_ARCH="{llvm_target}"
+export ROCM_SDK_TARGET_FAMILY="{rocm_family}"
+export HIP_CLANG_PATH="{rocm_layout["llvm_bin"]}"
+export HIP_DEVICE_LIB_PATH="{rocm_layout["device_lib"]}"
+export CMAKE_PREFIX_PATH="{rocm_layout["rocm_cmake"]}"
+export MIOPEN_SYSTEM_DB_PATH="{rocm_layout["miopen_sys_db"]}"
+export PATH="${{PYTHONHOME}}:${{PYTHONHOME}}/bin:{extra_sh_paths}/usr/local/bin:/usr/bin:/bin"
 export TEMP="${{ROOT_DIR}}/.tmp"
 export TMP="${{ROOT_DIR}}/.tmp"
 export TMPDIR="${{ROOT_DIR}}/.tmp"
@@ -1343,18 +1615,17 @@ export AMD_LOG_LEVEL="0"
 export TORCH_BLAS_PREFER_HIPBLASLT="1"
 export HSA_ENABLE_SDMA="1"
 export CUBLAS_WORKSPACE_CONFIG=":4096:8"
+export PYTORCH_ALLOC_CONF="{ALLOC_CONF_POLICY}"
 export PYTORCH_CUDA_ALLOC_CONF="{ALLOC_CONF_POLICY}"
 export PYTORCH_HIP_ALLOC_CONF="{ALLOC_CONF_POLICY}"
-export ROCM_PATH="${{PYTHONHOME}}"
 {hsa_sh_line}
 echo "======================================================================="
 echo " Hermetic Sandbox Shell Active"
 echo " Interpreter: ${{PYTHONHOME}}/bin/python"
+echo " TheRock ROCm SDK Root: ${{ROCM_PATH}} (Arch: ${{PYTORCH_ROCM_ARCH}} / Family: ${{ROCM_SDK_TARGET_FAMILY}})"
 echo " Cache Anchor: ${{HF_HOME}}"
-echo " Local Temp: ${{TEMP}}"
-echo " Local Pip Cache: ${{PIP_CACHE_DIR}}"
 echo " MIOpen Cache: ${{MIOPEN_CUSTOM_CACHE_DIR}} (Find Mode: ${{MIOPEN_FIND_MODE}})"
-echo " Allocator Policy: ${{PYTORCH_HIP_ALLOC_CONF}}"
+echo " Allocator Policy: ${{PYTORCH_ALLOC_CONF}}"
 {hsa_echo_sh}
 echo " Isolation Status: Consolidated Launch Script + Non-Destructive sitecustomize."
 echo "======================================================================="
@@ -1371,10 +1642,19 @@ exec $SHELL
 
 
 def run_hardware_acceptance_gate(
-    executable: Path, isolated_env: dict[str, str], hsa_override: str = ""
+    executable: Path,
+    target_sandbox: Path,
+    profile: str,
+    llvm_target: str,
+    hsa_override: str = "",
 ) -> None:
     print_status("Executing hardware-accelerated acceptance verification...", "INFO")
-    test_env = isolated_env.copy()
+    test_env = build_hermetic_env(
+        target_sandbox,
+        profile=profile,
+        llvm_target=llvm_target,
+        executable=executable,
+    )
     if hsa_override:
         test_env["HSA_OVERRIDE_GFX_VERSION"] = hsa_override
     else:
@@ -1391,18 +1671,24 @@ def run_hardware_acceptance_gate(
             )
 
     test_code = (
-        "import os, sys, torch\n"
+        "import os, sys, torch, torch.nn.functional as F\n"
         "device = 'cuda' if torch.cuda.is_available() else 'mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu'\n"
         "backend = getattr(torch.version, 'hip', None) or getattr(torch.version, 'cuda', None) or ('mps' if device == 'mps' else 'cpu')\n"
         "name = torch.cuda.get_device_name(0) if device == 'cuda' else ('Apple Silicon' if device == 'mps' else 'Host CPU')\n"
+        "arch = getattr(torch.cuda.get_device_properties(0), 'gcnArchName', 'n/a') if device == 'cuda' else 'n/a'\n"
         "print(f'[ACCEPTANCE] Interpreter: {sys.executable} (Python {sys.version.split()[0]})')\n"
-        "print(f'[ACCEPTANCE] Device: {device.upper()} | Backend: {backend} | GPU: {name}')\n"
-        "print(f'[ACCEPTANCE] Runtime Flags: MIOPEN_FIND_MODE={os.environ.get(\"MIOPEN_FIND_MODE\")} | HIPBLASLT={os.environ.get(\"TORCH_BLAS_PREFER_HIPBLASLT\")} | ALLOC_CONF={os.environ.get(\"PYTORCH_HIP_ALLOC_CONF\")}')\n"
-        "x = torch.randn((512, 512), device=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32)\n"
+        "print(f'[ACCEPTANCE] Device: {device.upper()} | Backend: {backend} | GPU: {name} | ISA: {arch}')\n"
+        "print(f'[ACCEPTANCE] TheRock SDK: ROCM_PATH={os.environ.get(\"ROCM_PATH\")} | FAMILY={os.environ.get(\"ROCM_SDK_TARGET_FAMILY\")}')\n"
+        "print(f'[ACCEPTANCE] Runtime Flags: MIOPEN_FIND_MODE={os.environ.get(\"MIOPEN_FIND_MODE\")} | HIPBLASLT={os.environ.get(\"TORCH_BLAS_PREFER_HIPBLASLT\")} | ALLOC_CONF={os.environ.get(\"PYTORCH_ALLOC_CONF\")}')\n"
+        "dtype = torch.bfloat16 if device == 'cuda' else torch.float32\n"
+        "x = torch.randn((512, 512), device=device, dtype=dtype)\n"
         "y = torch.mm(x, x.T).float()\n"
+        "c_in = torch.randn((1, 64, 32, 32), device=device, dtype=dtype)\n"
+        "c_w = torch.randn((64, 64, 3, 3), device=device, dtype=dtype)\n"
+        "c_out = F.conv2d(c_in, c_w, padding=1).float()\n"
         "if device == 'cuda': torch.cuda.synchronize()\n"
-        "assert torch.isfinite(y).all(), 'Non-finite tensor output detected'\n"
-        "print(f'[ACCEPTANCE] BF16/FP32 hipBLASLt GEMM Verification PASSED on {device.upper()}.')\n"
+        "assert torch.isfinite(y).all() and torch.isfinite(c_out).all(), 'Non-finite tensor output detected'\n"
+        "print(f'[ACCEPTANCE] BF16/FP32 hipBLASLt GEMM & MIOpen Conv2d Verification PASSED on {device.upper()}.')\n"
     )
     res = subprocess.run(
         [str(executable), "-c", test_code],
@@ -1447,7 +1733,7 @@ def main() -> None:
     parser.add_argument(
         "--launchers-only",
         action="store_true",
-        help="Regenerate sitecustomize.py, launch_env.bat, and launch_env.ps1 for the active py_env_* sandbox and run acceptance check.",
+        help="Materialize rocm_sdk devel sysroot, regenerate sitecustomize.py/launchers for the active py_env_* sandbox, and run acceptance check.",
     )
     parser.add_argument(
         "--hermetic-internal",
@@ -1466,14 +1752,29 @@ def main() -> None:
             if os.name == "nt"
             else existing_sandbox / "bin" / "python"
         )
-        isolated_env = build_hermetic_env(existing_sandbox)
-        _, llvm_target = resolve_hardware_matrix()
+        profile, llvm_target = resolve_hardware_matrix()
         hsa_override = HSA_OVERRIDES.get(llvm_target, "")
+        isolated_env = build_hermetic_env(
+            existing_sandbox,
+            profile=profile,
+            llvm_target=llvm_target,
+            executable=exe,
+        )
+        if profile == "ROCM":
+            initialize_rocm_sdk_devel(exe, isolated_env, existing_sandbox)
         generate_environment_anchors(
-            existing_sandbox, exe, hsa_override=hsa_override
+            existing_sandbox,
+            exe,
+            profile=profile,
+            llvm_target=llvm_target,
+            hsa_override=hsa_override,
         )
         run_hardware_acceptance_gate(
-            exe, isolated_env, hsa_override=hsa_override
+            exe,
+            existing_sandbox,
+            profile=profile,
+            llvm_target=llvm_target,
+            hsa_override=hsa_override,
         )
         return
 
@@ -1512,7 +1813,13 @@ def main() -> None:
 
     target_sandbox = ROOT_DIR / f"py_env_{selected_version.replace('.', '_')}"
     executable = fetch_runtime(selected_version, target_sandbox)
-    isolated_env = build_hermetic_env(target_sandbox)
+    profile, llvm_target = resolve_hardware_matrix()
+    isolated_env = build_hermetic_env(
+        target_sandbox,
+        profile=profile,
+        llvm_target=llvm_target,
+        executable=executable,
+    )
 
     current_exe = Path(sys.executable).resolve()
     target_exe = executable.resolve()
@@ -1536,15 +1843,22 @@ def main() -> None:
         res = subprocess.run(respawn_cmd, env=isolated_env)
         sys.exit(res.returncode)
 
-    profile, llvm_target = resolve_hardware_matrix()
     hsa_override = condition_pytorch_runtime(
-        executable, isolated_env, profile, llvm_target
+        executable, isolated_env, profile, llvm_target, target_sandbox
     )
     generate_environment_anchors(
-        target_sandbox, executable, hsa_override=hsa_override
+        target_sandbox,
+        executable,
+        profile=profile,
+        llvm_target=llvm_target,
+        hsa_override=hsa_override,
     )
     run_hardware_acceptance_gate(
-        executable, isolated_env, hsa_override=hsa_override
+        executable,
+        target_sandbox,
+        profile=profile,
+        llvm_target=llvm_target,
+        hsa_override=hsa_override,
     )
     print_status(
         f"Hermetic sandbox conditioned successfully at {target_sandbox.name}.",

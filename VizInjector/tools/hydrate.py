@@ -243,6 +243,79 @@ def promote_directory(src_dir: Path, dest_dir: Path) -> None:
     safe_rmtree(src_dir)
 
 
+def safe_subprocess(cmd: list, env: dict[str, str] | None = None) -> str:
+    try:
+        kwargs = (
+            {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+        )
+        return subprocess.check_output(
+            cmd,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            text=True,
+            env=env,
+            **kwargs,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def resolve_rocm_sdk_layout(target_sandbox: Path) -> dict[str, str]:
+    site_packages = (
+        target_sandbox / "Lib" / "site-packages"
+        if IS_WIN
+        else next(target_sandbox.glob("lib/python*/site-packages"), None)
+    )
+    rocm_root: Path | None = None
+    rocm_bin: Path | None = None
+    rocm_cmake: Path | None = None
+
+    if site_packages is not None and site_packages.is_dir():
+        devel_dir = site_packages / "_rocm_sdk_devel"
+        core_dir = site_packages / "_rocm_sdk_core"
+        if (devel_dir / "bin").is_dir():
+            rocm_root = devel_dir.resolve()
+        elif (core_dir / "bin").is_dir():
+            rocm_root = core_dir.resolve()
+        if rocm_root is not None:
+            if (rocm_root / "bin").is_dir():
+                rocm_bin = (rocm_root / "bin").resolve()
+            if (rocm_root / "lib" / "cmake").is_dir():
+                rocm_cmake = (rocm_root / "lib" / "cmake").resolve()
+
+    if rocm_root is None:
+        rocm_root = target_sandbox.resolve()
+
+    llvm_bin = rocm_root / "lib" / "llvm" / "bin"
+    device_lib = rocm_root / "lib" / "llvm" / "amdgcn" / "bitcode"
+    miopen_sys_db = rocm_root / "share" / "miopen" / "db"
+
+    extra_bins: list[str] = []
+    if rocm_bin is not None and rocm_bin.is_dir():
+        extra_bins.append(str(rocm_bin))
+    if llvm_bin.is_dir():
+        extra_bins.append(str(llvm_bin.resolve()))
+    if site_packages is not None and site_packages.is_dir():
+        for pkg_dir in sorted(site_packages.glob("_rocm_sdk_*")):
+            b_dir = pkg_dir / "bin"
+            if b_dir.is_dir():
+                b_str = str(b_dir.resolve())
+                if b_str not in extra_bins:
+                    extra_bins.append(b_str)
+
+    return {
+        "rocm_root": str(rocm_root),
+        "rocm_bin": str(rocm_bin) if rocm_bin is not None else "",
+        "rocm_cmake": str(rocm_cmake) if rocm_cmake is not None else "",
+        "llvm_bin": str(llvm_bin.resolve()) if llvm_bin.is_dir() else "",
+        "device_lib": str(device_lib.resolve()) if device_lib.is_dir() else "",
+        "miopen_sys_db": (
+            str(miopen_sys_db.resolve()) if miopen_sys_db.is_dir() else ""
+        ),
+        "extra_bins": os.pathsep.join(extra_bins),
+    }
+
+
 def get_isolated_env() -> dict[str, str]:
     for d in (
         CACHE_ROOT,
@@ -259,6 +332,11 @@ def get_isolated_env() -> dict[str, str]:
         d.mkdir(parents=True, exist_ok=True)
 
     tempfile.tempdir = str(TMP_DIR)
+    rocm_layout = resolve_rocm_sdk_layout(PYTHON_DIR)
+    rocm_extra_bins = [
+        p for p in rocm_layout["extra_bins"].split(os.pathsep) if p
+    ]
+
     env: dict[str, str] = {}
     for os_var in (
         "SYSTEMROOT",
@@ -278,18 +356,23 @@ def get_isolated_env() -> dict[str, str]:
             env[os_var] = os.environ[os_var]
 
     sys_root = env.get("SYSTEMROOT", r"C:\Windows")
-    hermetic_bins = [
-        str(PYTHON_DIR if IS_WIN else PYTHON_DIR / "bin"),
-        str(PYTHON_DIR / "Scripts" if IS_WIN else PYTHON_DIR / "bin"),
-        str(BIN_DIR / "git" / "cmd"),
-        str(BIN_DIR / "llvm" / "bin"),
-        str(BIN_DIR / "cmake" / "bin"),
-        str(BIN_DIR / "ninja"),
-        str(BIN_DIR / "nasm"),
-        str(BIN_DIR / "shaderc" / "bin"),
-        str(FFMPEG_DIR),
-        str(SYSROOT_DIR / "bin"),
-    ]
+    hermetic_bins = (
+        [
+            str(PYTHON_DIR if IS_WIN else PYTHON_DIR / "bin"),
+            str(PYTHON_DIR / "Scripts" if IS_WIN else PYTHON_DIR / "bin"),
+        ]
+        + rocm_extra_bins
+        + [
+            str(BIN_DIR / "git" / "cmd"),
+            str(BIN_DIR / "llvm" / "bin"),
+            str(BIN_DIR / "cmake" / "bin"),
+            str(BIN_DIR / "ninja"),
+            str(BIN_DIR / "nasm"),
+            str(BIN_DIR / "shaderc" / "bin"),
+            str(FFMPEG_DIR),
+            str(SYSROOT_DIR / "bin"),
+        ]
+    )
     if IS_WIN:
         hermetic_bins.extend(
             [
@@ -323,7 +406,16 @@ def get_isolated_env() -> dict[str, str]:
     env["XDG_CACHE_HOME"] = str(ENV_CACHE_DIR)
     env["XDG_CONFIG_HOME"] = str(ENV_CACHE_DIR / "config")
     env["XDG_DATA_HOME"] = str(ENV_CACHE_DIR / "share")
-    env["ROCM_PATH"] = str(PYTHON_DIR)
+    env["ROCM_PATH"] = rocm_layout["rocm_root"]
+    env["ROCM_HOME"] = rocm_layout["rocm_root"]
+    env["HIP_PATH"] = rocm_layout["rocm_root"]
+
+    if rocm_layout["llvm_bin"]:
+        env["HIP_CLANG_PATH"] = rocm_layout["llvm_bin"]
+    if rocm_layout["device_lib"]:
+        env["HIP_DEVICE_LIB_PATH"] = rocm_layout["device_lib"]
+    if rocm_layout["miopen_sys_db"]:
+        env["MIOPEN_SYSTEM_DB_PATH"] = rocm_layout["miopen_sys_db"]
 
     contract_defaults = {
         "HF_HOME": str(HF_CACHE_DIR),
@@ -341,6 +433,7 @@ def get_isolated_env() -> dict[str, str]:
         "TORCH_BLAS_PREFER_HIPBLASLT": "1",
         "HSA_ENABLE_SDMA": "1",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "PYTORCH_ALLOC_CONF": ALLOC_CONF_POLICY,
         "PYTORCH_CUDA_ALLOC_CONF": ALLOC_CONF_POLICY,
         "PYTORCH_HIP_ALLOC_CONF": ALLOC_CONF_POLICY,
     }
@@ -348,8 +441,14 @@ def get_isolated_env() -> dict[str, str]:
         cur = os.environ.get(k)
         env[k] = cur if (cur is not None and cur.strip()) else v
 
-    if os.environ.get("HSA_OVERRIDE_GFX_VERSION", "").strip():
-        env["HSA_OVERRIDE_GFX_VERSION"] = os.environ["HSA_OVERRIDE_GFX_VERSION"].strip()
+    for passthrough_rocm in (
+        "HIP_PLATFORM",
+        "PYTORCH_ROCM_ARCH",
+        "ROCM_SDK_TARGET_FAMILY",
+        "HSA_OVERRIDE_GFX_VERSION",
+    ):
+        if os.environ.get(passthrough_rocm, "").strip():
+            env[passthrough_rocm] = os.environ[passthrough_rocm].strip()
 
     return env
 
@@ -385,7 +484,7 @@ def normalize_numeric_version(ver_str: str) -> str:
 
 
 def _http_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
-    headers = {"User-Agent": "vizinjector-hydrator/1.0"}
+    headers = {"User-Agent": "vizinjector-hydrator/2.0"}
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -613,18 +712,6 @@ def unpack_archive(
             temp_dir = extract_dir.parent / f"_tmp_{extract_dir.name}"
             promote_directory(single_dir, temp_dir)
             promote_directory(temp_dir, extract_dir)
-
-
-def safe_subprocess(cmd: list) -> str:
-    try:
-        kwargs = (
-            {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
-        )
-        return subprocess.check_output(
-            cmd, stderr=subprocess.DEVNULL, timeout=10, text=True, **kwargs
-        ).strip()
-    except Exception:
-        return ""
 
 
 def query_dxgi_adapters_win32() -> list[dict]:
@@ -1030,7 +1117,28 @@ def salvage_cached_wheels() -> None:
             pass
 
 
-def synchronize_pip_and_pytorch(force: bool = False) -> str:
+def initialize_rocm_sdk_devel(isolated_env: dict[str, str]) -> None:
+    site_packages = (
+        PYTHON_DIR / "Lib" / "site-packages"
+        if IS_WIN
+        else next(PYTHON_DIR.glob("lib/python*/site-packages"), None)
+    )
+    if site_packages is None or not (site_packages / "rocm_sdk").is_dir():
+        return
+    devel_dir = site_packages / "_rocm_sdk_devel"
+    if (devel_dir / "_devel.tar.xz").is_file() or not (devel_dir / "bin").is_dir():
+        log_info("Materializing TheRock rocm_sdk devel sysroot (rocm_sdk init)...")
+        subprocess.run(
+            [str(HERMETIC_PYTHON_EXE), "-I", "-m", "rocm_sdk", "init"],
+            env=isolated_env,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def synchronize_pip_and_pytorch(
+    force: bool = False,
+) -> tuple[str, str, str]:
     isolated_env = get_isolated_env()
     discovered_pkgs = scan_ast_dependencies()
     profile, llvm_target = resolve_hardware_matrix()
@@ -1075,6 +1183,9 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
         )
         if profile == "ROCM":
             family = AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
+            isolated_env["ROCM_SDK_TARGET_FAMILY"] = family
+            if llvm_target:
+                isolated_env["PYTORCH_ROCM_ARCH"] = llvm_target
             index_url = f"{HTTPS}rocm.nightlies.amd.com/v2-staging/{family}/"
             log_info(f"Locking Sovereign Staging Nightly Index: {index_url}")
             if IS_WIN:
@@ -1107,13 +1218,7 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
                 stdin=subprocess.DEVNULL,
                 check=True,
             )
-            subprocess.run(
-                [str(HERMETIC_PYTHON_EXE), "-I", "-m", "rocm_sdk", "init"],
-                env=isolated_env,
-                stdin=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-            )
+            initialize_rocm_sdk_devel(isolated_env)
         elif profile.startswith("CUDA_"):
             cuda_urls = {
                 "CUDA_13_2": f"{HTTPS}download.pytorch.org/whl/nightly/cu132",
@@ -1182,6 +1287,8 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
             )
         torch_marker.write_text(f"{expected_profile_tag}\n", encoding="utf-8")
     else:
+        if profile == "ROCM":
+            initialize_rocm_sdk_devel(isolated_env)
         log_info(f"Hardware-aligned PyTorch runtime converged ({expected_profile_tag}).")
 
     log_info(
@@ -1202,7 +1309,7 @@ def synchronize_pip_and_pytorch(force: bool = False) -> str:
         check=True,
     )
     LOCK_FILE.write_text(freeze_res.stdout, encoding="utf-8")
-    return hsa_override
+    return profile, llvm_target, hsa_override
 
 
 def resolve_release_asset(
@@ -1952,7 +2059,9 @@ def hydrate_sources(force: bool = False) -> None:
         log_info(f"stb converged ({stb_tag[:12]}).")
 
 
-def orchestrate_hermetic_runtime_environment(hsa_override: str = "") -> None:
+def orchestrate_hermetic_runtime_environment(
+    profile: str, llvm_target: str, hsa_override: str = ""
+) -> None:
     miopen_db = HF_CACHE_DIR / "miopen" / "db"
     miopen_kernels = HF_CACHE_DIR / "miopen" / "kernels"
     inductor_dir = HF_CACHE_DIR / "torch_inductor"
@@ -1968,6 +2077,12 @@ def orchestrate_hermetic_runtime_environment(hsa_override: str = "") -> None:
     else:
         site_packages_dirs = list((PYTHON_DIR / "lib").glob("python*/site-packages"))
 
+    rocm_family = (
+        AMD_STAGING_FAMILY_MAP.get(llvm_target, f"{llvm_target}-all")
+        if (profile == "ROCM" and llvm_target)
+        else ""
+    )
+
     sitecustomize_code = f"""from __future__ import annotations
 
 import os
@@ -1975,6 +2090,7 @@ from pathlib import Path
 import sys
 
 _HERE = Path(__file__).resolve()
+_SP_DIR = _HERE.parent
 _ROOT = _HERE.parents[{4 if IS_WIN else 5}]
 _BIN = _ROOT / "bin"
 _PY = _BIN / "python"
@@ -1995,10 +2111,45 @@ def _env_default(key: str, val: str) -> None:
         os.environ[key] = val
 
 
+_ROCM_DEVEL = _SP_DIR / "_rocm_sdk_devel"
+_ROCM_CORE = _SP_DIR / "_rocm_sdk_core"
+if (_ROCM_DEVEL / "bin").is_dir():
+    _ROCM_ROOT = _ROCM_DEVEL.resolve()
+elif (_ROCM_CORE / "bin").is_dir():
+    _ROCM_ROOT = _ROCM_CORE.resolve()
+else:
+    _ROCM_ROOT = _PY.resolve()
+
+_LLVM_BIN = _ROCM_ROOT / "lib" / "llvm" / "bin"
+_DEVICE_LIB = _ROCM_ROOT / "lib" / "llvm" / "amdgcn" / "bitcode"
+_ROCM_CMAKE = _ROCM_ROOT / "lib" / "cmake"
+_MIOPEN_SYS_DB = _ROCM_ROOT / "share" / "miopen" / "db"
+
 _env_default("PYTHONNOUSERSITE", "1")
 _env_default("PYTHONUTF8", "1")
 _env_default("PYTHONIOENCODING", "utf-8")
-_env_default("ROCM_PATH", str(_PY))
+
+_cur_rocm = os.environ.get("ROCM_PATH", "")
+if not _cur_rocm.strip() or Path(_cur_rocm).resolve() == _PY.resolve():
+    os.environ["ROCM_PATH"] = str(_ROCM_ROOT)
+_env_default("ROCM_HOME", str(_ROCM_ROOT))
+_env_default("HIP_PATH", str(_ROCM_ROOT))
+if _LLVM_BIN.is_dir():
+    _env_default("HIP_CLANG_PATH", str(_LLVM_BIN))
+if _DEVICE_LIB.is_dir():
+    _env_default("HIP_DEVICE_LIB_PATH", str(_DEVICE_LIB))
+if _ROCM_CMAKE.is_dir():
+    _env_default("CMAKE_PREFIX_PATH", str(_ROCM_CMAKE))
+if _MIOPEN_SYS_DB.is_dir():
+    _env_default("MIOPEN_SYSTEM_DB_PATH", str(_MIOPEN_SYS_DB))
+
+if {repr(profile == "ROCM")}:
+    _env_default("HIP_PLATFORM", "amd")
+if {repr(bool(llvm_target))}:
+    _env_default("PYTORCH_ROCM_ARCH", {repr(llvm_target)})
+if {repr(bool(rocm_family))}:
+    _env_default("ROCM_SDK_TARGET_FAMILY", {repr(rocm_family)})
+
 _env_default("HF_HOME", str(_HF))
 _env_default("TORCH_HOME", str(_HF / "torch"))
 _env_default("TRANSFORMERS_CACHE", str(_HF / "transformers"))
@@ -2014,6 +2165,7 @@ _env_default("AMD_LOG_LEVEL", "0")
 _env_default("TORCH_BLAS_PREFER_HIPBLASLT", "1")
 _env_default("HSA_ENABLE_SDMA", "1")
 _env_default("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+_env_default("PYTORCH_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
 _env_default("PYTORCH_CUDA_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
 _env_default("PYTORCH_HIP_ALLOC_CONF", "{ALLOC_CONF_POLICY}")
 
@@ -2025,14 +2177,25 @@ elif os.environ.get("HSA_OVERRIDE_GFX_VERSION", "") == "":
 _hermetic_bins = [
     str(_PY if sys.platform == "win32" else _PY / "bin"),
     str(_PY / "Scripts" if sys.platform == "win32" else _PY / "bin"),
-    str(_BIN / "llvm" / "bin"),
-    str(_BIN / "cmake" / "bin"),
-    str(_BIN / "ninja"),
-    str(_BIN / "nasm"),
-    str(_BIN / "shaderc" / "bin"),
-    str(_BIN / "ffmpeg"),
-    str(_BIN / "sysroot" / "bin"),
 ]
+if (_ROCM_ROOT / "bin").is_dir():
+    _hermetic_bins.append(str(_ROCM_ROOT / "bin"))
+if _LLVM_BIN.is_dir():
+    _hermetic_bins.append(str(_LLVM_BIN))
+for _pkg_b in sorted(_SP_DIR.glob("_rocm_sdk_*/bin")):
+    if _pkg_b.is_dir() and str(_pkg_b) not in _hermetic_bins:
+        _hermetic_bins.append(str(_pkg_b))
+_hermetic_bins.extend(
+    [
+        str(_BIN / "llvm" / "bin"),
+        str(_BIN / "cmake" / "bin"),
+        str(_BIN / "ninja"),
+        str(_BIN / "nasm"),
+        str(_BIN / "shaderc" / "bin"),
+        str(_BIN / "ffmpeg"),
+        str(_BIN / "sysroot" / "bin"),
+    ]
+)
 _cur_path = os.environ.get("PATH", "")
 os.environ["PATH"] = os.pathsep.join(
     _hermetic_bins + ([_cur_path] if _cur_path else [])
@@ -2042,10 +2205,17 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
-    for _dll_dir in (_ROOT / "dist" / "bin", _BIN / "sysroot" / "bin", _BIN / "ffmpeg"):
+    _dll_dirs = [
+        _ROOT / "dist" / "bin",
+        _BIN / "sysroot" / "bin",
+        _BIN / "ffmpeg",
+        _ROCM_ROOT / "bin",
+        _LLVM_BIN,
+    ] + list(_SP_DIR.glob("_rocm_sdk_*/bin"))
+    for _dll_dir in _dll_dirs:
         if _dll_dir.is_dir():
             try:
-                os.add_dll_directory(str(_dll_dir))
+                os.add_dll_directory(str(_dll_dir.resolve()))
             except Exception:
                 pass
 """
@@ -2108,11 +2278,15 @@ def main() -> None:
         res = subprocess.run(cmd, env=isolated_env)
         sys.exit(res.returncode)
 
-    hsa_override = synchronize_pip_and_pytorch(force=args.force)
+    profile, llvm_target, hsa_override = synchronize_pip_and_pytorch(
+        force=args.force
+    )
     hydrate_host_tools(force=args.force)
     hydrate_winsdk(force=args.force)
     hydrate_sources(force=args.force)
-    orchestrate_hermetic_runtime_environment(hsa_override=hsa_override)
+    orchestrate_hermetic_runtime_environment(
+        profile=profile, llvm_target=llvm_target, hsa_override=hsa_override
+    )
     safe_rmtree(TMP_DIR)
     log_info("VizInjector hermetic hydration converged to latest upstream state.")
 
