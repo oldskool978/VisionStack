@@ -36,6 +36,8 @@ from engine import (
     derive_stage_keys,
     load_sharded_safetensors_into,
     philox_randn,
+    splat_box_latents_to_canvas,
+    stream_safetensors_inplace,
     subphase_radial_clamp,
 )
 from harness import build_default_request
@@ -161,21 +163,33 @@ def gate_1_native_subsystems() -> None:
         )
         for think_flag in (True, False):
             for p_counts in (None, [2304, 576]):
-                ref_str = render_qwen35_chat_prompt(
-                    raw_p2,
-                    enable_thinking=think_flag,
-                    image_patch_counts=p_counts,
-                )
-                _assert(
-                    tok.encode(ref_str, allowed_special="all")
-                    == tok.encode_chat(
-                        raw_p2,
-                        enable_thinking=think_flag,
-                        max_sequence_length=8192,
-                        image_patch_counts=p_counts,
-                    ),
-                    f"encode_chat parity failure for thinking={think_flag}, patches={p_counts}",
-                )
+                for sys_p in (None, "You are a spatial composition architect."):
+                    for t_trace in (
+                        None,
+                        "Place Picture 1 in the left quadrant and preserve typography.",
+                    ):
+                        for vis_id in (True, False):
+                            ref_str = render_qwen35_chat_prompt(
+                                raw_p2,
+                                enable_thinking=think_flag,
+                                image_patch_counts=p_counts,
+                                system_prompt=sys_p,
+                                thinking_trace=t_trace,
+                                add_vision_id=vis_id,
+                            )
+                            _assert(
+                                tok.encode(ref_str, allowed_special="all")
+                                == tok.encode_chat(
+                                    raw_p2,
+                                    enable_thinking=think_flag,
+                                    max_sequence_length=8192,
+                                    image_patch_counts=p_counts,
+                                    system_prompt=sys_p,
+                                    thinking_trace=t_trace,
+                                    add_vision_id=vis_id,
+                                ),
+                                f"encode_chat parity failure for thinking={think_flag}, patches={p_counts}, sys={sys_p is not None}, trace={t_trace is not None}, vis_id={vis_id}",
+                            )
         shared_pfx = MOSSImageTokenizer.find_common_prefix(ids_1, ids_2)
         _assert(
             shared_pfx > 150, f"Expected shared prefix > 150 tokens, got {shared_pfx}"
@@ -183,7 +197,7 @@ def gate_1_native_subsystems() -> None:
         decoded_p1 = tok.decode(ids_1)
         _assert("OPENMOSS" in decoded_p1, "Tokenizer roundtrip failed")
         print(
-            f"  [+] VizToken Qwen3.5 SWISS5  : {tok.ranks_path.name} (Vocab={tok.n_vocab:,}, FastTables={tok.has_fast_tables}, SharedPrefix={shared_pfx} tok)"
+            f"  [+] VizToken Qwen3.5 SWISS5  : {tok.ranks_path.name} (Vocab={tok.n_vocab:,}, FastTables={tok.has_fast_tables}, SharedPrefix={shared_pfx} tok, System/Trace/VisionID Parity Verified)"
         )
 
     with VizInjectorClient(prefer_vulkan=True) as viz:
@@ -319,7 +333,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             "Expected initial neg miss",
         )
         p_cache.insert(neg_tokens, h_neg)
-
         _ = p_cache.lookup(neg_tokens, dev, is_negative=True)
         _assert(
             p_cache.pos_hits == 0,
@@ -371,7 +384,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             vae_key_v7 == vae_key_v8 and vae_key_v8 == vae_key_cc,
             "Aspect-matching 'never_crop', 'inscribed', and 'cover_crop' must canonicalize to the same VAE cache key",
         )
-
         with torch.inference_mode():
             rec_in = CachedReferenceRecord(
                 packed_latents=torch.randn((1, 128, 32, 32), device=dev),
@@ -430,11 +442,22 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             str(tmp_sf),
         )
         load_sharded_safetensors_into(Path(tmpdir), meta_dit, device=dev, dtype=dtype)
-    meta_dit.eval()
-    _assert(
-        not next(meta_dit.parameters()).is_meta,
-        "load_sharded_safetensors_into left parameters on meta device",
-    )
+        meta_dit.eval()
+        _assert(
+            not next(meta_dit.parameters()).is_meta,
+            "load_sharded_safetensors_into left parameters on meta device",
+        )
+        ptrs_before = {k: p.data_ptr() for k, p in meta_dit.named_parameters()}
+        with torch.no_grad():
+            meta_dit.layers[0].proj["q"].weight.zero_()
+        inplace_ok = stream_safetensors_inplace(
+            Path(tmpdir), meta_dit, device=dev, dtype=dtype
+        )
+        ptrs_after = {k: p.data_ptr() for k, p in meta_dit.named_parameters()}
+        _assert(
+            inplace_ok and ptrs_before == ptrs_after,
+            "stream_safetensors_inplace reallocated parameter storage instead of streaming in-place",
+        )
 
     with torch.inference_mode():
         lat = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
@@ -513,6 +536,60 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             f"Block-partitioned FlashAttention IsoKV diverged from boolean mask: {iso_diff}",
         )
 
+        bias_none = dit._get_box_aperture_bias(
+            height=8,
+            width=8,
+            ref_token_lengths=[r1_tok, r2_tok],
+            text_tokens=16,
+            ref_shapes=[(8, 8), (6, 6)],
+            ref_bboxes=[(0.5, 0.5, 1.0, 1.0), None],
+            reference_box_isolation=0.0,
+            feather_radius_lat=1.0,
+            device=dev,
+            dtype=torch.float32,
+        )
+        _assert(
+            bias_none is None,
+            "Zero box_attn_isolation must return None without allocating a bias tensor",
+        )
+
+        bias_active = dit._get_box_aperture_bias(
+            height=8,
+            width=8,
+            ref_token_lengths=[r1_tok, r2_tok],
+            text_tokens=16,
+            ref_shapes=[(8, 8), (6, 6)],
+            ref_bboxes=[(0.5, 0.5, 1.0, 1.0), None],
+            reference_box_isolation=[0.85, 0.0],
+            feather_radius_lat=1.5,
+            device=dev,
+            dtype=torch.float32,
+        )
+        _assert(
+            bias_active is not None and bias_active.shape == (1, 1, 64, 180),
+            f"Unexpected box aperture bias shape: {None if bias_active is None else bias_active.shape}",
+        )
+        interior_idx = 6 * 8 + 6
+        exterior_idx = 0 * 8 + 0
+        feather_idx = 3 * 8 + 6
+        _assert(
+            float(bias_active[0, 0, interior_idx, t_tok + 5].item()) == 0.0,
+            "Interior target token inside Ref 1 bbox must have 0.0 attention bias",
+        )
+        _assert(
+            abs(float(bias_active[0, 0, exterior_idx, t_tok + 5].item()) - (-17.0))
+            < 1e-4,
+            f"Exterior target token outside Ref 1 bbox expected -17.0 bias, got {bias_active[0, 0, exterior_idx, t_tok + 5].item()}",
+        )
+        _assert(
+            -17.0 < float(bias_active[0, 0, feather_idx, t_tok + 5].item()) < 0.0,
+            "Feather boundary token must have smooth intermediate attention bias",
+        )
+        _assert(
+            float(bias_active[0, 0, :, t_tok + r1_tok :].abs().max().item()) == 0.0,
+            "Unisolated Ref 2 and Text tokens must remain completely unattenuated (0.0)",
+        )
+
         phase_boxed = dit.rope._compute_phase(
             8,
             8,
@@ -551,11 +628,47 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         ).sample
         _assert(
             float((out1 - out_meta).abs().max().item()) == 0.0,
-            "Meta-initialized DiT output diverged from standard DiT",
+            "Meta-initialized and in-place streamed DiT output diverged from standard DiT",
         )
         _assert(
             out1.shape == (1, 128, 8, 8), f"Unexpected DiT output shape: {out1.shape}"
         )
+
+        out_box_iso = dit(
+            lat,
+            t_step_1,
+            txt,
+            mask,
+            reference_latents=[ref1, ref2],
+            reference_zero_timestep=True,
+            reference_isolated_kv=True,
+            reference_bboxes=ref_boxes,
+            reference_box_isolation=[0.90, 0.50],
+            box_feather_radius=1.25,
+        ).sample
+        out_box_iso_non_isokv = dit(
+            lat,
+            t_step_1,
+            txt,
+            mask,
+            reference_latents=[ref1, ref2],
+            reference_zero_timestep=True,
+            reference_isolated_kv=False,
+            reference_bboxes=ref_boxes,
+            reference_box_isolation=0.85,
+            box_feather_radius=1.25,
+        ).sample
+        _assert(
+            torch.isfinite(out_box_iso).all()
+            and torch.isfinite(out_box_iso_non_isokv).all()
+            and float((out1 - out_box_iso).abs().max().item()) > 1e-5,
+            "Regional box-aperture isolation forward pass failed or produced no spatial modulation",
+        )
+        _assert(
+            len(dit._box_aperture_bias_cache) >= 2,
+            "Box aperture bias cache was not populated",
+        )
+
         _assert(dit._mod_seq_buf is not None, "_mod_seq_buf was not allocated")
         buf_ptr_1 = dit._mod_seq_buf.data_ptr()
         _assert(
@@ -618,8 +731,13 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             dit._mod_seq_buf is None,
             "clear_transient_caches must release _mod_seq_buf between turns",
         )
+        dit.clear_caches()
+        _assert(
+            len(dit._box_aperture_bias_cache) == 0,
+            "clear_caches must flush _box_aperture_bias_cache",
+        )
     print(
-        f"  [+] MOSSImageTransformer     : Meta-Init + Box-4D-RoPE + FlashIsoKV (diff={iso_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
+        f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap (0-Alloc) + Box-4D-RoPE + RegionalApertureBias + FlashIsoKV (diff={iso_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
     )
 
     orig_q_weight = dit.layers[0].proj["q"].weight.data.detach().float().clone()
@@ -968,7 +1086,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     _assert(
         "bf16" in DTYPE_MAP and "fp16" in DTYPE_LOOKUP,
         "Refinery DTYPE_MAP/DTYPE_LOOKUP missing",
@@ -1109,11 +1226,17 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             os.environ["SHADOWBOXER_DEFAULT_JSON"] = str(tmp_preset)
             custom_req = GenerationRequest(
                 prompt="Preset hot-reload test",
+                system_prompt="Spatial layout system prompt",
+                thinking_trace="Explicit spatial chain-of-thought",
+                add_vision_id=False,
                 early_solver="sde_gpu_pp",
                 late_solver="ipndm",
                 early_cfg=3.5,
                 late_cfg=2.5,
                 uncond_skip_layers=[22, 24],
+                box_attn_isolation=0.85,
+                composite_box_images_to_init=True,
+                uncond_uses_references=False,
             )
             custom_req.save_preset(tmp_preset)
             _assert(
@@ -1124,8 +1247,14 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             _assert(
                 reloaded_req.early_solver == "sde_gpu_pp"
                 and abs(reloaded_req.early_cfg - 3.5) < 1e-6
-                and reloaded_req.uncond_skip_layers == [22, 24],
-                "GenerationRequest failed to inherit active default.json overrides",
+                and reloaded_req.uncond_skip_layers == [22, 24]
+                and abs(float(reloaded_req.box_attn_isolation or 0.0) - 0.85) < 1e-6
+                and reloaded_req.composite_box_images_to_init is True
+                and reloaded_req.uncond_uses_references is False
+                and reloaded_req.system_prompt == "Spatial layout system prompt"
+                and reloaded_req.thinking_trace == "Explicit spatial chain-of-thought"
+                and reloaded_req.add_vision_id is False,
+                f"GenerationRequest failed to inherit active default.json overrides: {reloaded_req}",
             )
         finally:
             if prev_env is None:
@@ -1166,6 +1295,8 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 "caption": "Subject portrait in moody lighting",
                 "bbox": [256, 256, 768, 768],
                 "image_path": "box_subject.png",
+                "isolate_box_attn": 0.9,
+                "paste_to_canvas": True,
             },
             {
                 "category": "text",
@@ -1181,19 +1312,83 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
     _assert(
         ref_specs[0]["norm_bbox"] is None
-        and ref_specs[1]["norm_bbox"] == (0.25, 0.25, 0.75, 0.75),
-        f"Unexpected reference norm_bbox mapping: {ref_specs}",
+        and ref_specs[1]["norm_bbox"] == (0.25, 0.25, 0.75, 0.75)
+        and abs(float(ref_specs[1]["isolate_box_attn"]) - 0.9) < 1e-6
+        and ref_specs[1]["paste_to_canvas"] is True,
+        f"Unexpected reference spec mapping: {ref_specs}",
     )
     compiled_poly = req_poly.compile_effective_prompt()
     _assert(
         '"reference": "Picture 2"' in compiled_poly
-        and "box_subject.png" not in compiled_poly,
-        "Polymorphic layout compiler failed to bind 'Picture 2' or leaked local image_path",
+        and "box_subject.png" not in compiled_poly
+        and "isolate_box_attn" not in compiled_poly
+        and "paste_to_canvas" not in compiled_poly,
+        "Polymorphic layout compiler failed to bind 'Picture 2' or leaked internal box routing keys",
     )
     _assert(
         req_poly.effective_reference_zero_timestep is True
         and req_poly.effective_reference_isolated_kv is True,
         "Box-bound reference images must automatically enable t_ref=0 and IsoKV",
+    )
+
+    req_mixed_roles = GenerationRequest(
+        prompt="Mixed role multimodal indexing and box-conformal framing test",
+        prompt_mode="layout_json",
+        edit_format="moss_image_edit",
+        framing_mode="never_crop",
+        height=1024,
+        width=1024,
+        layout_coords_are_pixels=True,
+        reference_image_paths=["global_bg_edit.png"],
+        layout_items=[
+            {
+                "category": "structure",
+                "caption": "Depth map guide",
+                "bbox": [0, 0, 512, 512],
+                "image_path": "box_depth.png",
+                "input_role": "depth_map",
+            },
+            {
+                "category": "subject",
+                "caption": "Foreground character reference",
+                "bbox": [256, 512, 768, 1024],
+                "image_path": "box_hero.png",
+                "input_role": "photo_ref",
+            },
+        ],
+    )
+    mixed_specs, mixed_pic_map = req_mixed_roles.resolve_visual_references()
+    _assert(
+        len(mixed_specs) == 3 and mixed_pic_map == {1: 1},
+        f"Expected Picture 1 strictly bound to box 1 (photo_ref), got map={mixed_pic_map}",
+    )
+    _assert(
+        mixed_specs[0]["emits_vit"] is False
+        and mixed_specs[0]["picture_index"] is None
+        and mixed_specs[0]["dit_ref_index"] == 1
+        and mixed_specs[0]["framing_mode"] == "never_crop",
+        f"Global moss_image_edit ref spec mismatch: {mixed_specs[0]}",
+    )
+    _assert(
+        mixed_specs[1]["emits_vit"] is False
+        and mixed_specs[1]["picture_index"] is None
+        and mixed_specs[1]["dit_ref_index"] == 2
+        and mixed_specs[1]["framing_mode"] == "inscribed",
+        f"Box 0 depth_map ref spec mismatch: {mixed_specs[1]}",
+    )
+    _assert(
+        mixed_specs[2]["emits_vit"] is True
+        and mixed_specs[2]["picture_index"] == 1
+        and mixed_specs[2]["dit_ref_index"] == 3
+        and mixed_specs[2]["framing_mode"] == "inscribed",
+        f"Box 1 photo_ref spec failed box-conformal framing or Picture 1 parity: {mixed_specs[2]}",
+    )
+    compiled_mixed = req_mixed_roles.compile_effective_prompt()
+    _assert(
+        '"reference": "Picture 1"' in compiled_mixed
+        and '"reference": "Picture 2"' not in compiled_mixed
+        and '"reference": "Picture 3"' not in compiled_mixed,
+        f"Mixed-role layout prompt desynchronized Picture index: {compiled_mixed}",
     )
 
     aperture_mask = build_box_aperture_mask(
@@ -1215,6 +1410,30 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Box aperture mask failed interior/feather/exterior boundary conditions",
     )
 
+    with torch.inference_mode():
+        base_canvas = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
+        box_lat = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
+        splat_canvas, splat_alpha = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(box_lat, (0.25, 0.25, 0.75, 0.75), None, 0.75)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=2.0,
+            device=dev,
+        )
+        _assert(
+            splat_canvas.shape == (1, 128, 32, 32)
+            and splat_alpha.shape == (1, 1, 32, 32),
+            "splat_box_latents_to_canvas output shape mismatch",
+        )
+        _assert(
+            abs(float(splat_canvas[0, 0, 16, 16].item()) - 2.5) < 1e-5
+            and float(splat_canvas[0, 0, 0, 0].item()) == 0.0
+            and 0.0 < float(splat_canvas[0, 0, 8, 16].item()) < 2.5,
+            "splat_box_latents_to_canvas failed interior/feather/exterior composite values",
+        )
+
     for fmt in ("moss_image_edit", "ai_toolkit_isolated", "control_color_depth"):
         req = GenerationRequest(prompt="test", edit_format=fmt)
         _assert(
@@ -1225,8 +1444,20 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             req.effective_reference_isolated_kv is True,
             f"edit_format={fmt} must enable reference_isolated_kv",
         )
+    req_ait = GenerationRequest(prompt="test", edit_format="ai_toolkit_isolated")
+    _assert(
+        req_ait.effective_uncond_uses_references is False,
+        "Unboxed ai_toolkit_isolated must default effective_uncond_uses_references to False",
+    )
+    req_ait_override = GenerationRequest(
+        prompt="test", edit_format="ai_toolkit_isolated", uncond_uses_references=True
+    )
+    _assert(
+        req_ait_override.effective_uncond_uses_references is True,
+        "Explicit uncond_uses_references=True override was not respected",
+    )
     print(
-        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + Preset Hot-Reload + Box-Picture JSON Verified"
+        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + Mixed-Role Picture Parity + Box-Conformal Framing + Latent Splatting Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)

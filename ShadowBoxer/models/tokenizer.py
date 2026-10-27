@@ -85,7 +85,6 @@ def compile_qwen_ranks_binary(
         if target_bin_path is not None
         else (tok_dir / "qwen35.ranks.bin")
     )
-
     if _is_valid_qwen35_swiss5(bin_path):
         return bin_path
 
@@ -160,19 +159,42 @@ def render_qwen35_chat_prompt(
     prompt: str,
     enable_thinking: bool = True,
     image_patch_counts: Optional[Sequence[int]] = None,
+    system_prompt: Optional[str] = None,
+    thinking_trace: Optional[str] = None,
+    add_vision_id: bool = True,
 ) -> str:
+    sys_prefix = ""
+    if system_prompt is not None:
+        norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
+        if norm_sys:
+            sys_prefix = f"<|im_start|>system\n{norm_sys}<|im_end|>\n"
+
     vision_prefix = ""
     if image_patch_counts:
         parts = []
         for idx, count in enumerate(image_patch_counts, start=1):
             pads = "<|image_pad|>" * max(1, int(count))
-            parts.append(f"Picture {idx}: <|vision_start|>{pads}<|vision_end|>")
+            vis_label = f"Picture {idx}: " if add_vision_id else ""
+            parts.append(f"{vis_label}<|vision_start|>{pads}<|vision_end|>")
         vision_prefix = "".join(parts)
 
     clean_prompt = unicodedata.normalize("NFC", prompt).strip()
     body = f"{vision_prefix}{clean_prompt}"
-    think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
-    return f"<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n{think_suffix}"
+
+    if thinking_trace is not None:
+        norm_trace = unicodedata.normalize("NFC", thinking_trace).strip()
+    else:
+        norm_trace = ""
+
+    if norm_trace:
+        think_suffix = f"<think>\n{norm_trace}\n</think>\n\n"
+    else:
+        think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+
+    return (
+        f"{sys_prefix}<|im_start|>user\n{body}<|im_end|>\n"
+        f"<|im_start|>assistant\n{think_suffix}"
+    )
 
 
 def load_ranks_binary(ranks_path: Union[str, Path, None] = None) -> Encoding:
@@ -275,21 +297,55 @@ class MOSSImageTokenizer:
         enable_thinking: bool = True,
         max_sequence_length: int = 4096,
         image_patch_counts: Optional[Sequence[int]] = None,
+        system_prompt: Optional[str] = None,
+        thinking_trace: Optional[str] = None,
+        add_vision_id: bool = True,
     ) -> List[int]:
         native_chat_fn = getattr(self._enc, "encode_chat", None)
         if callable(native_chat_fn):
-            return native_chat_fn(
-                prompt=prompt,
-                enable_thinking=enable_thinking,
-                max_sequence_length=max_sequence_length,
-                image_patch_counts=image_patch_counts,
-            )
+            try:
+                return native_chat_fn(
+                    prompt=prompt,
+                    enable_thinking=enable_thinking,
+                    max_sequence_length=max_sequence_length,
+                    image_patch_counts=image_patch_counts,
+                    system_prompt=system_prompt,
+                    thinking_trace=thinking_trace,
+                    add_vision_id=add_vision_id,
+                )
+            except TypeError:
+                if (
+                    system_prompt is None
+                    and thinking_trace is None
+                    and add_vision_id is True
+                ):
+                    return native_chat_fn(
+                        prompt=prompt,
+                        enable_thinking=enable_thinking,
+                        max_sequence_length=max_sequence_length,
+                        image_patch_counts=image_patch_counts,
+                    )
 
         norm_prompt = unicodedata.normalize("NFC", prompt).strip()
-        think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+        sys_prefix = ""
+        if system_prompt is not None:
+            norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
+            if norm_sys:
+                sys_prefix = f"<|im_start|>system\n{norm_sys}<|im_end|>\n"
+
+        if thinking_trace is not None:
+            norm_trace = unicodedata.normalize("NFC", thinking_trace).strip()
+        else:
+            norm_trace = ""
+
+        if norm_trace:
+            think_suffix = f"<think>\n{norm_trace}\n</think>\n\n"
+        else:
+            think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+
         if not image_patch_counts:
             full_text = (
-                f"<|im_start|>user\n{norm_prompt}<|im_end|>\n"
+                f"{sys_prefix}<|im_start|>user\n{norm_prompt}<|im_end|>\n"
                 f"<|im_start|>assistant\n{think_suffix}"
             )
             toks = self._enc.encode(
@@ -298,10 +354,11 @@ class MOSSImageTokenizer:
         else:
             toks = []
             for idx, count in enumerate(image_patch_counts, start=1):
+                vis_label = f"Picture {idx}: " if add_vision_id else ""
                 seg = (
-                    f"<|im_start|>user\nPicture {idx}: <|vision_start|>"
+                    f"{sys_prefix}<|im_start|>user\n{vis_label}<|vision_start|>"
                     if idx == 1
-                    else f"<|vision_end|>Picture {idx}: <|vision_start|>"
+                    else f"<|vision_end|>{vis_label}<|vision_start|>"
                 )
                 toks.extend(
                     self._enc.encode(seg, allowed_special="all", disallowed_special=())
@@ -314,7 +371,6 @@ class MOSSImageTokenizer:
             toks.extend(
                 self._enc.encode(tail, allowed_special="all", disallowed_special=())
             )
-
         if max_sequence_length > 0 and len(toks) > max_sequence_length:
             toks = toks[:max_sequence_length]
         return toks

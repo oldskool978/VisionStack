@@ -118,6 +118,9 @@ def build_default_request() -> GenerationRequest:
     raw_kwargs: Dict[str, Any] = {
         "prompt": str(d.get("prompt", DEFAULT_POSITIVE_PROMPT)),
         "negative_prompt": str(d.get("negative_prompt", "")),
+        "system_prompt": d.get("system_prompt", None),
+        "thinking_trace": d.get("thinking_trace", None),
+        "add_vision_id": bool(d.get("add_vision_id", True)),
         "model_variant": str(d.get("model_variant", "sft")),
         "prompt_mode": str(d.get("prompt_mode", "natural")),
         "layout_summary": str(d.get("layout_summary", DEFAULT_LAYOUT_SUMMARY)),
@@ -125,6 +128,11 @@ def build_default_request() -> GenerationRequest:
         "layout_coords_are_pixels": bool(d.get("layout_coords_are_pixels", True)),
         "preserve_canvas_outside_boxes": bool(
             d.get("preserve_canvas_outside_boxes", False)
+        ),
+        "box_attn_isolation": float(d.get("box_attn_isolation", 0.0)),
+        "uncond_uses_references": d.get("uncond_uses_references", None),
+        "composite_box_images_to_init": bool(
+            d.get("composite_box_images_to_init", False)
         ),
         "enable_thinking": bool(d.get("enable_thinking", True)),
         "width": int(d.get("width", 1024)),
@@ -241,7 +249,9 @@ load_request_from_json = lambda path: load_or_create_initial_request(path)[0]
 save_request_to_json = save_request_json
 
 
-def _truncate(text: str, max_len: int = 68) -> str:
+def _truncate(text: Optional[str], max_len: int = 68) -> str:
+    if not text:
+        return "<Empty>"
     clean = " ".join(text.strip().split())
     if not clean:
         return "<Empty>"
@@ -275,6 +285,11 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
         if (req.edit_lora_path and abs(req.edit_lora_scale) > 1e-6)
         else "<Disabled>"
     )
+    uncond_ref_str = (
+        "AUTO"
+        if req.uncond_uses_references is None
+        else ("ON" if req.uncond_uses_references else "OFF")
+    )
 
     print("\n" + "=" * 92)
     print("               SHADOWBOXER: OPENMOSS ARCHITECTURAL EXPLORATION HARNESS")
@@ -287,7 +302,7 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     )
     print(f" [2]  Positive Prompt:        {_truncate(req.prompt, 65)}")
     print(f" [3]  Negative Prompt:        {_truncate(req.negative_prompt, 65)}")
-    print(f" [4]  Qwen3.5 Thinking Mode:  {think_str}")
+    print(f" [4]  Qwen3.5 Thinking Mode:  {think_str} | VisionID: {req.add_vision_id}")
     print(f" [5]  Canvas Resolution:      {req.width} x {req.height} px (Multiples of 16)")
     print(" --- FLOW-MATCHING SCHEDULE & SOLVER REGIME ---")
     print(
@@ -322,6 +337,9 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     print(
         f" [17] Memory & Backends:      CPU Offload: {req.cpu_offload} | Vulkan: {req.prefer_vulkan} | RefCache: {req.use_reference_cache}"
     )
+    print(
+        f" [18] Spatio-Visual & ChatML: BoxIso: {float(req.box_attn_isolation or 0.0):.2f} | BoxSplat: {req.composite_box_images_to_init} | UncondRefs: {uncond_ref_str} | Sys/Trace: {_truncate(req.system_prompt or req.thinking_trace, 18)}"
+    )
     print("-" * 92)
     print(
         " [G]  Generate Master Image   [TP] Run 10-Vector Permutation Suite   [X] Custom Sweep Matrix"
@@ -344,6 +362,7 @@ def render_telemetry_report(
         if resp.viztoken_active
         else "FALLBACK TOKENIZER"
     )
+
     print("\n" + "=" * 92)
     print("                          SHADOWBOXER: OPENMOSS TELEMETRY REPORT")
     print("=" * 92)
@@ -383,7 +402,7 @@ def render_telemetry_report(
         f"Vision Conditioner:     {resp.vizinjector_backend} | Ref Cache Hit: {resp.reference_cache_hit}"
     )
     print(
-        f"Conditioning Routing:   Edit={resp.edit_format_used} | Framing={resp.framing_mode_used} | Role={resp.input_role_used} | t_ref=0: {resp.reference_zero_timestep_used} | IsoKV: {resp.reference_isolated_kv_used} | LoRA: {resp.edit_lora_active}"
+        f"Conditioning Routing:   Edit={resp.edit_format_used} | Framing={resp.framing_mode_used} | Role={resp.input_role_used} | t_ref=0: {resp.reference_zero_timestep_used} | IsoKV: {resp.reference_isolated_kv_used} | BoxIso: {resp.box_attn_isolation_used:.2f} | UncondRefs: {resp.uncond_uses_references_used} | BoxSplat: {resp.composite_box_images_used} | LoRA: {resp.edit_lora_active}"
     )
     print(f"Schedule Regime:        {sched_str} | Shift: {resp.shift_used:.2f}")
     print(
@@ -587,6 +606,7 @@ def run_permutation_suite(
     staged = stage_test_input_files()
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     active_base = base_req if base_req is not None else build_default_request()
+
     w = width_override or active_base.width
     h = height_override or active_base.height
     eff_steps = (
@@ -627,6 +647,8 @@ def run_permutation_suite(
         input_role="photo_ref",
         edit_lora_path=None,
         edit_lora_scale=0.0,
+        box_attn_isolation=0.0,
+        composite_box_images_to_init=False,
         layout_items=_get_layout_items(active_base)
         or [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
     )
@@ -785,6 +807,9 @@ def run_permutation_suite(
             "shared_prefix_tokens": resp.common_prefix_tokens,
             "t_ref_zero": resp.reference_zero_timestep_used,
             "iso_kv": resp.reference_isolated_kv_used,
+            "box_iso": round(resp.box_attn_isolation_used, 3),
+            "uncond_refs": resp.uncond_uses_references_used,
+            "composite_boxes": resp.composite_box_images_used,
             "lora_active": resp.edit_lora_active,
             "entropy_bits": round(resp.shannon_entropy_bits, 3),
             "sharpness": round(resp.laplacian_sharpness, 4),
@@ -851,6 +876,7 @@ def interactive_loop(
 ) -> None:
     req = initial_req
     active_tag = banner_tag
+
     while True:
         render_menu(req, active_tag)
         try:
@@ -1149,6 +1175,59 @@ def interactive_loop(
                         "0",
                         "false",
                     )
+            elif cmd == "18":
+                iso_in = input(
+                    f"Box Attention Isolation [0.0-1.0] (Current: {float(req.box_attn_isolation or 0.0):.2f}): "
+                ).strip()
+                spl_in = input(
+                    f"Composite Box Images to Init Canvas? [y/N] (Current: {req.composite_box_images_to_init}): "
+                ).strip()
+                unc_in = input(
+                    f"Uncond Uses References? ['auto', 'true', 'false'] (Current: {req.uncond_uses_references}): "
+                ).strip()
+                sys_in = input(
+                    f"System Prompt ('none' to clear, Blank to keep): "
+                ).strip()
+                trc_in = input(
+                    f"Thinking Trace ('none' to clear, Blank to keep): "
+                ).strip()
+                vid_in = input(
+                    f"Add 'Picture k:' Vision ID Prefix? [Y/n] (Current: {req.add_vision_id}): "
+                ).strip()
+                if iso_in:
+                    req.box_attn_isolation = max(0.0, min(1.0, float(iso_in)))
+                if spl_in:
+                    req.composite_box_images_to_init = spl_in.lower() in (
+                        "y",
+                        "yes",
+                        "1",
+                        "true",
+                    )
+                if unc_in:
+                    if unc_in.lower() == "auto":
+                        req.uncond_uses_references = None
+                    else:
+                        req.uncond_uses_references = unc_in.lower() in (
+                            "y",
+                            "yes",
+                            "1",
+                            "true",
+                        )
+                if sys_in.lower() == "none":
+                    req.system_prompt = None
+                elif sys_in:
+                    req.system_prompt = sys_in
+                if trc_in.lower() == "none":
+                    req.thinking_trace = None
+                elif trc_in:
+                    req.thinking_trace = trc_in
+                if vid_in:
+                    req.add_vision_id = vid_in.lower() not in (
+                        "n",
+                        "no",
+                        "0",
+                        "false",
+                    )
             else:
                 print(f"[!] Unrecognized option: '{choice}'")
         except Exception as e:
@@ -1166,6 +1245,10 @@ def main() -> None:
     parser.add_argument("--stage_inputs", action="store_true")
     parser.add_argument("--warmup", action="store_true")
     parser.add_argument("--prompt", type=str, default=None)
+    parser.add_argument("--system_prompt", type=str, default=None)
+    parser.add_argument("--thinking_trace", type=str, default=None)
+    parser.add_argument("--box_attn_isolation", type=float, default=None)
+    parser.add_argument("--composite_box_images", action="store_true")
     parser.add_argument(
         "--model_variant",
         "--variant",
@@ -1190,6 +1273,14 @@ def main() -> None:
     req, banner_tag = load_or_create_initial_request(cfg_path)
     if args.prompt is not None:
         req.prompt = args.prompt
+    if args.system_prompt is not None:
+        req.system_prompt = args.system_prompt
+    if args.thinking_trace is not None:
+        req.thinking_trace = args.thinking_trace
+    if args.box_attn_isolation is not None:
+        req.box_attn_isolation = max(0.0, min(1.0, float(args.box_attn_isolation)))
+    if args.composite_box_images:
+        req.composite_box_images_to_init = True
     if args.model_variant is not None:
         req.model_variant = args.model_variant
         req.repo_id = None

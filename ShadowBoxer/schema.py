@@ -60,6 +60,9 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "model_variant": "sft",
     "prompt_mode": "natural",
     "negative_prompt": "",
+    "system_prompt": None,
+    "thinking_trace": None,
+    "add_vision_id": True,
     "layout_coords_are_pixels": True,
     "height": 1024,
     "width": 1024,
@@ -95,6 +98,9 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "apply_bayer_dither": True,
     "use_reference_cache": True,
     "preserve_canvas_outside_boxes": False,
+    "box_attn_isolation": 0.0,
+    "uncond_uses_references": None,
+    "composite_box_images_to_init": False,
     "edit_lora_path": None,
     "edit_lora_scale": 1.0,
     "num_images_per_prompt": 1,
@@ -119,6 +125,8 @@ _INTERNAL_BOX_KEYS = {
     "input_role",
     "denoise_strength",
     "inpaint_box",
+    "isolate_box_attn",
+    "paste_to_canvas",
     "id",
     "label",
     "enabled",
@@ -211,7 +219,6 @@ def compile_layout_prompt(
             continue
         raw_entry = dict(item)
         bbox = raw_entry.get("bbox")
-
         clean_entry: Dict[str, Any] = {}
         for k, v in raw_entry.items():
             if k in _INTERNAL_BOX_KEYS or v is None:
@@ -302,8 +309,8 @@ def parse_layer_list(
 def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "engine_defaults" in data and isinstance(data["engine_defaults"], dict):
         data = data["engine_defaults"]
-    harvested: Dict[str, Any] = {}
 
+    harvested: Dict[str, Any] = {}
     if "model_variant" in data and isinstance(data["model_variant"], str):
         mv = data["model_variant"].strip().lower()
         if mv in SUPPORTED_MODELS:
@@ -316,6 +323,13 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
 
     if "negative_prompt" in data and isinstance(data["negative_prompt"], str):
         harvested["negative_prompt"] = data["negative_prompt"]
+
+    for str_opt_key in ("system_prompt", "thinking_trace"):
+        if str_opt_key in data:
+            val = data[str_opt_key]
+            harvested[str_opt_key] = (
+                str(val) if (isinstance(val, str) and val.strip()) else None
+            )
 
     if "layout_coords_are_pixels" in data and data["layout_coords_are_pixels"] is not None:
         harvested["layout_coords_are_pixels"] = bool(data["layout_coords_are_pixels"])
@@ -373,7 +387,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
 
     if "uncond_skip_layers" in data:
         harvested["uncond_skip_layers"] = parse_layer_list(data["uncond_skip_layers"])
-
     if "slg_layers" in data:
         harvested["slg_layers"] = parse_layer_list(data["slg_layers"])
 
@@ -383,7 +396,7 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         except (ValueError, TypeError):
             pass
 
-    for b_key in ("slg_start", "slg_stop", "eta"):
+    for b_key in ("slg_start", "slg_stop", "eta", "box_attn_isolation"):
         if b_key in data and data[b_key] is not None:
             try:
                 harvested[b_key] = max(0.0, min(1.0, float(data[b_key])))
@@ -454,8 +467,13 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             str(val).strip() if (isinstance(val, str) and val.strip()) else None
         )
 
+    if "uncond_uses_references" in data:
+        val = data["uncond_uses_references"]
+        harvested["uncond_uses_references"] = None if val is None else bool(val)
+
     for flag_key in (
         "enable_thinking",
+        "add_vision_id",
         "cpu_offload",
         "prepass_warmup",
         "deband_8bit",
@@ -463,6 +481,7 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         "apply_bayer_dither",
         "use_reference_cache",
         "preserve_canvas_outside_boxes",
+        "composite_box_images_to_init",
     ):
         if flag_key in data and data[flag_key] is not None:
             harvested[flag_key] = bool(data[flag_key])
@@ -534,38 +553,53 @@ def has_custom_default_preset() -> bool:
 class GenerationRequest(BaseModel):
     model_variant: str = Field(default="sft")
     repo_id: Optional[str] = Field(default=None)
+
     prompt: str = Field(default="")
     negative_prompt: str = Field(default="")
+    system_prompt: Optional[str] = Field(default=None)
+    thinking_trace: Optional[str] = Field(default=None)
+    add_vision_id: Optional[bool] = Field(default=None)
     prompt_mode: str = Field(default="natural")
     layout_summary: Optional[str] = Field(default=None)
     layout_items: List[Dict[str, Any]] = Field(default_factory=list)
     layout_coords_are_pixels: bool = Field(default=True)
     preserve_canvas_outside_boxes: Optional[bool] = Field(default=None)
+    box_attn_isolation: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    composite_box_images_to_init: Optional[bool] = Field(default=None)
+
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1024, ge=256, le=2048)
+
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     shift: Optional[float] = Field(default=None, ge=0.1, le=20.0)
     use_v2_grid: Optional[bool] = Field(default=None)
+
     early_solver: Optional[str] = Field(default=None)
     late_solver: Optional[str] = Field(default=None)
     handoff_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     early_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     late_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
+
     uncond_skip_layers: Optional[List[int]] = Field(default=None)
     slg_layers: Optional[List[int]] = Field(default=None)
     slg_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     slg_start: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     slg_stop: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
     eta: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     s_noise: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+
     max_sequence_length: Optional[int] = Field(default=None, ge=64, le=4096)
     enable_thinking: Optional[bool] = Field(default=None)
+
     init_image_path: Optional[str] = Field(default=None)
     denoise_strength: float = Field(default=1.0, ge=0.01, le=1.0)
     inpaint_mask_path: Optional[str] = Field(default=None)
     control_image_path: Optional[str] = Field(default=None)
     reference_image_paths: List[str] = Field(default_factory=list)
+
     framing_mode: Optional[str] = Field(default=None)
     input_role: Optional[str] = Field(default=None)
     edit_format: Optional[str] = Field(default=None)
@@ -578,12 +612,16 @@ class GenerationRequest(BaseModel):
     latent_clamp_sigma: Optional[float] = Field(default=None, ge=2.0, le=12.0)
     apply_bayer_dither: Optional[bool] = Field(default=None)
     use_reference_cache: Optional[bool] = Field(default=None)
+
     reference_zero_timestep: Optional[bool] = Field(default=None)
     reference_isolated_kv: Optional[bool] = Field(default=None)
+    uncond_uses_references: Optional[bool] = Field(default=None)
     edit_lora_path: Optional[str] = Field(default=None)
     edit_lora_scale: float = Field(default=1.0, ge=0.0, le=4.0)
+
     export_vizj_path: Optional[str] = Field(default=None)
     export_vizj_tier: int = Field(default=2, ge=0, le=2)
+
     num_images_per_prompt: int = Field(default=1, ge=1, le=8)
     seed: Optional[int] = Field(default=42)
     output_path: str = Field(default="output_moss_master.png")
@@ -618,6 +656,15 @@ class GenerationRequest(BaseModel):
     def _sync_defaults(self) -> GenerationRequest:
         active = get_active_engine_defaults()
         use_custom = has_custom_default_preset()
+
+        if self.system_prompt is None and active.get("system_prompt") is not None:
+            self.system_prompt = str(active["system_prompt"])
+        if self.thinking_trace is None and active.get("thinking_trace") is not None:
+            self.thinking_trace = str(active["thinking_trace"])
+        if self.add_vision_id is None or (
+            use_custom and self.add_vision_id == BASELINE_ENGINE_DEFAULTS["add_vision_id"]
+        ):
+            self.add_vision_id = bool(active.get("add_vision_id", True))
 
         if self.num_inference_steps is None or (
             use_custom
@@ -805,6 +852,28 @@ class GenerationRequest(BaseModel):
                 active.get("preserve_canvas_outside_boxes", False)
             )
 
+        if self.box_attn_isolation is None or (
+            use_custom
+            and self.box_attn_isolation
+            == BASELINE_ENGINE_DEFAULTS["box_attn_isolation"]
+        ):
+            self.box_attn_isolation = float(active.get("box_attn_isolation", 0.0))
+
+        if self.composite_box_images_to_init is None or (
+            use_custom
+            and self.composite_box_images_to_init
+            == BASELINE_ENGINE_DEFAULTS["composite_box_images_to_init"]
+        ):
+            self.composite_box_images_to_init = bool(
+                active.get("composite_box_images_to_init", False)
+            )
+
+        if (
+            self.uncond_uses_references is None
+            and active.get("uncond_uses_references") is not None
+        ):
+            self.uncond_uses_references = bool(active["uncond_uses_references"])
+
         if self.cpu_offload is None or (
             use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]
         ):
@@ -840,19 +909,48 @@ class GenerationRequest(BaseModel):
     def resolve_visual_references(
         self,
     ) -> Tuple[List[Dict[str, Any]], Dict[int, int]]:
+        """
+        Resolves global and box-bound visual references while maintaining independent
+        1-based indices for:
+          - dit_ref_index: 4D-RoPE reference latent index (r >= 1) across all roles.
+          - picture_index: Qwen3.5 ViT 'Picture k' index strictly over ViT-emitting refs.
+        """
         specs: List[Dict[str, Any]] = []
         box_pic_map: Dict[int, int] = {}
+        dit_ref_counter = 0
+        vit_pic_counter = 0
+
+        global_role = str(self.input_role or "photo_ref").lower()
+        if global_role not in SUPPORTED_INPUT_ROLES:
+            global_role = "photo_ref"
+        global_framing = str(self.framing_mode or "inscribed").lower()
+        if global_framing not in SUPPORTED_FRAMING_MODES:
+            global_framing = "inscribed"
+        global_emits_vit = (global_role == "photo_ref") and (
+            self.edit_format != "moss_image_edit"
+        )
 
         for p_str in self.reference_image_paths:
             if isinstance(p_str, str) and p_str.strip():
+                dit_ref_counter += 1
+                pic_idx: Optional[int] = None
+                if global_emits_vit:
+                    vit_pic_counter += 1
+                    pic_idx = vit_pic_counter
                 specs.append(
                     {
                         "path": p_str.strip(),
                         "norm_bbox": None,
                         "pixel_bbox": None,
-                        "framing_mode": self.framing_mode or "inscribed",
-                        "input_role": self.input_role or "photo_ref",
+                        "framing_mode": global_framing,
+                        "input_role": global_role,
                         "box_index": None,
+                        "picture_index": pic_idx,
+                        "dit_ref_index": dit_ref_counter,
+                        "emits_vit": global_emits_vit,
+                        "isolate_box_attn": 0.0,
+                        "paste_to_canvas": False,
+                        "denoise_strength": None,
                     }
                 )
 
@@ -883,16 +981,52 @@ class GenerationRequest(BaseModel):
                     width=self.width,
                     coords_are_pixels=self.layout_coords_are_pixels,
                 )
-            fm = str(
-                item.get("framing_mode") or self.framing_mode or "inscribed"
-            ).lower()
-            if fm not in SUPPORTED_FRAMING_MODES:
-                fm = self.framing_mode or "inscribed"
+
+            # Box-anchored references default to box-conformal framing ("inscribed")
+            # when global framing is "never_crop" so the resampled latent grid matches
+            # the target bounding box aspect ratio without shearing.
+            raw_box_fm = item.get("framing_mode")
+            if isinstance(raw_box_fm, str) and raw_box_fm.strip().lower() in SUPPORTED_FRAMING_MODES:
+                fm = raw_box_fm.strip().lower()
+            elif norm_box is not None and global_framing == "never_crop":
+                fm = "inscribed"
+            else:
+                fm = global_framing
+
             role = str(
                 item.get("input_role") or self.input_role or "photo_ref"
             ).lower()
             if role not in SUPPORTED_INPUT_ROLES:
-                role = self.input_role or "photo_ref"
+                role = global_role
+
+            emits_vit = role == "photo_ref"
+            dit_ref_counter += 1
+            pic_idx = None
+            if emits_vit:
+                vit_pic_counter += 1
+                pic_idx = vit_pic_counter
+                box_pic_map[idx] = pic_idx
+
+            raw_iso = item.get("isolate_box_attn")
+            if raw_iso is not None:
+                box_iso = max(0.0, min(1.0, float(raw_iso)))
+            elif norm_box is not None:
+                box_iso = max(0.0, min(1.0, float(self.box_attn_isolation or 0.0)))
+            else:
+                box_iso = 0.0
+
+            raw_paste = item.get("paste_to_canvas")
+            if raw_paste is not None:
+                paste_flag = bool(raw_paste) and (norm_box is not None)
+            else:
+                paste_flag = bool(self.composite_box_images_to_init) and (
+                    norm_box is not None
+                )
+
+            raw_dn = item.get("denoise_strength")
+            box_dn = (
+                max(0.01, min(1.0, float(raw_dn))) if raw_dn is not None else None
+            )
 
             specs.append(
                 {
@@ -902,9 +1036,14 @@ class GenerationRequest(BaseModel):
                     "framing_mode": fm,
                     "input_role": role,
                     "box_index": idx,
+                    "picture_index": pic_idx,
+                    "dit_ref_index": dit_ref_counter,
+                    "emits_vit": emits_vit,
+                    "isolate_box_attn": box_iso,
+                    "paste_to_canvas": paste_flag,
+                    "denoise_strength": box_dn,
                 }
             )
-            box_pic_map[idx] = len(specs)
 
         return specs, box_pic_map
 
@@ -931,6 +1070,16 @@ class GenerationRequest(BaseModel):
             "moss_image_edit",
             "ai_toolkit_isolated",
             "control_color_depth",
+        )
+
+    @property
+    def effective_uncond_uses_references(self) -> bool:
+        if self.uncond_uses_references is not None:
+            return bool(self.uncond_uses_references)
+        return not (
+            self.edit_format in ("ai_toolkit_isolated", "ai_toolkit_full")
+            and not self.has_box_images()
+            and not bool(self.control_image_path)
         )
 
     def resolve_repo_id(self) -> str:
@@ -981,6 +1130,10 @@ class GenerationRequest(BaseModel):
         if not (0.0 <= self.slg_start <= self.slg_stop <= 1.0):
             raise ValueError(
                 "SLG window must satisfy 0.0 <= slg_start <= slg_stop <= 1.0."
+            )
+        if not (0.0 <= float(self.box_attn_isolation or 0.0) <= 1.0):
+            raise ValueError(
+                f"box_attn_isolation must be in [0.0, 1.0], got {self.box_attn_isolation}"
             )
         if not self.compile_effective_prompt():
             raise ValueError("Prompt cannot be empty.")
@@ -1045,6 +1198,9 @@ class GenerationResponse(BaseModel):
     input_role_used: str = Field(default="photo_ref")
     reference_zero_timestep_used: bool = Field(default=False)
     reference_isolated_kv_used: bool = Field(default=False)
+    box_attn_isolation_used: float = Field(default=0.0)
+    uncond_uses_references_used: bool = Field(default=True)
+    composite_box_images_used: bool = Field(default=False)
     edit_lora_active: bool = Field(default=False)
     effective_prompt: str
     mean_luminance: float

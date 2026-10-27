@@ -26,7 +26,6 @@ import unicodedata
 
 ROOT_DIR = Path(__file__).resolve().parent
 IS_WIN = sys.platform == "win32"
-
 _DLL_NAMES = (
     ("viztoken.dll", "tiktalkin.dll")
     if IS_WIN
@@ -361,13 +360,11 @@ def find_common_prefix(
         tokens_a = tokens_a.detach().cpu().numpy().ravel()
     if hasattr(tokens_b, "detach"):
         tokens_b = tokens_b.detach().cpu().numpy().ravel()
-
     len_a = len(tokens_a)
     len_b = len(tokens_b)
     limit = len_a if len_a < len_b else len_b
     if limit == 0:
         return 0
-
     try:
         import numpy as np
 
@@ -382,7 +379,6 @@ def find_common_prefix(
             return int(binding.find_common_prefix(ptr_a, limit, ptr_b, limit))
     except Exception:
         pass
-
     for i in range(limit):
         if tokens_a[i] != tokens_b[i]:
             return i
@@ -398,8 +394,8 @@ class Encoding:
     ):
         self._name = name
         self._binding = get_binding()
-
         resolved_ranks: Optional[Path] = None
+
         if ranks_path is not None:
             p = Path(ranks_path).resolve()
             if p.is_file() and p.suffix == ".bin":
@@ -593,7 +589,6 @@ class Encoding:
 
         if allowed_special == "all":
             return self._encode_all_special_unchecked(text)
-
         if not allowed_special:
             return self.encode_ordinary(text)
 
@@ -609,7 +604,6 @@ class Encoding:
         valid_allowed.sort(key=len, reverse=True)
         pattern = f"({'|'.join(re.escape(s) for s in valid_allowed)})"
         parts = re.split(pattern, text)
-
         result: List[int] = []
         for part in parts:
             if not part:
@@ -626,12 +620,30 @@ class Encoding:
         enable_thinking: bool = True,
         max_sequence_length: int = 4096,
         image_patch_counts: Optional[Sequence[int]] = None,
+        system_prompt: Optional[str] = None,
+        thinking_trace: Optional[str] = None,
+        add_vision_id: bool = True,
     ) -> List[int]:
         norm_prompt = unicodedata.normalize("NFC", prompt).strip()
-        think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+        sys_prefix = ""
+        if system_prompt is not None:
+            norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
+            if norm_sys:
+                sys_prefix = f"<|im_start|>system\n{norm_sys}<|im_end|>\n"
+
+        if thinking_trace is not None:
+            norm_trace = unicodedata.normalize("NFC", thinking_trace).strip()
+        else:
+            norm_trace = ""
+
+        if norm_trace:
+            think_suffix = f"<think>\n{norm_trace}\n</think>\n\n"
+        else:
+            think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+
         if not image_patch_counts:
             full_text = (
-                f"<|im_start|>user\n{norm_prompt}<|im_end|>\n"
+                f"{sys_prefix}<|im_start|>user\n{norm_prompt}<|im_end|>\n"
                 f"<|im_start|>assistant\n{think_suffix}"
             )
             toks = self._encode_all_special_unchecked(full_text)
@@ -639,10 +651,11 @@ class Encoding:
             img_pad_id = self._special_token_to_id.get("<|image_pad|>", 248056)
             toks = []
             for idx, count in enumerate(image_patch_counts, start=1):
+                vis_label = f"Picture {idx}: " if add_vision_id else ""
                 seg = (
-                    f"<|im_start|>user\nPicture {idx}: <|vision_start|>"
+                    f"{sys_prefix}<|im_start|>user\n{vis_label}<|vision_start|>"
                     if idx == 1
-                    else f"<|vision_end|>Picture {idx}: <|vision_start|>"
+                    else f"<|vision_end|>{vis_label}<|vision_start|>"
                 )
                 toks.extend(self._encode_all_special_unchecked(seg))
                 toks.extend([img_pad_id] * max(1, int(count)))
@@ -651,7 +664,6 @@ class Encoding:
                 f"<|im_start|>assistant\n{think_suffix}"
             )
             toks.extend(self._encode_all_special_unchecked(tail))
-
         if max_sequence_length > 0 and len(toks) > max_sequence_length:
             toks = toks[:max_sequence_length]
         return toks

@@ -97,14 +97,16 @@ def _configure_rocm_runtime_env() -> None:
 
 
 _configure_rocm_runtime_env()
+
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 import numpy as np
 from PIL import Image
+from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors
 import torch
 import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
-from safetensors.torch import load_file as load_safetensors
 
 if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -114,7 +116,11 @@ if hasattr(torch.backends, "cudnn"):
 if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("highest")
 
-from models.modeling_moss import MOSSImageTransformer, validate_skip_layers
+from models.modeling_moss import (
+    MOSSImageConfig,
+    MOSSImageTransformer,
+    validate_skip_layers,
+)
 from models.modeling_qwen35 import Qwen3_5Model
 from models.modeling_vae import Flux2AutoencoderKL
 from models.tokenizer import MOSSImageTokenizer
@@ -165,6 +171,17 @@ _MAX_INACTIVE_SPLIT_BYTES = 512 * (1024**2)
 _AI_TOOLKIT_MAX_REF_DIM = 512
 
 _GENERATOR_CACHE: Dict[str, torch.Generator] = {}
+
+
+def _canonicalize_device(device: Union[str, torch.device]) -> torch.device:
+    dev = torch.device(device) if isinstance(device, str) else device
+    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return dev
+
+
+def _same_device(dev_a: torch.device, dev_b: torch.device) -> bool:
+    return _canonicalize_device(dev_a) == _canonicalize_device(dev_b)
 
 
 class _DXGI_ADAPTER_DESC1(ctypes.Structure):
@@ -234,7 +251,7 @@ class WDDMMemorySnapshot:
 
 class WDDMMemoryGuard:
     def __init__(self, device: torch.device):
-        self.device = device
+        self.device = _canonicalize_device(device)
         self.active = False
         self.adapter_name = "Generic GPU"
         self.luid_key = ""
@@ -242,6 +259,7 @@ class WDDMMemoryGuard:
         self.shared_budget_gb = 0.0
         self.shared_baseline_gb = 0.0
         self._adapter3 = ctypes.c_void_p()
+
         if sys.platform == "win32" and self.device.type == "cuda":
             self._init_win32_telemetry()
 
@@ -342,6 +360,7 @@ class WDDMMemoryGuard:
                     hw_seen += 1
                 self._call_com(adapter, 2, [ctypes.c_void_p])
                 adapter_idx += 1
+
             self._call_com(factory, 2, [ctypes.c_void_p])
             if self.active:
                 _, shr_used = self._query_video_memory_info()
@@ -478,12 +497,20 @@ class WDDMMemoryGuard:
             return snap
         reserved_bytes = int(snap.pt_reserved_gb * (1024**3))
         split_bytes = int(snap.pt_inactive_split_gb * (1024**3))
+        adaptive_trim_bytes = (
+            max(
+                _VRAM_TRIM_THRESHOLD_BYTES,
+                int(snap.dedicated_total_gb * 0.94 * (1024**3)),
+            )
+            if snap.dedicated_total_gb > 0.0
+            else _VRAM_TRIM_THRESHOLD_BYTES
+        )
         needs_eviction = (
             force
             or snap.is_spilling
             or (snap.contiguous_avail_gb < required_headroom_gb)
             or (split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
-            or (reserved_bytes > _VRAM_TRIM_THRESHOLD_BYTES)
+            or (reserved_bytes > adaptive_trim_bytes)
         )
         if needs_eviction:
             gc.collect()
@@ -585,7 +612,6 @@ def _resolve_unboxed_reference_dims(
         else req_h
     )
     max_area = float(max(64 * 64, cap_w * cap_h))
-
     dims = _probe_image_dimensions(path)
     if dims is not None and dims[0] > 0 and dims[1] > 0:
         src_w, src_h = dims
@@ -594,7 +620,6 @@ def _resolve_unboxed_reference_dims(
         out_w = max(64, int(round((src_w * scale) / 16.0)) * 16)
         out_h = max(64, int(round((src_h * scale) / 16.0)) * 16)
         return out_w, out_h
-
     return max(64, (cap_w // 16) * 16), max(64, (cap_h // 16) * 16)
 
 
@@ -622,7 +647,10 @@ def build_box_aperture_mask(
     for item in layout_items:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
-        if only_flagged_boxes and not bool(item.get("inpaint_box", False)):
+        if only_flagged_boxes and not (
+            bool(item.get("inpaint_box", False))
+            or bool(item.get("paste_to_canvas", False))
+        ):
             continue
         bbox = item.get("bbox")
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
@@ -654,6 +682,81 @@ def build_box_aperture_mask(
     return mask.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)
 
 
+def splat_box_latents_to_canvas(
+    base_canvas: Optional[torch.Tensor],
+    splat_entries: Sequence[
+        Tuple[
+            torch.Tensor,
+            Tuple[float, float, float, float],
+            Optional[torch.Tensor],
+            Optional[float],
+        ]
+    ],
+    h_lat: int,
+    w_lat: int,
+    latent_channels: int,
+    feather_radius_lat: float,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if base_canvas is not None:
+        canvas = base_canvas.to(device=device, dtype=torch.float32).clone()
+        if canvas.shape[-2:] != (h_lat, w_lat):
+            canvas = F.interpolate(
+                canvas, size=(h_lat, w_lat), mode="bilinear", align_corners=False
+            )
+    else:
+        canvas = torch.zeros(
+            (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
+        )
+
+    union_alpha = torch.zeros((1, 1, h_lat, w_lat), device=device, dtype=torch.float32)
+    feather = max(0.25, float(feather_radius_lat))
+
+    for box_lat_cpu, norm_bbox, box_mask_cpu, _ in splat_entries:
+        uy0, ux0, uy1, ux1 = norm_bbox
+        y0 = max(0, min(h_lat - 1, int(round(uy0 * h_lat))))
+        x0 = max(0, min(w_lat - 1, int(round(ux0 * w_lat))))
+        y1 = max(y0 + 1, min(h_lat, int(round(uy1 * h_lat))))
+        x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
+        bh = y1 - y0
+        bw = x1 - x0
+
+        b_lat = box_lat_cpu.to(device=device, dtype=torch.float32)
+        if b_lat.shape[-2:] != (bh, bw):
+            b_lat = F.interpolate(
+                b_lat, size=(bh, bw), mode="bilinear", align_corners=False
+            )
+
+        yy = torch.arange(bh, device=device, dtype=torch.float32).unsqueeze(1) + 0.5
+        xx = torch.arange(bw, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
+        d_edge = torch.minimum(
+            torch.minimum(yy, float(bh) - yy),
+            torch.minimum(xx, float(bw) - xx),
+        )
+        edge_ramp = 0.5 * (
+            1.0 - torch.cos(math.pi * (d_edge / feather).clamp(0.0, 1.0))
+        )
+        local_alpha = edge_ramp.unsqueeze(0).unsqueeze(0)
+
+        if box_mask_cpu is not None:
+            b_mask = box_mask_cpu.to(device=device, dtype=torch.float32)
+            if b_mask.shape[-2:] != (bh, bw):
+                b_mask = F.interpolate(
+                    b_mask, size=(bh, bw), mode="bilinear", align_corners=False
+                )
+            local_alpha = local_alpha * b_mask.clamp(0.0, 1.0)
+
+        region = canvas[:, :, y0:y1, x0:x1]
+        canvas[:, :, y0:y1, x0:x1] = (
+            local_alpha * b_lat + (1.0 - local_alpha) * region
+        )
+        union_alpha[:, :, y0:y1, x0:x1] = torch.maximum(
+            union_alpha[:, :, y0:y1, x0:x1], local_alpha
+        )
+
+    return canvas, union_alpha.clamp(0.0, 1.0)
+
+
 def splitmix64(seed: int) -> int:
     z = (seed + _SPLITMIX64_C1) & _MASK64
     z = ((z ^ (z >> 30)) * _SPLITMIX64_C2) & _MASK64
@@ -683,7 +786,7 @@ def philox_randn(
     device: Union[str, torch.device] = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    target_device = torch.device(device) if isinstance(device, str) else device
+    target_device = _canonicalize_device(device)
     eff_seed = derive_effective_seed(seed, stream_id, offset)
     dev_key = f"{target_device.type}:{target_device.index if target_device.index is not None else 0}"
     gen = _GENERATOR_CACHE.get(dev_key)
@@ -939,6 +1042,7 @@ class BifurcatedFlowMatchScheduler:
         target_device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
+
         if self.use_v2_grid:
             snapped = compute_moss_v2_sigmas(
                 num_inference_steps=num_inference_steps,
@@ -960,8 +1064,8 @@ class BifurcatedFlowMatchScheduler:
         self.base_sigmas = torch.from_numpy(base_sigmas_np.astype(np.float32)).to(
             device=target_device
         )
-        active_steps = len(sigmas_np)
 
+        active_steps = len(sigmas_np)
         if self.handoff_threshold >= 1.0:
             k_star = active_steps
         elif self.handoff_threshold <= 0.0:
@@ -984,6 +1088,7 @@ class BifurcatedFlowMatchScheduler:
 
         step_configs: List[Dict[str, Any]] = []
         eval_timesteps: List[float] = []
+
         for i in range(active_steps):
             is_early = i < k_star
             solver = self.early_solver if is_early else self.late_solver
@@ -1123,6 +1228,7 @@ class BifurcatedFlowMatchScheduler:
         num_passes = len(self._step_configs)
         if self._step_index is None or self._step_index >= num_passes:
             self.reset()
+
         v = (
             model_output[0].float()
             if isinstance(model_output, (tuple, list))
@@ -1179,6 +1285,7 @@ class BifurcatedFlowMatchScheduler:
                     dx = dx + c3 * self._history[-3]
             else:
                 dx = dt * v
+
             if is_early and self.eta > 0.0 and s_next > 0.0:
                 disp = self._calc_sde_dispersion(
                     sample_f32, v, s_curr, s_next, generator=generator
@@ -1186,6 +1293,7 @@ class BifurcatedFlowMatchScheduler:
                 prev_sample = sample_f32 + dx + disp
             else:
                 prev_sample = sample_f32 + dx
+
             if solver in ("ipndm", "multitree") and self.ipndm_max_order > 1:
                 self._push_history(v)
 
@@ -1448,6 +1556,7 @@ class EngineProgressReporter:
         is_final = current >= total
         if not is_final and (now - self.last_render < self.render_interval):
             return
+
         self.last_render = now
         self._render_bar(stage, current, total, now)
         if is_final:
@@ -1544,6 +1653,85 @@ def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
     )
 
 
+def _resolve_target_tensor_dtype(
+    clean_key: str,
+    src_tensor: torch.Tensor,
+    dtype: Optional[torch.dtype],
+) -> torch.dtype:
+    if not src_tensor.is_floating_point():
+        return src_tensor.dtype
+    if (
+        clean_key.endswith("bands")
+        or clean_key.endswith("inv_freq")
+        or clean_key.startswith("bn.")
+    ):
+        return torch.float32
+    if clean_key.endswith("A_log") or dtype is None:
+        return src_tensor.dtype
+    if src_tensor.dtype == torch.float32 and dtype != torch.float32:
+        return dtype
+    return src_tensor.dtype
+
+
+def stream_safetensors_inplace(
+    model_dir: Path,
+    target_module: torch.nn.Module,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> bool:
+    with torch.inference_mode(False), torch.no_grad():
+        target_dev = _canonicalize_device(device)
+        sf_files = sorted(set(model_dir.glob("*.safetensors")))
+        if not sf_files:
+            raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+
+        param_map: Dict[str, torch.nn.Parameter] = dict(
+            target_module.named_parameters()
+        )
+        buf_map: Dict[str, torch.Tensor] = dict(target_module.named_buffers())
+
+        for p in param_map.values():
+            if p.is_meta or not _same_device(p.device, target_dev):
+                return False
+
+        for sf_path in sf_files:
+            resolved_sf = sf_path.resolve(strict=True)
+            with safe_open(str(resolved_sf), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    clean_key = k[6:] if k.startswith("model.") else k
+                    target_t: Optional[torch.Tensor] = param_map.get(clean_key)
+                    if target_t is None:
+                        target_t = buf_map.get(clean_key)
+                    if target_t is None:
+                        continue
+
+                    v = f.get_tensor(k)
+                    t_dtype = _resolve_target_tensor_dtype(clean_key, v, dtype)
+                    if (
+                        not target_t.is_meta
+                        and _same_device(target_t.device, target_dev)
+                        and target_t.shape == v.shape
+                        and target_t.dtype == t_dtype
+                        and not target_t.is_inference()
+                    ):
+                        if v.dtype != t_dtype:
+                            v_cast = v.to(dtype=t_dtype)
+                            target_t.data.copy_(v_cast, non_blocking=True)
+                            del v_cast
+                        else:
+                            target_t.data.copy_(v, non_blocking=True)
+                    else:
+                        target_t.data = v.to(device=target_dev, dtype=t_dtype)
+                    del v
+
+        clear_fn = getattr(target_module, "clear_caches", None)
+        if callable(clear_fn):
+            clear_fn()
+        if target_dev.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(target_dev)
+        return True
+
+
 def load_sharded_safetensors_into(
     model_dir: Path,
     target_module: torch.nn.Module,
@@ -1551,52 +1739,44 @@ def load_sharded_safetensors_into(
     dtype: Optional[torch.dtype] = None,
 ) -> None:
     with torch.inference_mode(False), torch.no_grad():
+        target_dev = _canonicalize_device(device)
+        first_param = next(target_module.parameters(), None)
+        if (
+            first_param is not None
+            and not first_param.is_meta
+            and _same_device(first_param.device, target_dev)
+        ):
+            if stream_safetensors_inplace(
+                model_dir, target_module, device=target_dev, dtype=dtype
+            ):
+                return
+
         sf_files = sorted(set(model_dir.glob("*.safetensors")))
         if not sf_files:
             raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+
         state_dict: Dict[str, torch.Tensor] = {}
         for sf_path in sf_files:
-            raw = load_safetensors(str(sf_path), device="cpu")
-            for k, v in raw.items():
-                clean_key = k[6:] if k.startswith("model.") else k
-                if v.is_floating_point():
-                    if (
-                        clean_key.endswith("bands")
-                        or clean_key.endswith("inv_freq")
-                        or clean_key.startswith("bn.")
-                    ):
-                        state_dict[clean_key] = v.to(
-                            device=device, dtype=torch.float32
-                        )
-                    elif clean_key.endswith("A_log") or dtype is None:
-                        state_dict[clean_key] = v.to(device=device)
-                    elif v.dtype == torch.float32 and dtype != torch.float32:
-                        state_dict[clean_key] = v.to(device=device, dtype=dtype)
+            resolved_sf = sf_path.resolve(strict=True)
+            with safe_open(str(resolved_sf), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    clean_key = k[6:] if k.startswith("model.") else k
+                    v = f.get_tensor(k)
+                    t_dtype = _resolve_target_tensor_dtype(clean_key, v, dtype)
+                    if v.dtype != t_dtype:
+                        state_dict[clean_key] = v.to(device=target_dev, dtype=t_dtype)
                     else:
-                        state_dict[clean_key] = v.to(device=device)
-                else:
-                    state_dict[clean_key] = v.to(device=device)
-            del raw
+                        state_dict[clean_key] = v.to(device=target_dev)
+                    del v
 
         target_module.load_state_dict(state_dict, strict=True, assign=True)
         del state_dict
         gc.collect()
 
         for name, param in target_module.named_parameters():
-            if param.device != device:
-                if param.is_floating_point():
-                    if (
-                        name.endswith("A_log")
-                        or name.endswith("rope.bands")
-                        or dtype is None
-                    ):
-                        param.data = param.data.to(device=device)
-                    elif param.dtype == torch.float32 and dtype != torch.float32:
-                        param.data = param.data.to(device=device, dtype=dtype)
-                    else:
-                        param.data = param.data.to(device=device)
-                else:
-                    param.data = param.data.to(device=device)
+            if not _same_device(param.device, target_dev):
+                t_dtype = _resolve_target_tensor_dtype(name, param, dtype)
+                param.data = param.data.to(device=target_dev, dtype=t_dtype)
 
         for name, buf in target_module.named_buffers():
             if buf.is_floating_point():
@@ -1605,12 +1785,15 @@ def load_sharded_safetensors_into(
                     or name.endswith("inv_freq")
                     or dtype is None
                 ):
-                    if buf.device != device or buf.dtype != torch.float32:
-                        buf.data = buf.data.to(device=device, dtype=torch.float32)
-                elif buf.device != device:
-                    buf.data = buf.data.to(device=device)
-            elif buf.device != device:
-                buf.data = buf.data.to(device=device)
+                    if (
+                        not _same_device(buf.device, target_dev)
+                        or buf.dtype != torch.float32
+                    ):
+                        buf.data = buf.data.to(device=target_dev, dtype=torch.float32)
+                elif not _same_device(buf.device, target_dev):
+                    buf.data = buf.data.to(device=target_dev)
+            elif not _same_device(buf.device, target_dev):
+                buf.data = buf.data.to(device=target_dev)
 
 
 def compute_image_telemetry(pil_img: Image.Image) -> Tuple[float, float, float, float]:
@@ -1618,10 +1801,12 @@ def compute_image_telemetry(pil_img: Image.Image) -> Tuple[float, float, float, 
     luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
     mean_luma = float(np.mean(luma))
     rms_contrast = float(np.std(luma))
+
     luma_u8 = np.clip(np.round(luma * 255.0), 0, 255).astype(np.uint8)
     hist = np.bincount(luma_u8.ravel(), minlength=256).astype(np.float64)
     probs = hist[hist > 0] / float(luma_u8.size)
     entropy = float(-np.sum(probs * np.log2(probs)))
+
     if luma.shape[0] >= 3 and luma.shape[1] >= 3:
         lap = (
             luma[:-2, 1:-1]
@@ -1703,7 +1888,7 @@ class MOSSImageEngine:
         self.repo_id = repo_id or SUPPORTED_MODELS.get(
             self.model_variant, SUPPORTED_MODELS["sft"]
         )
-        self.device = torch.device(device) if isinstance(device, str) else device
+        self.device = _canonicalize_device(device)
         self.dtype = dtype
         self.vae_dtype = vae_dtype
 
@@ -1798,12 +1983,14 @@ class MOSSImageEngine:
                 self.memory_guard.close()
             except Exception:
                 pass
+
             if self.vizinjector is not None:
                 try:
                     self.vizinjector.close()
                 except Exception:
                     pass
                 self.vizinjector = None
+
             if self.tokenizer is not None:
                 close_fn = getattr(self.tokenizer, "close", None)
                 if callable(close_fn):
@@ -1812,9 +1999,11 @@ class MOSSImageEngine:
                     except Exception:
                         pass
                 self.tokenizer = None
+
             self.embed_cache.clear()
             self.ref_cache.clear()
             _GENERATOR_CACHE.clear()
+
             if self.transformer is not None:
                 try:
                     self.transformer.unfuse_lora()
@@ -1822,16 +2011,19 @@ class MOSSImageEngine:
                 except Exception:
                     pass
                 self.transformer = None
+
             if self.text_encoder is not None:
                 try:
                     self.text_encoder.clear_caches()
                 except Exception:
                     pass
                 self.text_encoder = None
+
             self.vae = None
             self._loaded_repo_id = None
             self._current_offload_state = None
             self._warmed_up = False
+
             gc.collect()
             if torch.cuda.is_available():
                 try:
@@ -1894,7 +2086,7 @@ class MOSSImageEngine:
                         self.transformer.to(target_device)
                         self.transformer.clear_caches()
                         self._current_offload_state = cpu_offload
-                        self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
+                        self._trim_reserved_vram(force=True, required_headroom_gb=1.50)
                         self.memory_guard.recalibrate_baseline()
                         return
                     self._current_offload_state = cpu_offload
@@ -1902,6 +2094,7 @@ class MOSSImageEngine:
                     return
 
             root_path = resolve_model_path(target_repo_id)
+
             if (
                 self.transformer is not None
                 and self.text_encoder is not None
@@ -1918,23 +2111,41 @@ class MOSSImageEngine:
                 transformer_dir = root_path / "transformer"
                 self.transformer.unfuse_lora()
                 self.transformer.clear_caches()
-                del self.transformer
-                self.transformer = None
-                self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
-                with _MetaWeightInitMode():
-                    self.transformer = MOSSImageTransformer.from_config_dir(
-                        transformer_dir
+
+                cfg_file = transformer_dir / "config.json"
+                same_arch = True
+                if cfg_file.is_file():
+                    incoming_cfg = MOSSImageConfig.from_json_file(cfg_file)
+                    same_arch = incoming_cfg == self.transformer.config
+
+                streamed_inplace = False
+                if same_arch:
+                    streamed_inplace = stream_safetensors_inplace(
+                        transformer_dir,
+                        self.transformer,
+                        device=target_device,
+                        dtype=self.dtype,
                     )
-                load_sharded_safetensors_into(
-                    transformer_dir,
-                    self.transformer,
-                    device=target_device,
-                    dtype=self.dtype,
-                )
+
+                if not streamed_inplace:
+                    del self.transformer
+                    self.transformer = None
+                    self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
+                    with _MetaWeightInitMode():
+                        self.transformer = MOSSImageTransformer.from_config_dir(
+                            transformer_dir
+                        )
+                    load_sharded_safetensors_into(
+                        transformer_dir,
+                        self.transformer,
+                        device=target_device,
+                        dtype=self.dtype,
+                    )
+                    self._trim_reserved_vram(force=False, required_headroom_gb=1.50)
+
                 self.transformer.clear_caches()
                 self.transformer.eval().requires_grad_(False)
                 self._loaded_repo_id = target_repo_id
-                self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
                 self.memory_guard.recalibrate_baseline()
                 logging.info(
                     "Hot-swap completed in %.2fs (Shared Qwen3.5 & Flux2-VAE retained).",
@@ -2005,7 +2216,7 @@ class MOSSImageEngine:
 
             self._loaded_repo_id = target_repo_id
             self._current_offload_state = cpu_offload
-            self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
+            self._trim_reserved_vram(force=True, required_headroom_gb=1.50)
             self.memory_guard.recalibrate_baseline()
             logging.info(
                 "MOSSImageEngine initialized (%s) in %.2fs.",
@@ -2026,7 +2237,7 @@ class MOSSImageEngine:
             ):
                 if self.transformer._lora_backups:
                     self.transformer.unfuse_lora()
-                    self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+                    self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
                 return False
 
             raw_spec = edit_lora_path.strip()
@@ -2071,12 +2282,11 @@ class MOSSImageEngine:
             lora_sd: Dict[str, torch.Tensor] = {}
             for sf in sf_files:
                 lora_sd.update(load_safetensors(str(sf), device="cpu"))
-
             fused = self.transformer.fuse_lora_state_dict(
                 lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
             )
             del lora_sd
-            self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
             return fused > 0
 
     def _condition_single_reference(
@@ -2116,6 +2326,7 @@ class MOSSImageEngine:
             mtf_boost=request.mtf_boost,
             mask_feather_radius=request.mask_feather_radius,
         )
+
         cached_vae_tuple: Optional[
             Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Any]]
         ] = None
@@ -2182,6 +2393,7 @@ class MOSSImageEngine:
                 latent_clamp_sigma=request.latent_clamp_sigma,
             )
             bundle = self.vizinjector.condition_image(image_path, viz_req)
+
             if have_cached_vae:
                 packed_lat = cached_vae_tuple[0]
                 latent_mask = cached_vae_tuple[1]
@@ -2207,7 +2419,7 @@ class MOSSImageEngine:
                     packed_lat = _evacuate_to_cpu(clamped_lat)
                     del raw_lat, clamped_lat
                     bundle.vae_tensor = None
-                    self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+                    self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
                 latent_mask = _evacuate_to_cpu(bundle.latent_mask)
 
             vit_embeds = _evacuate_to_cpu(bundle.vit_embeds)
@@ -2226,7 +2438,7 @@ class MOSSImageEngine:
                 vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
                 del img_splits
                 self.text_encoder.visual.clear_caches()
-                self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+                self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
 
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
@@ -2251,7 +2463,7 @@ class MOSSImageEngine:
                 )
                 packed_lat = _evacuate_to_cpu(clamped_lat)
                 del img_t, raw_lat, clamped_lat
-                self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+                self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
                 was_hit = False
 
             vit_embeds = None
@@ -2271,8 +2483,7 @@ class MOSSImageEngine:
                 vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
                 del img_splits
                 self.text_encoder.visual.clear_caches()
-                self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
-
+                self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
                 vit_embeds=vit_embeds,
@@ -2299,9 +2510,12 @@ class MOSSImageEngine:
         is_negative: bool = False,
         vision_reference_paths: Optional[Sequence[str]] = None,
         prebuilt_vision_records: Optional[Sequence[CachedReferenceRecord]] = None,
+        system_prompt: Optional[str] = None,
+        thinking_trace: Optional[str] = None,
+        add_vision_id: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         te_device = next(self.text_encoder.parameters()).device
-        out_device = device if device is not None else te_device
+        out_device = _canonicalize_device(device) if device is not None else te_device
 
         pixel_values: Optional[torch.Tensor] = None
         image_grid_thw: Optional[torch.Tensor] = None
@@ -2332,10 +2546,36 @@ class MOSSImageEngine:
                     pixel_values = torch.cat(
                         [r.vit_patches for r in valid_recs], dim=0
                     ).to(device=te_device, non_blocking=True)
+                else:
+                    resolved_embeds: List[torch.Tensor] = []
+                    for r in valid_recs:
+                        if r.vit_embeds is not None:
+                            resolved_embeds.append(
+                                r.vit_embeds.to(device=te_device, non_blocking=True)
+                            )
+                        elif r.vit_patches is not None and r.grid_thw is not None:
+                            splits = self.text_encoder.get_image_features(
+                                r.vit_patches,
+                                r.grid_thw.to(
+                                    device=self.text_encoder.visual.device,
+                                    non_blocking=True,
+                                ),
+                            )
+                            resolved_embeds.append(
+                                torch.cat(splits, dim=0).to(
+                                    device=te_device, non_blocking=True
+                                )
+                            )
+                            del splits
+                    if resolved_embeds:
+                        pre_vit_embeds = torch.cat(resolved_embeds, dim=0)
+                        del resolved_embeds
         elif vision_reference_paths:
-            patch_tensors = []
-            grid_tensors = []
-            embed_tensors = []
+            patch_tensors: List[torch.Tensor] = []
+            grid_tensors: List[torch.Tensor] = []
+            ordered_items: List[
+                Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]
+            ] = []
             patch_counts = []
             for p_str in vision_reference_paths:
                 p = Path(p_str)
@@ -2353,9 +2593,14 @@ class MOSSImageEngine:
                             n_llm = int(v_bundle.llm_tokens)
                             grid_tensors.append(v_bundle.grid_thw)
                             patch_counts.append(n_llm)
-                            if v_bundle.vit_embeds is not None:
-                                embed_tensors.append(v_bundle.vit_embeds)
-                            elif v_bundle.vit_patches is not None:
+                            ordered_items.append(
+                                (
+                                    v_bundle.vit_embeds,
+                                    v_bundle.vit_patches,
+                                    v_bundle.grid_thw,
+                                )
+                            )
+                            if v_bundle.vit_patches is not None:
                                 patch_tensors.append(v_bundle.vit_patches)
                             vision_sig_list.append(
                                 (str(p.resolve()), int(st.st_mtime_ns), int(n_llm))
@@ -2365,6 +2610,7 @@ class MOSSImageEngine:
                     patch_tensors.append(patches)
                     grid_tensors.append(g_thw)
                     patch_counts.append(n_llm)
+                    ordered_items.append((None, patches, g_thw))
                     vision_sig_list.append(
                         (str(p.resolve()), int(st.st_mtime_ns), int(n_llm))
                     )
@@ -2372,23 +2618,50 @@ class MOSSImageEngine:
                 image_grid_thw = torch.cat(grid_tensors, dim=0).to(
                     device=te_device, non_blocking=True
                 )
-                if embed_tensors and len(embed_tensors) == len(grid_tensors):
-                    pre_vit_embeds = torch.cat(embed_tensors, dim=0).to(
-                        device=te_device, non_blocking=True
-                    )
-                elif patch_tensors:
+                if all(it[0] is not None for it in ordered_items):
+                    pre_vit_embeds = torch.cat(
+                        [it[0] for it in ordered_items if it[0] is not None], dim=0
+                    ).to(device=te_device, non_blocking=True)
+                elif len(patch_tensors) == len(grid_tensors):
                     pixel_values = torch.cat(patch_tensors, dim=0).to(
                         device=te_device, non_blocking=True
                     )
+                else:
+                    resolved_embeds = []
+                    for emb_t, pat_t, g_t in ordered_items:
+                        if emb_t is not None:
+                            resolved_embeds.append(
+                                emb_t.to(device=te_device, non_blocking=True)
+                            )
+                        elif pat_t is not None:
+                            splits = self.text_encoder.get_image_features(
+                                pat_t,
+                                g_t.to(
+                                    device=self.text_encoder.visual.device,
+                                    non_blocking=True,
+                                ),
+                            )
+                            resolved_embeds.append(
+                                torch.cat(splits, dim=0).to(
+                                    device=te_device, non_blocking=True
+                                )
+                            )
+                            del splits
+                    if resolved_embeds:
+                        pre_vit_embeds = torch.cat(resolved_embeds, dim=0)
+                        del resolved_embeds
 
         tok_list = self.tokenizer.encode_chat(
             prompt=prompt,
             enable_thinking=enable_thinking,
             max_sequence_length=max_sequence_length,
             image_patch_counts=patch_counts,
+            system_prompt=system_prompt if not is_negative else None,
+            thinking_trace=thinking_trace if not is_negative else None,
+            add_vision_id=add_vision_id,
         )
-
         vision_signature = tuple(vision_sig_list)
+
         if use_cache:
             cached = self.embed_cache.lookup(
                 tok_list,
@@ -2405,8 +2678,8 @@ class MOSSImageEngine:
 
         input_ids = torch.tensor([tok_list], dtype=torch.long, device=te_device)
         attention_mask = torch.ones_like(input_ids, device=te_device)
-
         inputs_embeds: Optional[torch.Tensor] = None
+
         if pre_vit_embeds is not None and image_grid_thw is not None:
             base_embeds = self.text_encoder.get_input_embeddings()(input_ids)
             image_mask = (
@@ -2487,7 +2760,7 @@ class MOSSImageEngine:
         del dummy_ids, dummy_out
         self.text_encoder.clear_caches()
         self._sync_device()
-        self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+        self._trim_reserved_vram(force=False, required_headroom_gb=1.50)
 
         sys.stdout.write(
             f"  [2/3] Warmup: 42-Layer MOSS-DiT 4D-RoPE Velocity Field ({width}x{height})...\n"
@@ -2516,7 +2789,7 @@ class MOSSImageEngine:
         del dummy_ctx_cpu, dummy_ctx, dummy_mask, dummy_lat
         self.transformer.clear_transient_caches()
         self._sync_device()
-        self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+        self._trim_reserved_vram(force=False, required_headroom_gb=1.50)
 
         sys.stdout.write(
             f"  [3/3] Warmup: Flux2-VAE FP32 Unpatch & Decoder ({width}x{height})...\n"
@@ -2530,7 +2803,7 @@ class MOSSImageEngine:
         dummy_dec = self.vae.decode_packed_latents(dummy_lat_vae)
         del dummy_lat_vae, dummy_dec
         self._sync_device()
-        self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
+        self._trim_reserved_vram(force=True, required_headroom_gb=1.50)
         self.memory_guard.recalibrate_baseline()
 
         elapsed = time.perf_counter() - t0
@@ -2559,7 +2832,7 @@ class MOSSImageEngine:
             request.edit_lora_path, request.edit_lora_scale
         )
         if not cpu_offload:
-            self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
 
         reporter: Optional[EngineProgressReporter] = None
         if progress_callback is None:
@@ -2587,6 +2860,15 @@ class MOSSImageEngine:
         inpaint_mask_cpu: Optional[torch.Tensor] = None
         ref_latents_cpu_list: List[torch.Tensor] = []
         ref_bboxes_list: List[Optional[Tuple[float, float, float, float]]] = []
+        ref_box_iso_list: List[float] = []
+        splat_entries: List[
+            Tuple[
+                torch.Tensor,
+                Tuple[float, float, float, float],
+                Optional[torch.Tensor],
+                Optional[float],
+            ]
+        ] = []
         ref_records_for_prompt: List[CachedReferenceRecord] = []
         any_ref_cache_hit = False
         exported_vizj_str: Optional[str] = None
@@ -2651,7 +2933,11 @@ class MOSSImageEngine:
                 elif request.layout_items and (
                     bool(request.preserve_canvas_outside_boxes)
                     or any(
-                        isinstance(it, dict) and bool(it.get("inpaint_box", False))
+                        isinstance(it, dict)
+                        and (
+                            bool(it.get("inpaint_box", False))
+                            or bool(it.get("paste_to_canvas", False))
+                        )
                         for it in request.layout_items
                     )
                 ):
@@ -2676,12 +2962,18 @@ class MOSSImageEngine:
                     if request.input_role in ("color_map", "depth_map")
                     else "color_map"
                 )
+                ctrl_w, ctrl_h = _resolve_unboxed_reference_dims(
+                    ctrl_p,
+                    request.width,
+                    request.height,
+                    request.edit_format,
+                )
                 ctrl_rec, hit = self._condition_single_reference(
                     ctrl_p,
                     request,
                     role_override=ctrl_role,
-                    target_w_override=request.width,
-                    target_h_override=request.height,
+                    target_w_override=ctrl_w,
+                    target_h_override=ctrl_h,
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
                 if ctrl_rec.packed_latents is not None:
@@ -2689,12 +2981,21 @@ class MOSSImageEngine:
                         _evacuate_to_cpu(ctrl_rec.packed_latents)
                     )
                     ref_bboxes_list.append(None)
+                    ref_box_iso_list.append(0.0)
 
             for spec in valid_ref_specs:
                 r_path = Path(spec["path"])
                 px_box = spec.get("pixel_bbox")
                 norm_box = spec.get("norm_bbox")
                 is_box_ref = norm_box is not None
+                emits_vit = bool(
+                    spec.get(
+                        "emits_vit",
+                        spec.get("input_role", request.input_role) == "photo_ref"
+                        and (is_box_ref or request.edit_format != "moss_image_edit"),
+                    )
+                )
+
                 if px_box is not None:
                     ymin, xmin, ymax, xmax = px_box
                     ref_w = max(64, ((xmax - xmin + 8) // 16) * 16)
@@ -2706,6 +3007,7 @@ class MOSSImageEngine:
                         request.height,
                         request.edit_format,
                     )
+
                 r_rec, hit = self._condition_single_reference(
                     r_path,
                     request,
@@ -2713,16 +3015,26 @@ class MOSSImageEngine:
                     framing_override=spec.get("framing_mode", request.framing_mode),
                     target_w_override=ref_w,
                     target_h_override=ref_h,
-                    force_vit=is_box_ref,
+                    force_vit=emits_vit,
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
                 if r_rec.packed_latents is not None:
-                    ref_latents_cpu_list.append(_evacuate_to_cpu(r_rec.packed_latents))
+                    lat_cpu = _evacuate_to_cpu(r_rec.packed_latents)
+                    ref_latents_cpu_list.append(lat_cpu)
                     ref_bboxes_list.append(norm_box)
-                if r_rec.llm_tokens > 0 and (
-                    is_box_ref or request.edit_format != "moss_image_edit"
-                ):
+                    ref_box_iso_list.append(float(spec.get("isolate_box_attn") or 0.0))
+                    if bool(spec.get("paste_to_canvas", False)) and norm_box is not None:
+                        splat_entries.append(
+                            (
+                                lat_cpu,
+                                norm_box,
+                                _evacuate_to_cpu(r_rec.latent_mask),
+                                spec.get("denoise_strength"),
+                            )
+                        )
+                if r_rec.llm_tokens > 0 and emits_vit:
                     ref_records_for_prompt.append(r_rec)
+
                 if (
                     request.export_vizj_path
                     and self.vizinjector is not None
@@ -2754,7 +3066,7 @@ class MOSSImageEngine:
                 self.vae.to("cpu")
                 self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             else:
-                self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
+                self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
 
         effective_prompt = request.compile_effective_prompt()
         pos_hits_before = self.embed_cache.pos_hits
@@ -2765,7 +3077,6 @@ class MOSSImageEngine:
 
         if cpu_offload:
             self.text_encoder.to(self.device)
-
         if reporter is not None:
             reporter.start_stage("context", ctx_total)
 
@@ -2776,6 +3087,11 @@ class MOSSImageEngine:
             device=torch.device("cpu"),
             is_negative=False,
             prebuilt_vision_records=ref_records_for_prompt,
+            system_prompt=request.system_prompt,
+            thinking_trace=request.thinking_trace,
+            add_vision_id=bool(
+                request.add_vision_id if request.add_vision_id is not None else True
+            ),
         )
         cache_hit = self.embed_cache.pos_hits > pos_hits_before
         common_prefix_len = self.embed_cache.last_common_prefix_len
@@ -2790,6 +3106,9 @@ class MOSSImageEngine:
                 enable_thinking=request.enable_thinking,
                 device=torch.device("cpu"),
                 is_negative=True,
+                add_vision_id=bool(
+                    request.add_vision_id if request.add_vision_id is not None else True
+                ),
             )
             self._sync_device()
             effective_cb("context", 2, ctx_total)
@@ -2800,7 +3119,7 @@ class MOSSImageEngine:
             self.text_encoder.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
         else:
-            self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
 
         if cpu_offload:
             self.transformer.to(self.device)
@@ -2853,11 +3172,13 @@ class MOSSImageEngine:
         ]
         del ref_latents_cpu_list
 
+        h_lat = request.height // 16
+        w_lat = request.width // 16
         shape = (
             num_imgs,
             self.transformer.config.latent_channels,
-            request.height // 16,
-            request.width // 16,
+            h_lat,
+            w_lat,
         )
         k_init, k_sde, _ = derive_stage_keys(explicit_seed)
         noise = philox_randn(
@@ -2874,31 +3195,54 @@ class MOSSImageEngine:
             clean_init_latents = init_latents_cpu.to(
                 device=self.device, dtype=torch.float32, non_blocking=True
             )
-            if clean_init_latents.shape[-2:] != shape[-2:]:
+            if clean_init_latents.shape[-2:] != (h_lat, w_lat):
                 clean_init_latents = F.interpolate(
                     clean_init_latents,
-                    size=shape[-2:],
+                    size=(h_lat, w_lat),
                     mode="bilinear",
                     align_corners=False,
                 )
         del init_latents_cpu
+
+        composite_used = False
+        splat_union_alpha: Optional[torch.Tensor] = None
+        eff_denoise_strength = float(request.denoise_strength)
+        if splat_entries:
+            composite_used = True
+            clean_init_latents, splat_union_alpha = splat_box_latents_to_canvas(
+                base_canvas=clean_init_latents,
+                splat_entries=splat_entries,
+                h_lat=h_lat,
+                w_lat=w_lat,
+                latent_channels=self.transformer.config.latent_channels,
+                feather_radius_lat=float(request.mask_feather_radius or 1.25),
+                device=self.device,
+            )
+            box_dns = [
+                float(e[3]) for e in splat_entries if e[3] is not None
+            ]
+            if box_dns and eff_denoise_strength >= 0.999:
+                eff_denoise_strength = max(0.05, min(1.0, sum(box_dns) / len(box_dns)))
+            elif not has_init and eff_denoise_strength >= 0.999:
+                eff_denoise_strength = 0.78
+        del splat_entries
 
         inpaint_mask_tensor: Optional[torch.Tensor] = None
         if inpaint_mask_cpu is not None:
             inpaint_mask_tensor = inpaint_mask_cpu.to(
                 device=self.device, dtype=torch.float32, non_blocking=True
             )
-            if inpaint_mask_tensor.shape[-2:] != shape[-2:]:
+            if inpaint_mask_tensor.shape[-2:] != (h_lat, w_lat):
                 inpaint_mask_tensor = F.interpolate(
                     inpaint_mask_tensor,
-                    size=shape[-2:],
+                    size=(h_lat, w_lat),
                     mode="bilinear",
                     align_corners=False,
                 )
         del inpaint_mask_cpu
 
         start_step = 0
-        if clean_init_latents is not None and 0.0 < request.denoise_strength < 1.0:
+        if clean_init_latents is not None and 0.0 < eff_denoise_strength < 1.0:
             start_step = max(
                 0,
                 min(
@@ -2906,7 +3250,7 @@ class MOSSImageEngine:
                     int(
                         round(
                             request.num_inference_steps
-                            * (1.0 - request.denoise_strength)
+                            * (1.0 - eff_denoise_strength)
                         )
                     ),
                 ),
@@ -2947,9 +3291,18 @@ class MOSSImageEngine:
 
         if clean_init_latents is not None and start_step > 0:
             sigma_0 = float(active_scheduler.sigmas[0].item())
-            latents = (1.0 - sigma_0) * clean_init_latents + sigma_0 * noise
+            noised_init = (1.0 - sigma_0) * clean_init_latents + sigma_0 * noise
+            if not has_init and splat_union_alpha is not None:
+                latents = (
+                    splat_union_alpha * noised_init
+                    + (1.0 - splat_union_alpha) * noise
+                )
+            else:
+                latents = noised_init
+            del noised_init
         else:
             latents = noise
+        del splat_union_alpha
 
         sde_gen = torch.Generator(device=self.device).manual_seed(k_sde & _MASK63)
         timesteps = active_scheduler.timesteps
@@ -2962,16 +3315,21 @@ class MOSSImageEngine:
             if (ref_bboxes_list and any(b is not None for b in ref_bboxes_list))
             else None
         )
-        uncond_uses_refs = not (
-            request.edit_format in ("ai_toolkit_isolated", "ai_toolkit_full")
-            and active_ref_bboxes is None
-            and not has_control
+        active_ref_box_iso = (
+            ref_box_iso_list
+            if (
+                active_ref_bboxes is not None
+                and any(v > 1e-6 for v in ref_box_iso_list)
+            )
+            else None
         )
+        uncond_uses_refs = request.effective_uncond_uses_references
         uncond_ref_latents = active_ref_latents if uncond_uses_refs else None
         uncond_ref_bboxes = active_ref_bboxes if uncond_uses_refs else None
-
+        uncond_ref_box_iso = active_ref_box_iso if uncond_uses_refs else None
         ref_zero_t = request.effective_reference_zero_timestep
         ref_iso_kv = request.effective_reference_isolated_kv
+        box_feather_lat = float(request.mask_feather_radius or 1.25)
 
         use_cuda_events = self.device.type == "cuda" and torch.cuda.is_available()
         step_events = (
@@ -3006,6 +3364,8 @@ class MOSSImageEngine:
                 reference_zero_timestep=ref_zero_t,
                 reference_isolated_kv=ref_iso_kv,
                 reference_bboxes=active_ref_bboxes,
+                reference_box_isolation=active_ref_box_iso,
+                box_feather_radius=box_feather_lat,
             ).sample.float()
             conditional = prediction if do_slg else None
             total_nfe += 1
@@ -3025,6 +3385,8 @@ class MOSSImageEngine:
                     reference_zero_timestep=ref_zero_t and uncond_uses_refs,
                     reference_isolated_kv=ref_iso_kv and uncond_uses_refs,
                     reference_bboxes=uncond_ref_bboxes,
+                    reference_box_isolation=uncond_ref_box_iso,
+                    box_feather_radius=box_feather_lat,
                     **skip_kwargs,
                 ).sample.float()
                 prediction = uncond + current_cfg * (prediction - uncond)
@@ -3042,6 +3404,8 @@ class MOSSImageEngine:
                     reference_zero_timestep=ref_zero_t,
                     reference_isolated_kv=ref_iso_kv,
                     reference_bboxes=active_ref_bboxes,
+                    reference_box_isolation=active_ref_box_iso,
+                    box_feather_radius=box_feather_lat,
                 ).sample.float()
                 if not do_step_cfg:
                     prediction = skipped
@@ -3096,6 +3460,12 @@ class MOSSImageEngine:
             early_steps = len(active_scheduler.timesteps)
             late_steps = 0
 
+        max_box_iso_used = (
+            max(ref_box_iso_list)
+            if ref_box_iso_list
+            else float(request.box_attn_isolation or 0.0)
+        )
+
         latents_cpu = _evacuate_to_cpu(latents)
         self.transformer.clear_transient_caches()
         del (
@@ -3109,10 +3479,13 @@ class MOSSImageEngine:
             negative_mask,
             active_ref_latents,
             active_ref_bboxes,
+            active_ref_box_iso,
             uncond_ref_latents,
             uncond_ref_bboxes,
+            uncond_ref_box_iso,
             ref_latents_list,
             ref_bboxes_list,
+            ref_box_iso_list,
             clean_init_latents,
             inpaint_mask_tensor,
             noise,
@@ -3123,7 +3496,7 @@ class MOSSImageEngine:
             self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
             self.vae.to(self.device)
         else:
-            self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
 
         if reporter is not None:
             reporter.start_stage("vae", num_imgs)
@@ -3135,11 +3508,12 @@ class MOSSImageEngine:
         decoded_cpu = _evacuate_to_cpu(decoded_gpu)
         del decoded_gpu
         self._sync_device()
+
         if cpu_offload:
             self.vae.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
         else:
-            self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
 
         if self.vizinjector is not None:
             pil_images, viz_telems = self.vizinjector.postprocess_to_pil(
@@ -3220,6 +3594,9 @@ class MOSSImageEngine:
             input_role_used=request.input_role,
             reference_zero_timestep_used=ref_zero_t,
             reference_isolated_kv_used=ref_iso_kv,
+            box_attn_isolation_used=max_box_iso_used,
+            uncond_uses_references_used=bool(uncond_uses_refs),
+            composite_box_images_used=composite_used,
             edit_lora_active=lora_active,
             effective_prompt=effective_prompt,
             mean_luminance=mean_luma,
