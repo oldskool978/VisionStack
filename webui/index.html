@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VisionStack — Sovereign Spatio-Visual Studio</title>
+  <link rel="stylesheet" href="assets/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-cluster">
+      <div class="brand-mark">VS</div>
+      <div>
+        <div class="brand-title">VISIONSTACK <span class="brand-sub">// SHADOWBOXER STUDIO</span></div>
+        <div class="brand-meta" id="hwStatusLine">Probing Sovereign Compute Daemon...</div>
+      </div>
+    </div>
+    <div class="telemetry-pills">
+      <div class="pill" id="vramPill" title="WDDM Dedicated VRAM, Contiguous Pool &amp; Shared Spill Telemetry">
+        <span class="pill-label">VRAM</span>
+        <span class="pill-val" id="vramPillText">-- / -- GB</span>
+      </div>
+      <div class="pill" id="presetPill" title="Active ShadowBoxer Point-of-Truth Preset">
+        <span class="pill-label">PRESET</span>
+        <span class="pill-val" id="presetPillText">V03 HEUN-&gt;IPNDM</span>
+      </div>
+      <div class="pill" id="queuePill" title="Serial Compute Queue Status">
+        <span class="pill-label">QUEUE</span>
+        <span class="pill-val" id="queuePillText">IDLE (0)</span>
+      </div>
+      <select id="themeSelect" class="input-select compact-select" title="Studio Theme Palette">
+        <option value="obsidian_gold">Obsidian Gold</option>
+        <option value="cyber_neon">Cyber Neon</option>
+        <option value="sky_peace">Sky Peace</option>
+        <option value="crimson_forge">Crimson Forge</option>
+      </select>
+      <button id="authBtn" class="btn btn-secondary compact-btn">Sign In</button>
+    </div>
+  </header>
+
+  <main class="studio-grid">
+    <section class="panel deck-panel">
+      <div class="panel-header">
+        <h2>Conditioning &amp; Solver Deck</h2>
+        <span class="badge" id="quotaBadge">Quota: --</span>
+      </div>
+
+      <div class="deck-scroll">
+        <div class="field-group">
+          <label class="field-label" for="titleInput">Master Title</label>
+          <input id="titleInput" type="text" class="input-text" value="Untitled Vision Master" maxlength="120" />
+        </div>
+
+        <div class="field-row two-col">
+          <div class="field-group">
+            <label class="field-label" for="modelVariantSelect">Model Variant</label>
+            <select id="modelVariantSelect" class="input-select">
+              <option value="sft">MOSS-Image-SFT (Sharp Layout &amp; Text)</option>
+              <option value="base">MOSS-Image-Base (Foundation Diversity)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="promptModeSelect">Prompt Mode</label>
+            <select id="promptModeSelect" class="input-select">
+              <option value="natural">Natural Language</option>
+              <option value="layout_json">Spatial Layout JSON (yxyx)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label class="field-label" for="promptInput">Positive Prompt / Scene Summary</label>
+            <div class="inline-checks">
+              <label class="checkbox-inline" title="Automatically synchronize quoted text strings between Typography boxes and the Positive Prompt">
+                <input type="checkbox" id="syncQuotesCheck" checked />
+                <span>Sync Quotes</span>
+              </label>
+              <label class="checkbox-inline" title="Enable Qwen3.5 thinking block">
+                <input type="checkbox" id="enableThinkingCheck" checked />
+                <span>&lt;think&gt;</span>
+              </label>
+              <label class="checkbox-inline" title="Prefix ViT visual tokens with 'Picture k:'">
+                <input type="checkbox" id="addVisionIdCheck" checked />
+                <span>Picture IDs</span>
+              </label>
+            </div>
+          </div>
+          <textarea id="promptInput" class="input-textarea" rows="4" placeholder="Describe the visual composition, lighting, materials, and typography...">A wide view of a sleek brushed-steel refrigerator beside a warm walnut kitchen counter with a ceramic bowl of fresh citrus fruit. A small yellow sticky note on the refrigerator door is handwritten in crisp black marker: "Remember to test SFT &amp; Base permutations @ 1024x1024"</textarea>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label" for="negativePromptInput">Negative Prompt</label>
+          <textarea id="negativePromptInput" class="input-textarea" rows="2" placeholder="Optional negative conditioning terms..."></textarea>
+        </div>
+
+        <details class="deck-details">
+          <summary>Qwen3.5 ChatML System &amp; Thinking Trace Overrides</summary>
+          <div class="details-body">
+            <div class="field-group">
+              <label class="field-label" for="systemPromptInput">System Prompt (&lt;|im_start|&gt;system)</label>
+              <textarea id="systemPromptInput" class="input-textarea" rows="2" placeholder="Optional system instruction for Qwen3.5 context prefill..."></textarea>
+            </div>
+            <div class="field-group">
+              <label class="field-label" for="thinkingTraceInput">Explicit Thinking Trace (&lt;think&gt;...&lt;/think&gt;)</label>
+              <textarea id="thinkingTraceInput" class="input-textarea" rows="2" placeholder="Optional explicit spatial reasoning chain-of-thought..."></textarea>
+            </div>
+            <div class="field-row two-col">
+              <div class="field-group">
+                <label class="field-label" for="maxSeqLenInput">Max Sequence Tokens</label>
+                <input id="maxSeqLenInput" type="number" class="input-text" value="4096" min="64" max="4096" step="64" />
+              </div>
+              <div class="field-group">
+                <label class="field-label" for="maxVitPatchesInput">Max ViT Patches</label>
+                <input id="maxVitPatchesInput" type="number" class="input-text" value="2304" min="64" max="9216" step="64" />
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="section-divider">Canvas &amp; Bifurcated Flow Schedule (V03 Baseline)</div>
+
+        <div class="aspect-preset-bar">
+          <span class="field-label">Aspect Presets:</span>
+          <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1024x1024">1:1</button>
+          <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1280x832">3:2</button>
+          <button type="button" class="btn btn-secondary tiny-btn" data-aspect="832x1280">2:3</button>
+          <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1344x768">16:9</button>
+          <button type="button" class="btn btn-secondary tiny-btn" data-aspect="768x1344">9:16</button>
+          <button type="button" id="matchAssetAspectBtn" class="btn btn-secondary tiny-btn" title="Snap canvas dimensions to bound Init Image, Control Map, or primary Reference aspect ratio">Match Asset</button>
+        </div>
+
+        <div class="field-row four-col">
+          <div class="field-group">
+            <label class="field-label" for="widthInput">Width</label>
+            <input id="widthInput" type="number" class="input-text" value="1024" min="256" max="2048" step="16" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="heightInput">Height</label>
+            <input id="heightInput" type="number" class="input-text" value="1024" min="256" max="2048" step="16" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="stepsInput">Steps</label>
+            <input id="stepsInput" type="number" class="input-text" value="50" min="1" max="200" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="numImagesInput" title="Number of images to synthesize per prompt">Batch</label>
+            <input id="numImagesInput" type="number" class="input-text" value="1" min="1" max="4" />
+          </div>
+        </div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="earlySolverSelect">Early Solver</label>
+            <select id="earlySolverSelect" class="input-select">
+              <option value="heun" selected>HEUN (2nd-Order PC)</option>
+              <option value="euler">EULER (1st-Order)</option>
+              <option value="ipndm">IPNDM (Lagrange TVD)</option>
+              <option value="sde_gpu_pp">SDE_GPU_PP (Stochastic)</option>
+              <option value="multitree">MULTITREE (Hybrid)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="lateSolverSelect">Late Solver</label>
+            <select id="lateSolverSelect" class="input-select">
+              <option value="ipndm" selected>IPNDM (Lagrange TVD)</option>
+              <option value="heun">HEUN (2nd-Order PC)</option>
+              <option value="euler">EULER (1st-Order)</option>
+              <option value="sde_gpu_pp">SDE_GPU_PP</option>
+              <option value="multitree">MULTITREE</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="handoffInput">Handoff t*</label>
+            <input id="handoffInput" type="number" class="input-text" value="0.35" min="0.0" max="1.0" step="0.01" />
+          </div>
+        </div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="earlyCfgInput">Early CFG</label>
+            <input id="earlyCfgInput" type="number" class="input-text" value="3.2" min="0.0" max="30.0" step="0.1" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="lateCfgInput">Late CFG</label>
+            <input id="lateCfgInput" type="number" class="input-text" value="2.8" min="0.0" max="30.0" step="0.1" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="shiftInput">Shift</label>
+            <input id="shiftInput" type="number" class="input-text" value="5.0" min="0.1" max="20.0" step="0.1" />
+          </div>
+        </div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="skipLayersInput">Neg Skip Layers</label>
+            <input id="skipLayersInput" type="text" class="input-text" value="24" placeholder="24" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="slgLayersInput">SLG Layers</label>
+            <input id="slgLayersInput" type="text" class="input-text" value="" placeholder="e.g. 24" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="slgScaleInput">SLG Scale</label>
+            <input id="slgScaleInput" type="number" class="input-text" value="0.0" min="0.0" max="10.0" step="0.05" />
+          </div>
+        </div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="slgStartInput">SLG Start</label>
+            <input id="slgStartInput" type="number" class="input-text" value="0.20" min="0.0" max="1.0" step="0.05" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="slgStopInput">SLG Stop</label>
+            <input id="slgStopInput" type="number" class="input-text" value="0.70" min="0.0" max="1.0" step="0.05" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="seedInput">PRNG Seed</label>
+            <input id="seedInput" type="number" class="input-text" value="42" min="0" placeholder="Random if blank" />
+          </div>
+        </div>
+
+        <div class="field-row two-col">
+          <div class="field-group">
+            <label class="field-label" for="etaInput">Early SDE Eta</label>
+            <input id="etaInput" type="number" class="input-text" value="0.0" min="0.0" max="1.0" step="0.01" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="sNoiseInput">SDE S-Noise</label>
+            <input id="sNoiseInput" type="number" class="input-text" value="1.0" min="0.0" max="5.0" step="0.05" />
+          </div>
+        </div>
+
+        <div class="section-divider">VizInjector Routing, Spatio-Visual Aperture &amp; Mask Algebra</div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="editFormatSelect">Edit Format</label>
+            <select id="editFormatSelect" class="input-select">
+              <option value="standard">standard</option>
+              <option value="moss_image_edit">moss_image_edit (t_ref=0)</option>
+              <option value="ai_toolkit_isolated">ai_toolkit_isolated (4D IsoKV)</option>
+              <option value="ai_toolkit_full">ai_toolkit_full</option>
+              <option value="control_color_depth">control_color_depth</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="framingModeSelect">Framing Mode</label>
+            <select id="framingModeSelect" class="input-select">
+              <option value="inscribed">inscribed</option>
+              <option value="cover_crop">cover_crop</option>
+              <option value="contain">contain</option>
+              <option value="stretch">stretch</option>
+              <option value="never_crop">never_crop</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="inputRoleSelect">Input Role</label>
+            <select id="inputRoleSelect" class="input-select">
+              <option value="photo_ref">photo_ref</option>
+              <option value="color_map">color_map</option>
+              <option value="depth_map">depth_map</option>
+              <option value="inpaint_mask">inpaint_mask</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="boxAttnIsolationInput" title="2D raised-cosine log-aperture attention isolation for box-anchored references">Box Attn Isolation</label>
+            <input id="boxAttnIsolationInput" type="number" class="input-text" value="0.0" min="0.0" max="1.0" step="0.05" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="uncondUsesRefsSelect" title="Whether the unconditional CFG branch receives reference latents">Uncond Refs</label>
+            <select id="uncondUsesRefsSelect" class="input-select">
+              <option value="">Auto (Format Default)</option>
+              <option value="true">Force On</option>
+              <option value="false">Force Off</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="maskBlendModeSelect" title="How painted masks, box apertures, and PNG alpha mattes compose">Mask Algebra</label>
+            <select id="maskBlendModeSelect" class="input-select">
+              <option value="auto">auto (Smart Compose)</option>
+              <option value="union">union (Max Aperture)</option>
+              <option value="intersect">intersect (Aperture Lock)</option>
+              <option value="paint_only">paint_only</option>
+              <option value="boxes_only">boxes_only</option>
+              <option value="alpha_only">alpha_only (PNG Matte)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field-row three-col">
+          <div class="field-group">
+            <label class="field-label" for="denoiseInput">Denoise</label>
+            <input id="denoiseInput" type="number" class="input-text" value="1.0" min="0.05" max="1.0" step="0.05" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="mtfBoostInput">MTF Boost</label>
+            <input id="mtfBoostInput" type="number" class="input-text" value="0.08" min="0.0" max="0.5" step="0.01" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="featherInput">Mask Feather</label>
+            <input id="featherInput" type="number" class="input-text" value="1.25" min="0.0" max="6.0" step="0.1" />
+          </div>
+        </div>
+
+        <div class="field-row four-col">
+          <div class="field-group">
+            <label class="field-label" for="clampSigmaInput">Clamp &sigma;</label>
+            <input id="clampSigmaInput" type="number" class="input-text" value="4.5" min="2.0" max="12.0" step="0.1" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="softKneeTauInput">Knee &tau;</label>
+            <input id="softKneeTauInput" type="number" class="input-text" value="0.015" min="0.001" max="0.25" step="0.005" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="editLoraSelect">Edit LoRA</label>
+            <select id="editLoraSelect" class="input-select">
+              <option value="">Disabled</option>
+              <option value="auto">Auto (Moss-Edit)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="loraScaleInput">LoRA Scale</label>
+            <input id="loraScaleInput" type="number" class="input-text" value="1.0" min="0.0" max="4.0" step="0.05" />
+          </div>
+        </div>
+
+        <div class="active-bindings-card">
+          <div class="bindings-header">
+            <span>Staged Conditioning Bindings</span>
+            <button id="clearBindingsBtn" class="btn-link">Clear All</button>
+          </div>
+          <div class="binding-item"><span>Init Canvas:</span> <strong id="boundInitLabel">&lt;None&gt;</strong></div>
+          <div class="binding-item"><span>Inpaint Mask:</span> <strong id="boundMaskLabel">&lt;None&gt;</strong></div>
+          <div class="binding-item"><span>Control Map:</span> <strong id="boundCtrlLabel">&lt;None&gt;</strong></div>
+          <div class="binding-item"><span>Global 4D Refs:</span> <strong id="boundRefsLabel">&lt;None&gt;</strong></div>
+          <div class="binding-item"><span>Active Mask State:</span> <strong id="activeMaskStateLabel">Unmasked Full-Canvas Flow</strong></div>
+          <div class="flags-row">
+            <label class="checkbox-inline" title="Snap flow schedule to training nearest-grid sigmas">
+              <input type="checkbox" id="useV2GridCheck" checked />
+              <span>V2 Grid</span>
+            </label>
+            <label class="checkbox-inline" title="Composite box-bound reference latents onto the initial canvas">
+              <input type="checkbox" id="compositeBoxImagesCheck" />
+              <span>Splat Box Refs</span>
+            </label>
+            <label class="checkbox-inline" title="Preserve init/splatted canvas outside layout bounding boxes">
+              <input type="checkbox" id="preserveOutsideBoxesCheck" />
+              <span>Preserve Outside</span>
+            </label>
+            <label class="checkbox-inline" title="Invert the composed latent inpaint mask (1 - M)">
+              <input type="checkbox" id="invertMaskCheck" />
+              <span>Invert Mask</span>
+            </label>
+            <label class="checkbox-inline" title="Apply 8-bit debanding filter during VizInjector ingest">
+              <input type="checkbox" id="deband8bitCheck" checked />
+              <span>Deband 8b</span>
+            </label>
+            <label class="checkbox-inline" title="Apply ordered Bayer dither during FP32 to 8-bit mastering">
+              <input type="checkbox" id="applyBayerDitherCheck" checked />
+              <span>Bayer Dither</span>
+            </label>
+            <label class="checkbox-inline" title="Cache conditioned reference latents and ViT features in pinned RAM">
+              <input type="checkbox" id="useRefCacheCheck" checked />
+              <span>Ref Cache</span>
+            </label>
+            <label class="checkbox-inline" title="Prefer Vulkan SPIR-V compute shaders in VizInjector">
+              <input type="checkbox" id="preferVulkanCheck" checked />
+              <span>Vulkan</span>
+            </label>
+            <label class="checkbox-inline" title="Stage model components between system RAM and GPU VRAM">
+              <input type="checkbox" id="cpuOffloadCheck" />
+              <span>CPU Offload</span>
+            </label>
+            <label class="checkbox-inline" title="Export conditioned Tier-2 dual-latent .VIZJ artifact">
+              <input type="checkbox" id="exportVizjCheck" />
+              <span>Export .VIZJ</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="deck-footer">
+        <div class="progress-wrap" id="progressWrap" hidden>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progressBarFill" style="width: 0%"></div>
+          </div>
+          <div class="progress-text" id="progressStageText">Queued...</div>
+        </div>
+        <div class="action-row">
+          <button id="saveDefaultPresetBtn" class="btn btn-secondary" title="Save active solver &amp; conditioning settings to ShadowBoxer/default.json" hidden>
+            Lock Default
+          </button>
+          <button id="synthesizeBtn" class="btn btn-primary btn-full">
+            Synthesize Master Image
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel stage-panel">
+      <div class="panel-header stage-tabs-header">
+        <div class="tab-group">
+          <button class="tab-btn active" data-tab="viewportTab">Master Viewport</button>
+          <button class="tab-btn" data-tab="layoutTab">Spatial Layout Editor (4D-RoPE)</button>
+          <button class="tab-btn" data-tab="inpaintTab">Inpaint Mask Painter</button>
+        </div>
+        <div class="stage-actions">
+          <span class="stage-aspect-badge" id="stageAspectBadge">1024x1024 (1:1)</span>
+          <a id="downloadPngBtn" class="btn btn-secondary compact-btn" download hidden>Download PNG</a>
+          <a id="downloadVizjBtn" class="btn btn-secondary compact-btn" download hidden>Download .VIZJ</a>
+        </div>
+      </div>
+
+      <div id="viewportTab" class="tab-pane active">
+        <div class="viewport-canvas-wrap">
+          <div id="emptyViewportState" class="empty-state">
+            <div class="empty-glyph">SB // V03</div>
+            <p>Configure your prompt, spatial layout boxes, or reference conditioning assets and click <strong>Synthesize Master Image</strong>.</p>
+          </div>
+          <img id="masterOutputImage" class="master-image" alt="Master Synthesis Output" hidden />
+          <div id="batchThumbStrip" class="batch-thumb-strip" hidden></div>
+        </div>
+        <div class="telemetry-grid" id="telemetryGrid">
+          <div class="telem-card">
+            <span class="telem-label">SOLVER &amp; NFE</span>
+            <span class="telem-val" id="tSolverVal">HEUN -&gt; IPNDM</span>
+          </div>
+          <div class="telem-card">
+            <span class="telem-label">LATENCY</span>
+            <span class="telem-val" id="tLatencyVal">-- s</span>
+          </div>
+          <div class="telem-card">
+            <span class="telem-label">VRAM &amp; CONTIG</span>
+            <span class="telem-val" id="tVramVal">-- GB</span>
+          </div>
+          <div class="telem-card">
+            <span class="telem-label">ROUTING &amp; APERTURE</span>
+            <span class="telem-val" id="tRoutingVal">--</span>
+          </div>
+          <div class="telem-card">
+            <span class="telem-label">ENTROPY / SHARP</span>
+            <span class="telem-val" id="tSignalVal">-- bits / --</span>
+          </div>
+          <div class="telem-card">
+            <span class="telem-label">LUMA / CONTRAST</span>
+            <span class="telem-val" id="tLumaVal">-- / --</span>
+          </div>
+          <div class="telem-card">
+            <span class="telem-label">VIZTOKEN CACHE</span>
+            <span class="telem-val" id="tCacheVal">--</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="layoutTab" class="tab-pane">
+        <div class="canvas-toolbar">
+          <button id="addObjectBoxBtn" class="btn btn-secondary compact-btn">+ Object Box</button>
+          <button id="addTextBoxBtn" class="btn btn-secondary compact-btn">+ Typography Box</button>
+          <button id="clearAllBoxesBtn" class="btn btn-secondary compact-btn">Clear Boxes</button>
+          <button id="resetDefaultBoxesBtn" class="btn btn-secondary compact-btn">Reset Defaults</button>
+          <label class="toolbar-control">
+            <span>Underlay:</span>
+            <select id="layoutUnderlaySelect" class="input-select compact-select">
+              <option value="auto">Auto (Init / Control / Ref)</option>
+              <option value="none">None (Grid Only)</option>
+            </select>
+          </label>
+          <label class="toolbar-control">
+            <span>Opacity:</span>
+            <input id="layoutUnderlayOpacity" type="range" min="0.1" max="1.0" step="0.05" value="0.45" />
+          </label>
+        </div>
+        <div class="layout-workspace">
+          <div class="spatial-stage-container">
+            <div id="spatialStage" class="spatial-stage">
+              <img id="spatialUnderlayImg" class="stage-underlay-img" alt="" hidden />
+              <div id="spatialBoxesLayer" class="spatial-boxes-layer"></div>
+            </div>
+          </div>
+          <div class="box-inspector">
+            <div class="field-group">
+              <div class="label-row">
+                <label class="field-label" for="layoutSummaryInput">Layout Scene Summary Override</label>
+                <span class="tiny-muted">Auto-uses Prompt if blank</span>
+              </div>
+              <input id="layoutSummaryInput" type="text" class="input-text" placeholder="Optional global scene summary for layout JSON..." />
+            </div>
+            <h3>Spatial Box List &amp; Regional Conditioning</h3>
+            <div id="boxListContainer" class="box-list"></div>
+            <div class="compiled-json-preview">
+              <div class="label-row">
+                <label class="field-label">Compiled Qwen3.5 Layout JSON Preview</label>
+                <span class="badge" id="layoutActiveModeBadge">NATURAL MODE</span>
+              </div>
+              <pre id="compiledJsonPreview"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="inpaintTab" class="tab-pane">
+        <div class="canvas-toolbar">
+          <label class="toolbar-control">
+            <span>Brush:</span>
+            <input id="brushSizeInput" type="range" min="6" max="140" value="44" />
+          </label>
+          <button id="brushModePaintBtn" class="btn btn-secondary compact-btn active">Paint (Inpaint White)</button>
+          <button id="brushModeEraseBtn" class="btn btn-secondary compact-btn">Erase (Preserve Black)</button>
+          <button id="projectBoxesToMaskBtn" class="btn btn-secondary compact-btn" title="Rasterize active layout boxes with raised-cosine feathering onto the mask canvas">Project Layout Boxes</button>
+          <button id="invertMaskCanvasBtn" class="btn btn-secondary compact-btn">Invert Canvas</button>
+          <button id="clearMaskCanvasBtn" class="btn btn-secondary compact-btn">Clear</button>
+          <label class="toolbar-control">
+            <span>Underlay:</span>
+            <input id="inpaintUnderlayOpacity" type="range" min="0.0" max="0.95" step="0.05" value="0.55" />
+          </label>
+          <button id="commitMaskToVaultBtn" class="btn btn-primary compact-btn">Stage Mask to Vault</button>
+        </div>
+        <div class="inpaint-stage-wrap">
+          <div id="inpaintStageContainer" class="inpaint-stage-container">
+            <img id="inpaintUnderlayImg" class="stage-underlay-img" alt="" hidden />
+            <canvas id="inpaintCanvas" width="512" height="512"></canvas>
+            <div id="inpaintBoxesOverlay" class="inpaint-boxes-overlay"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel vault-panel">
+      <div class="panel-header">
+        <h2>User Vault &amp; Gallery</h2>
+      </div>
+
+      <div class="vault-section">
+        <div class="vault-subheader">
+          <h3>Reference Conditioning Assets</h3>
+          <div class="vault-actions-group">
+            <button id="stageDefaultRefsBtn" class="btn btn-secondary compact-btn" title="Stage deterministic test reference, init, mask &amp; control assets">Stage Test Set</button>
+            <label class="btn btn-secondary compact-btn upload-label">
+              + Upload
+              <input id="referenceFileInput" type="file" accept=".png,.jpg,.jpeg,.webp,.vizj" hidden />
+            </label>
+          </div>
+        </div>
+        <div id="referenceList" class="reference-list">
+          <div class="muted-note">No reference assets staged in your user vault.</div>
+        </div>
+      </div>
+
+      <div class="vault-section gallery-section">
+        <div class="vault-subheader">
+          <h3>Synthesized Master Gallery</h3>
+          <span class="badge" id="galleryCountBadge">0 items</span>
+        </div>
+        <div id="galleryList" class="gallery-list">
+          <div class="muted-note">Completed syntheses appear here with full recipe &amp; draft restoration.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="loginModal" class="modal-backdrop" hidden>
+    <div class="modal-card">
+      <h3>Creator Studio Authentication</h3>
+      <p class="modal-sub">Enter your registered VisionStack creator handle (e.g., <code>administrator</code> or <code>studio</code>) to unlock your isolated reference vault and gallery.</p>
+      <div class="field-group">
+        <label class="field-label" for="loginUsernameInput">Creator Handle</label>
+        <input id="loginUsernameInput" type="text" class="input-text" value="administrator" placeholder="administrator" />
+      </div>
+      <div id="loginErrorMsg" class="error-banner" hidden></div>
+      <div class="modal-actions">
+        <button id="loginSubmitBtn" class="btn btn-primary btn-full">Authenticate Session</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="assets/app.js"></script>
+</body>
+</html>
