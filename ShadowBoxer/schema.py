@@ -33,6 +33,14 @@ SUPPORTED_EDIT_FORMATS = [
     "ai_toolkit_full",
     "control_color_depth",
 ]
+SUPPORTED_MASK_BLEND_MODES = [
+    "auto",
+    "union",
+    "intersect",
+    "paint_only",
+    "boxes_only",
+    "alpha_only",
+]
 
 DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = [
     {
@@ -88,6 +96,8 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "framing_mode": "inscribed",
     "input_role": "photo_ref",
     "edit_format": "standard",
+    "mask_blend_mode": "auto",
+    "invert_inpaint_mask": False,
     "max_vit_patches": 2304,
     "deband_8bit": True,
     "prefer_vulkan": True,
@@ -205,6 +215,35 @@ def bbox_to_normalized(
     )
 
 
+def reconcile_layout_summary_quotes(
+    caption: str,
+    active_texts: Sequence[str],
+) -> str:
+    clean_cap = caption.strip()
+    if not clean_cap or not active_texts:
+        return clean_cap
+
+    matches = list(re.finditer(r'"([^"\r\n]+)"', clean_cap))
+    if not matches:
+        return clean_cap
+
+    if len(matches) == len(active_texts):
+        parts: List[str] = []
+        last_idx = 0
+        for m, new_txt in zip(matches, active_texts):
+            parts.append(clean_cap[last_idx : m.start()])
+            parts.append(f'"{new_txt}"')
+            last_idx = m.end()
+        parts.append(clean_cap[last_idx:])
+        return "".join(parts)
+
+    default_quote = '"Remember to test SFT & Base permutations @ 1024x1024"'
+    if default_quote in clean_cap:
+        return clean_cap.replace(default_quote, f'"{active_texts[0]}"', 1)
+
+    return clean_cap
+
+
 def compile_layout_prompt(
     caption: str,
     items: Sequence[Dict[str, Any]],
@@ -213,7 +252,9 @@ def compile_layout_prompt(
     coords_are_pixels: bool = False,
     box_picture_map: Optional[Dict[int, int]] = None,
 ) -> str:
-    normalized_items = []
+    normalized_items: List[Dict[str, Any]] = []
+    active_texts: List[str] = []
+
     for idx, item in enumerate(items):
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
@@ -229,6 +270,13 @@ def compile_layout_prompt(
 
         if "category" not in clean_entry:
             clean_entry["category"] = "text" if "text" in clean_entry else "region"
+
+        if clean_entry.get("category") == "text" and isinstance(
+            clean_entry.get("text"), str
+        ):
+            txt_val = clean_entry["text"].strip()
+            if txt_val:
+                active_texts.append(txt_val)
 
         if (
             box_picture_map
@@ -271,10 +319,11 @@ def compile_layout_prompt(
 
         normalized_items.append(clean_entry)
 
+    reconciled_caption = reconcile_layout_summary_quotes(caption, active_texts)
     layout_payload = {
         "bbox_format": "yxyx",
         "bbox_coord_space": "abs_centralized",
-        "summary": {"caption": caption.strip()},
+        "summary": {"caption": reconciled_caption},
         "items": normalized_items,
     }
     return json.dumps(layout_payload, ensure_ascii=False)
@@ -440,6 +489,11 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         if ef in SUPPORTED_EDIT_FORMATS:
             harvested["edit_format"] = ef
 
+    if "mask_blend_mode" in data and isinstance(data["mask_blend_mode"], str):
+        mb = data["mask_blend_mode"].strip().lower()
+        if mb in SUPPORTED_MASK_BLEND_MODES:
+            harvested["mask_blend_mode"] = mb
+
     if "max_vit_patches" in data and data["max_vit_patches"] is not None:
         try:
             harvested["max_vit_patches"] = max(
@@ -482,6 +536,7 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         "use_reference_cache",
         "preserve_canvas_outside_boxes",
         "composite_box_images_to_init",
+        "invert_inpaint_mask",
     ):
         if flag_key in data and data[flag_key] is not None:
             harvested[flag_key] = bool(data[flag_key])
@@ -597,6 +652,8 @@ class GenerationRequest(BaseModel):
     init_image_path: Optional[str] = Field(default=None)
     denoise_strength: float = Field(default=1.0, ge=0.01, le=1.0)
     inpaint_mask_path: Optional[str] = Field(default=None)
+    mask_blend_mode: Optional[str] = Field(default=None)
+    invert_inpaint_mask: Optional[bool] = Field(default=None)
     control_image_path: Optional[str] = Field(default=None)
     reference_image_paths: List[str] = Field(default_factory=list)
 
@@ -787,6 +844,21 @@ class GenerationRequest(BaseModel):
         ):
             self.edit_format = str(active["edit_format"])
 
+        if self.mask_blend_mode is None or (
+            use_custom
+            and self.mask_blend_mode == BASELINE_ENGINE_DEFAULTS["mask_blend_mode"]
+        ):
+            self.mask_blend_mode = str(active.get("mask_blend_mode", "auto"))
+
+        if self.invert_inpaint_mask is None or (
+            use_custom
+            and self.invert_inpaint_mask
+            == BASELINE_ENGINE_DEFAULTS["invert_inpaint_mask"]
+        ):
+            self.invert_inpaint_mask = bool(
+                active.get("invert_inpaint_mask", False)
+            )
+
         if self.max_vit_patches is None or (
             use_custom
             and self.max_vit_patches == BASELINE_ENGINE_DEFAULTS["max_vit_patches"]
@@ -909,12 +981,6 @@ class GenerationRequest(BaseModel):
     def resolve_visual_references(
         self,
     ) -> Tuple[List[Dict[str, Any]], Dict[int, int]]:
-        """
-        Resolves global and box-bound visual references while maintaining independent
-        1-based indices for:
-          - dit_ref_index: 4D-RoPE reference latent index (r >= 1) across all roles.
-          - picture_index: Qwen3.5 ViT 'Picture k' index strictly over ViT-emitting refs.
-        """
         specs: List[Dict[str, Any]] = []
         box_pic_map: Dict[int, int] = {}
         dit_ref_counter = 0
@@ -982,11 +1048,11 @@ class GenerationRequest(BaseModel):
                     coords_are_pixels=self.layout_coords_are_pixels,
                 )
 
-            # Box-anchored references default to box-conformal framing ("inscribed")
-            # when global framing is "never_crop" so the resampled latent grid matches
-            # the target bounding box aspect ratio without shearing.
             raw_box_fm = item.get("framing_mode")
-            if isinstance(raw_box_fm, str) and raw_box_fm.strip().lower() in SUPPORTED_FRAMING_MODES:
+            if (
+                isinstance(raw_box_fm, str)
+                and raw_box_fm.strip().lower() in SUPPORTED_FRAMING_MODES
+            ):
                 fm = raw_box_fm.strip().lower()
             elif norm_box is not None and global_framing == "never_crop":
                 fm = "inscribed"
@@ -1127,6 +1193,9 @@ class GenerationRequest(BaseModel):
             raise ValueError(f"Unsupported input_role: {self.input_role}")
         if self.edit_format not in SUPPORTED_EDIT_FORMATS:
             raise ValueError(f"Unsupported edit_format: {self.edit_format}")
+        mb_mode = str(self.mask_blend_mode or "auto").strip().lower()
+        if mb_mode not in SUPPORTED_MASK_BLEND_MODES:
+            raise ValueError(f"Unsupported mask_blend_mode: {self.mask_blend_mode}")
         if not (0.0 <= self.slg_start <= self.slg_stop <= 1.0):
             raise ValueError(
                 "SLG window must satisfy 0.0 <= slg_start <= slg_stop <= 1.0."
@@ -1196,6 +1265,8 @@ class GenerationResponse(BaseModel):
     edit_format_used: str = Field(default="standard")
     framing_mode_used: str = Field(default="inscribed")
     input_role_used: str = Field(default="photo_ref")
+    mask_blend_mode_used: str = Field(default="auto")
+    invert_inpaint_mask_used: bool = Field(default=False)
     reference_zero_timestep_used: bool = Field(default=False)
     reference_isolated_kv_used: bool = Field(default=False)
     box_attn_isolation_used: float = Field(default=0.0)

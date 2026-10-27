@@ -127,6 +127,7 @@ from models.tokenizer import MOSSImageTokenizer
 from schema import (
     GenerationRequest,
     GenerationResponse,
+    SUPPORTED_MASK_BLEND_MODES,
     SUPPORTED_MODELS,
     bbox_to_normalized,
 )
@@ -681,6 +682,80 @@ def build_box_aperture_mask(
         mask = torch.maximum(mask, box_m)
 
     return mask.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)
+
+
+def compose_latent_inpaint_mask(
+    paint_mask: Optional[torch.Tensor],
+    box_mask: Optional[torch.Tensor],
+    alpha_mask: Optional[torch.Tensor],
+    blend_mode: str = "auto",
+    preserve_outside_boxes: bool = False,
+    invert_mask: bool = False,
+    h_lat: Optional[int] = None,
+    w_lat: Optional[int] = None,
+    device: Union[str, torch.device] = torch.device("cpu"),
+) -> Optional[torch.Tensor]:
+    target_dev = _canonicalize_device(device)
+    mode = str(blend_mode or "auto").strip().lower()
+    if mode not in SUPPORTED_MASK_BLEND_MODES:
+        mode = "auto"
+
+    ref_t = paint_mask if paint_mask is not None else (box_mask if box_mask is not None else alpha_mask)
+    if ref_t is None:
+        return None
+
+    eff_h = int(h_lat) if h_lat is not None else int(ref_t.shape[-2])
+    eff_w = int(w_lat) if w_lat is not None else int(ref_t.shape[-1])
+
+    def _norm_mask(m: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if m is None:
+            return None
+        t = m.to(device=target_dev, dtype=torch.float32)
+        if t.ndim == 2:
+            t = t.unsqueeze(0).unsqueeze(0)
+        elif t.ndim == 3:
+            t = t.unsqueeze(0)
+        if t.shape[-2:] != (eff_h, eff_w):
+            t = F.interpolate(
+                t, size=(eff_h, eff_w), mode="bilinear", align_corners=False
+            )
+        return t.clamp(0.0, 1.0)
+
+    m_paint = _norm_mask(paint_mask)
+    m_box = _norm_mask(box_mask)
+    m_alpha = _norm_mask(alpha_mask)
+
+    composed: Optional[torch.Tensor] = None
+    if mode == "paint_only":
+        composed = m_paint
+    elif mode == "boxes_only":
+        composed = m_box
+    elif mode == "alpha_only":
+        composed = m_alpha
+    elif mode == "union":
+        for cand in (m_paint, m_box, m_alpha):
+            if cand is not None:
+                composed = cand if composed is None else torch.maximum(composed, cand)
+    elif mode == "intersect":
+        for cand in (m_paint, m_box, m_alpha):
+            if cand is not None:
+                composed = cand if composed is None else (composed * cand)
+    else:
+        if m_paint is not None and m_box is not None:
+            if preserve_outside_boxes:
+                composed = m_paint * m_box
+            else:
+                composed = torch.maximum(m_paint, m_box)
+        elif m_paint is not None:
+            composed = m_paint
+        elif m_box is not None:
+            composed = m_box
+        elif m_alpha is not None:
+            composed = m_alpha
+
+    if composed is not None and invert_mask:
+        composed = (1.0 - composed).clamp(0.0, 1.0)
+    return composed
 
 
 def splat_box_latents_to_canvas(
@@ -2858,6 +2933,9 @@ class MOSSImageEngine:
             torch.cuda.manual_seed_all(explicit_seed)
 
         init_latents_cpu: Optional[torch.Tensor] = None
+        paint_mask_cpu: Optional[torch.Tensor] = None
+        box_mask_cpu: Optional[torch.Tensor] = None
+        alpha_mask_cpu: Optional[torch.Tensor] = None
         inpaint_mask_cpu: Optional[torch.Tensor] = None
         ref_latents_cpu_list: List[torch.Tensor] = []
         ref_bboxes_list: List[Optional[Tuple[float, float, float, float]]] = []
@@ -2877,6 +2955,9 @@ class MOSSImageEngine:
         has_init = bool(
             request.init_image_path and Path(request.init_image_path).is_file()
         )
+        has_mask_file = bool(
+            request.inpaint_mask_path and Path(request.inpaint_mask_path).is_file()
+        )
         has_control = bool(
             request.control_image_path and Path(request.control_image_path).is_file()
         )
@@ -2885,7 +2966,7 @@ class MOSSImageEngine:
             spec for spec in visual_ref_specs if Path(spec["path"]).is_file()
         ]
 
-        if has_init or has_control or valid_ref_specs:
+        if has_init or has_mask_file or has_control or valid_ref_specs:
             if cpu_offload:
                 self.vae.to(self.device)
                 self.text_encoder.to(self.device)
@@ -2901,60 +2982,36 @@ class MOSSImageEngine:
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
                 init_latents_cpu = _evacuate_to_cpu(init_rec.packed_latents)
-
-                if (
-                    request.inpaint_mask_path
-                    and Path(request.inpaint_mask_path).is_file()
-                ):
-                    mask_p = Path(request.inpaint_mask_path)
-                    if self.vizinjector is not None and VizInjectorRequest is not None:
-                        m_req = VizInjectorRequest(
-                            target_width=request.width,
-                            target_height=request.height,
-                            framing_mode=_normalize_vizinjector_framing(
-                                request.framing_mode
-                            ),
-                            input_role="inpaint_mask",
-                            mask_feather_radius=request.mask_feather_radius,
-                            prefer_vulkan=request.prefer_vulkan,
-                        )
-                        m_bundle = self.vizinjector.condition_image(mask_p, m_req)
-                        if m_bundle.latent_mask is not None:
-                            inpaint_mask_cpu = _evacuate_to_cpu(m_bundle.latent_mask)
-                    if inpaint_mask_cpu is None:
-                        m_img = Image.open(mask_p).convert("L")
-                        m_img = m_img.resize(
-                            (request.width // 16, request.height // 16),
-                            resample=Image.Resampling.BILINEAR,
-                        )
-                        m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
-                        inpaint_mask_cpu = (
-                            torch.from_numpy(m_arr).unsqueeze(0).unsqueeze(0).contiguous()
-                        )
-                elif request.layout_items and (
-                    bool(request.preserve_canvas_outside_boxes)
-                    or any(
-                        isinstance(it, dict)
-                        and (
-                            bool(it.get("inpaint_box", False))
-                            or bool(it.get("paste_to_canvas", False))
-                        )
-                        for it in request.layout_items
-                    )
-                ):
-                    only_flagged = not bool(request.preserve_canvas_outside_boxes)
-                    inpaint_mask_cpu = build_box_aperture_mask(
-                        layout_items=request.layout_items,
-                        height=request.height,
-                        width=request.width,
-                        coords_are_pixels=request.layout_coords_are_pixels,
-                        feather_radius_lat=float(request.mask_feather_radius or 1.25),
-                        device=torch.device("cpu"),
-                        only_flagged_boxes=only_flagged,
-                    )
-                elif init_rec.latent_mask is not None:
+                if init_rec.latent_mask is not None:
                     if float(torch.min(init_rec.latent_mask).item()) < 0.99:
-                        inpaint_mask_cpu = _evacuate_to_cpu(init_rec.latent_mask)
+                        alpha_mask_cpu = _evacuate_to_cpu(init_rec.latent_mask)
+
+            if has_mask_file:
+                mask_p = Path(request.inpaint_mask_path)
+                if self.vizinjector is not None and VizInjectorRequest is not None:
+                    m_req = VizInjectorRequest(
+                        target_width=request.width,
+                        target_height=request.height,
+                        framing_mode=_normalize_vizinjector_framing(
+                            request.framing_mode
+                        ),
+                        input_role="inpaint_mask",
+                        mask_feather_radius=request.mask_feather_radius,
+                        prefer_vulkan=request.prefer_vulkan,
+                    )
+                    m_bundle = self.vizinjector.condition_image(mask_p, m_req)
+                    if m_bundle.latent_mask is not None:
+                        paint_mask_cpu = _evacuate_to_cpu(m_bundle.latent_mask)
+                if paint_mask_cpu is None:
+                    m_img = Image.open(mask_p).convert("L")
+                    m_img = m_img.resize(
+                        (request.width // 16, request.height // 16),
+                        resample=Image.Resampling.BILINEAR,
+                    )
+                    m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
+                    paint_mask_cpu = (
+                        torch.from_numpy(m_arr).unsqueeze(0).unsqueeze(0).contiguous()
+                    )
 
             if has_control:
                 ctrl_p = Path(request.control_image_path)
@@ -3068,6 +3125,48 @@ class MOSSImageEngine:
                 self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             else:
                 self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
+
+        if (has_init or bool(splat_entries)) and request.layout_items:
+            want_box_aperture = (
+                bool(request.preserve_canvas_outside_boxes)
+                or str(request.mask_blend_mode or "auto").lower() == "boxes_only"
+                or any(
+                    isinstance(it, dict)
+                    and (
+                        bool(it.get("inpaint_box", False))
+                        or (has_init and bool(it.get("paste_to_canvas", False)))
+                    )
+                    for it in request.layout_items
+                )
+            )
+            if want_box_aperture:
+                only_flagged = not (
+                    bool(request.preserve_canvas_outside_boxes)
+                    or str(request.mask_blend_mode or "auto").lower() == "boxes_only"
+                )
+                box_mask_cpu = build_box_aperture_mask(
+                    layout_items=request.layout_items,
+                    height=request.height,
+                    width=request.width,
+                    coords_are_pixels=request.layout_coords_are_pixels,
+                    feather_radius_lat=float(request.mask_feather_radius or 1.25),
+                    device=torch.device("cpu"),
+                    only_flagged_boxes=only_flagged,
+                )
+
+        if has_init or bool(splat_entries):
+            inpaint_mask_cpu = compose_latent_inpaint_mask(
+                paint_mask=paint_mask_cpu,
+                box_mask=box_mask_cpu,
+                alpha_mask=alpha_mask_cpu,
+                blend_mode=str(request.mask_blend_mode or "auto"),
+                preserve_outside_boxes=bool(request.preserve_canvas_outside_boxes),
+                invert_mask=bool(request.invert_inpaint_mask),
+                h_lat=request.height // 16,
+                w_lat=request.width // 16,
+                device=torch.device("cpu"),
+            )
+        del paint_mask_cpu, box_mask_cpu, alpha_mask_cpu
 
         effective_prompt = request.compile_effective_prompt()
         pos_hits_before = self.embed_cache.pos_hits
@@ -3290,10 +3389,17 @@ class MOSSImageEngine:
                 device=self.device,
             )
 
-        if clean_init_latents is not None and start_step > 0:
+        if clean_init_latents is not None and (
+            start_step > 0 or inpaint_mask_tensor is not None
+        ):
             sigma_0 = float(active_scheduler.sigmas[0].item())
             noised_init = (1.0 - sigma_0) * clean_init_latents + sigma_0 * noise
-            if not has_init and splat_union_alpha is not None:
+            if inpaint_mask_tensor is not None and start_step == 0:
+                latents = (
+                    inpaint_mask_tensor * noise
+                    + (1.0 - inpaint_mask_tensor) * noised_init
+                )
+            elif not has_init and splat_union_alpha is not None:
                 latents = (
                     splat_union_alpha * noised_init
                     + (1.0 - splat_union_alpha) * noise
@@ -3593,6 +3699,8 @@ class MOSSImageEngine:
             edit_format_used=request.edit_format,
             framing_mode_used=request.framing_mode,
             input_role_used=request.input_role,
+            mask_blend_mode_used=str(request.mask_blend_mode or "auto"),
+            invert_inpaint_mask_used=bool(request.invert_inpaint_mask),
             reference_zero_timestep_used=ref_zero_t,
             reference_isolated_kv_used=ref_iso_kv,
             box_attn_isolation_used=max_box_iso_used,

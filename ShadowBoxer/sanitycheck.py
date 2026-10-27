@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+# ShadowBoxer/sanitycheck.py
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
@@ -32,6 +34,7 @@ from engine import (
     _MetaWeightInitMode,
     _probe_image_dimensions,
     build_box_aperture_mask,
+    compose_latent_inpaint_mask,
     compute_moss_v2_sigmas,
     derive_stage_keys,
     load_sharded_safetensors_into,
@@ -67,12 +70,15 @@ from refinery import (
 from schema import (
     BASELINE_ENGINE_DEFAULTS,
     GenerationRequest,
+    SUPPORTED_MASK_BLEND_MODES,
     SUPPORTED_SOLVERS,
     bbox_to_normalized,
     bbox_to_pixel_rect,
+    compile_layout_prompt,
     get_active_engine_defaults,
     has_custom_default_preset,
     pixel_bbox_to_abs_centralized,
+    reconcile_layout_summary_quotes,
 )
 from vizinjector import (
     VIZJ_TIER_DUAL_LATENT,
@@ -1197,7 +1203,9 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and BASELINE_ENGINE_DEFAULTS["late_solver"] == "ipndm"
         and abs(float(BASELINE_ENGINE_DEFAULTS["early_cfg"]) - 3.2) < 1e-6
         and abs(float(BASELINE_ENGINE_DEFAULTS["late_cfg"]) - 2.8) < 1e-6
-        and BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"] == [24],
+        and BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"] == [24]
+        and BASELINE_ENGINE_DEFAULTS["mask_blend_mode"] == "auto"
+        and BASELINE_ENGINE_DEFAULTS["invert_inpaint_mask"] is False,
         f"Expected V03 Heun->IPNDM baseline defaults, got {BASELINE_ENGINE_DEFAULTS}",
     )
 
@@ -1237,6 +1245,8 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 box_attn_isolation=0.85,
                 composite_box_images_to_init=True,
                 uncond_uses_references=False,
+                mask_blend_mode="union",
+                invert_inpaint_mask=True,
             )
             custom_req.save_preset(tmp_preset)
             _assert(
@@ -1253,7 +1263,9 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 and reloaded_req.uncond_uses_references is False
                 and reloaded_req.system_prompt == "Spatial layout system prompt"
                 and reloaded_req.thinking_trace == "Explicit spatial chain-of-thought"
-                and reloaded_req.add_vision_id is False,
+                and reloaded_req.add_vision_id is False
+                and reloaded_req.mask_blend_mode == "union"
+                and reloaded_req.invert_inpaint_mask is True,
                 f"GenerationRequest failed to inherit active default.json overrides: {reloaded_req}",
             )
         finally:
@@ -1280,6 +1292,39 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     _assert(
         px_b == (256, 512, 768, 1024),
         f"Unexpected pixel rect from centralized bbox: {px_b}",
+    )
+
+    stale_summary = (
+        'A sleek brushed-steel refrigerator door with a yellow sticky note that reads: '
+        '"Remember to test SFT & Base permutations @ 1024x1024"'
+    )
+    reconciled_str = reconcile_layout_summary_quotes(
+        stale_summary, ["SHIP SOVEREIGN STUDIO v2"]
+    )
+    _assert(
+        '"SHIP SOVEREIGN STUDIO v2"' in reconciled_str
+        and "Remember to test SFT" not in reconciled_str,
+        f"reconcile_layout_summary_quotes failed to update stale quote: {reconciled_str}",
+    )
+    compiled_reconciled = json.loads(
+        compile_layout_prompt(
+            caption=stale_summary,
+            items=[
+                {
+                    "category": "text",
+                    "text": "SHIP SOVEREIGN STUDIO v2",
+                    "bbox": [288, 144, 544, 480],
+                }
+            ],
+            height=1024,
+            width=1024,
+            coords_are_pixels=True,
+        )
+    )
+    _assert(
+        '"SHIP SOVEREIGN STUDIO v2"' in compiled_reconciled["summary"]["caption"]
+        and compiled_reconciled["items"][0]["text"] == "SHIP SOVEREIGN STUDIO v2",
+        f"compile_layout_prompt failed single-point-of-truth quote reconciliation: {compiled_reconciled}",
     )
 
     req_poly = GenerationRequest(
@@ -1410,6 +1455,59 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Box aperture mask failed interior/feather/exterior boundary conditions",
     )
 
+    m_paint = torch.zeros((1, 1, 64, 64), device=dev, dtype=torch.float32)
+    m_paint[:, :, :32, :] = 1.0
+    m_alpha = torch.full((1, 1, 64, 64), 0.5, device=dev, dtype=torch.float32)
+
+    m_auto_union = compose_latent_inpaint_mask(
+        paint_mask=m_paint,
+        box_mask=aperture_mask,
+        alpha_mask=m_alpha,
+        blend_mode="auto",
+        preserve_outside_boxes=False,
+        invert_mask=False,
+        device=dev,
+    )
+    _assert(
+        m_auto_union is not None
+        and float(m_auto_union[0, 0, 5, 5].item()) == 1.0
+        and float(m_auto_union[0, 0, 40, 32].item()) == 1.0
+        and float(m_auto_union[0, 0, 55, 5].item()) == 0.0,
+        "compose_latent_inpaint_mask auto-union failed",
+    )
+
+    m_auto_inter = compose_latent_inpaint_mask(
+        paint_mask=m_paint,
+        box_mask=aperture_mask,
+        alpha_mask=m_alpha,
+        blend_mode="auto",
+        preserve_outside_boxes=True,
+        invert_mask=False,
+        device=dev,
+    )
+    _assert(
+        m_auto_inter is not None
+        and float(m_auto_inter[0, 0, 5, 5].item()) == 0.0
+        and float(m_auto_inter[0, 0, 24, 32].item()) == 1.0
+        and float(m_auto_inter[0, 0, 40, 32].item()) == 0.0,
+        "compose_latent_inpaint_mask auto-intersect (preserve_outside_boxes) failed",
+    )
+
+    m_inv_alpha = compose_latent_inpaint_mask(
+        paint_mask=m_paint,
+        box_mask=aperture_mask,
+        alpha_mask=m_alpha,
+        blend_mode="alpha_only",
+        invert_mask=True,
+        device=dev,
+    )
+    _assert(
+        m_inv_alpha is not None
+        and len(SUPPORTED_MASK_BLEND_MODES) == 6
+        and abs(float(m_inv_alpha[0, 0, 10, 10].item()) - 0.5) < 1e-6,
+        "compose_latent_inpaint_mask alpha_only + invert_mask failed",
+    )
+
     with torch.inference_mode():
         base_canvas = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
         box_lat = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
@@ -1457,7 +1555,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + Mixed-Role Picture Parity + Box-Conformal Framing + Latent Splatting Verified"
+        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + QuoteSync + ComposableMaskAlgebra + Box-Conformal Framing + Latent Splatting Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)
