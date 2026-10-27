@@ -81,7 +81,6 @@ def _configure_rocm_runtime_env() -> None:
         p_db = Path(cur_sys_db)
         if p_db.is_dir() and any(p_db.iterdir()):
             return
-
     for sp_cand in sys.path:
         if not sp_cand:
             continue
@@ -160,9 +159,11 @@ _SPLITMIX64_C3 = 0x94D049BB133111EB
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 _MASK63 = 0x7FFFFFFFFFFFFFFF
 
-_VRAM_TRIM_THRESHOLD_BYTES = int(25.6 * (1024**3))
-_MIN_RECLAIMABLE_CACHE_BYTES = 16 * (1024**2)
-_MAX_INACTIVE_SPLIT_BYTES = 256 * (1024**2)
+_VRAM_TRIM_THRESHOLD_BYTES = int(28.5 * (1024**3))
+_MIN_RECLAIMABLE_CACHE_BYTES = 64 * (1024**2)
+_MAX_INACTIVE_SPLIT_BYTES = 512 * (1024**2)
+_AI_TOOLKIT_MAX_REF_DIM = 512
+
 _GENERATOR_CACHE: Dict[str, torch.Generator] = {}
 
 
@@ -341,7 +342,6 @@ class WDDMMemoryGuard:
                     hw_seen += 1
                 self._call_com(adapter, 2, [ctypes.c_void_p])
                 adapter_idx += 1
-
             self._call_com(factory, 2, [ctypes.c_void_p])
             if self.active:
                 _, shr_used = self._query_video_memory_info()
@@ -470,7 +470,7 @@ class WDDMMemoryGuard:
 
     def enforce_stage_budget(
         self,
-        required_headroom_gb: float = 2.50,
+        required_headroom_gb: float = 2.00,
         force: bool = False,
     ) -> WDDMMemorySnapshot:
         snap = self.poll()
@@ -481,7 +481,6 @@ class WDDMMemoryGuard:
         needs_eviction = (
             force
             or snap.is_spilling
-            or (snap.dedicated_avail_gb < required_headroom_gb)
             or (snap.contiguous_avail_gb < required_headroom_gb)
             or (split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
             or (reserved_bytes > _VRAM_TRIM_THRESHOLD_BYTES)
@@ -568,6 +567,37 @@ def _probe_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
         return None
 
 
+def _resolve_unboxed_reference_dims(
+    path: Path,
+    req_w: int,
+    req_h: int,
+    edit_format: str,
+) -> Tuple[int, int]:
+    fmt = str(edit_format or "standard").strip().lower()
+    cap_w = (
+        min(req_w, _AI_TOOLKIT_MAX_REF_DIM)
+        if fmt in ("ai_toolkit_isolated", "ai_toolkit_full")
+        else req_w
+    )
+    cap_h = (
+        min(req_h, _AI_TOOLKIT_MAX_REF_DIM)
+        if fmt in ("ai_toolkit_isolated", "ai_toolkit_full")
+        else req_h
+    )
+    max_area = float(max(64 * 64, cap_w * cap_h))
+
+    dims = _probe_image_dimensions(path)
+    if dims is not None and dims[0] > 0 and dims[1] > 0:
+        src_w, src_h = dims
+        src_area = float(src_w * src_h)
+        scale = min(1.0, math.sqrt(max_area / src_area))
+        out_w = max(64, int(round((src_w * scale) / 16.0)) * 16)
+        out_h = max(64, int(round((src_h * scale) / 16.0)) * 16)
+        return out_w, out_h
+
+    return max(64, (cap_w // 16) * 16), max(64, (cap_h // 16) * 16)
+
+
 def _normalize_vizinjector_framing(framing_mode: Optional[str]) -> str:
     fm = str(framing_mode or "inscribed").strip().lower()
     if fm in ("inscribed", "cover_crop"):
@@ -601,6 +631,7 @@ def build_box_aperture_mask(
             )
             if (uy1 - uy0) > 1e-4 and (ux1 - ux0) > 1e-4:
                 active_boxes.append((uy0, ux0, uy1, ux1))
+
     if not active_boxes:
         return None
 
@@ -905,7 +936,6 @@ class BifurcatedFlowMatchScheduler:
             self.shift = float(shift)
         if handoff_threshold is not None:
             self.handoff_threshold = max(0.0, min(1.0, float(handoff_threshold)))
-
         target_device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
@@ -930,8 +960,8 @@ class BifurcatedFlowMatchScheduler:
         self.base_sigmas = torch.from_numpy(base_sigmas_np.astype(np.float32)).to(
             device=target_device
         )
-
         active_steps = len(sigmas_np)
+
         if self.handoff_threshold >= 1.0:
             k_star = active_steps
         elif self.handoff_threshold <= 0.0:
@@ -954,7 +984,6 @@ class BifurcatedFlowMatchScheduler:
 
         step_configs: List[Dict[str, Any]] = []
         eval_timesteps: List[float] = []
-
         for i in range(active_steps):
             is_early = i < k_star
             solver = self.early_solver if is_early else self.late_solver
@@ -1364,6 +1393,7 @@ class ReferenceVisionCache:
         self._cache.move_to_end(key)
         while len(self._cache) > self.max_entries:
             self._cache.popitem(last=False)
+
         if vae_key is not None and pinned_rec.packed_latents is not None:
             self._vae_cache[vae_key] = (
                 pinned_rec.packed_latents,
@@ -1413,6 +1443,7 @@ class EngineProgressReporter:
             self.stage_start = now
             self.last_render = 0.0
             self.last_count = 0
+
         self.last_count = current
         is_final = current >= total
         if not is_final and (now - self.last_render < self.render_interval):
@@ -1429,6 +1460,7 @@ class EngineProgressReporter:
         remaining_units = max(0, total - current)
         eta = (remaining_units / rate) if rate > 0.0 else 0.0
         time_str = f"[{_format_seconds(elapsed)}<{_format_seconds(eta)}"
+
         if stage == "context":
             prefix = "[1/3 Qwen3.5 Context]"
             rate_str = f"{rate:5.1f} seq/s" if rate > 0 else "  --.- seq/s"
@@ -1483,6 +1515,7 @@ def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
     direct_path = Path(repo_or_path)
     if direct_path.exists():
         return direct_path.resolve()
+
     repo_str = str(repo_or_path).replace("\\", "/")
     hub_candidates = [
         CACHE_DIR / "hub",
@@ -1544,9 +1577,11 @@ def load_sharded_safetensors_into(
                 else:
                     state_dict[clean_key] = v.to(device=device)
             del raw
+
         target_module.load_state_dict(state_dict, strict=True, assign=True)
         del state_dict
         gc.collect()
+
         for name, param in target_module.named_parameters():
             if param.device != device:
                 if param.is_floating_point():
@@ -1562,6 +1597,7 @@ def load_sharded_safetensors_into(
                         param.data = param.data.to(device=device)
                 else:
                     param.data = param.data.to(device=device)
+
         for name, buf in target_module.named_buffers():
             if buf.is_floating_point():
                 if (
@@ -1675,6 +1711,7 @@ class MOSSImageEngine:
         self.text_encoder: Optional[Qwen3_5Model] = None
         self.transformer: Optional[MOSSImageTransformer] = None
         self.vae: Optional[Flux2AutoencoderKL] = None
+
         self.embed_cache = PromptEmbedCache(max_entries=32)
         self.ref_cache = ReferenceVisionCache(max_entries=32)
         self.memory_guard = WDDMMemoryGuard(self.device)
@@ -1723,7 +1760,7 @@ class MOSSImageEngine:
             torch.cuda.synchronize(self.device)
 
     def _trim_reserved_vram(
-        self, force: bool = False, required_headroom_gb: float = 2.50
+        self, force: bool = False, required_headroom_gb: float = 2.00
     ) -> WDDMMemorySnapshot:
         return self.memory_guard.enforce_stage_budget(
             required_headroom_gb=required_headroom_gb, force=force
@@ -1775,11 +1812,9 @@ class MOSSImageEngine:
                     except Exception:
                         pass
                 self.tokenizer = None
-
             self.embed_cache.clear()
             self.ref_cache.clear()
             _GENERATOR_CACHE.clear()
-
             if self.transformer is not None:
                 try:
                     self.transformer.unfuse_lora()
@@ -1794,7 +1829,6 @@ class MOSSImageEngine:
                     pass
                 self.text_encoder = None
             self.vae = None
-
             self._loaded_repo_id = None
             self._current_offload_state = None
             self._warmed_up = False
@@ -1860,7 +1894,7 @@ class MOSSImageEngine:
                         self.transformer.to(target_device)
                         self.transformer.clear_caches()
                         self._current_offload_state = cpu_offload
-                        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+                        self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
                         self.memory_guard.recalibrate_baseline()
                         return
                     self._current_offload_state = cpu_offload
@@ -1868,7 +1902,6 @@ class MOSSImageEngine:
                     return
 
             root_path = resolve_model_path(target_repo_id)
-
             if (
                 self.transformer is not None
                 and self.text_encoder is not None
@@ -1901,7 +1934,7 @@ class MOSSImageEngine:
                 self.transformer.clear_caches()
                 self.transformer.eval().requires_grad_(False)
                 self._loaded_repo_id = target_repo_id
-                self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+                self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
                 self.memory_guard.recalibrate_baseline()
                 logging.info(
                     "Hot-swap completed in %.2fs (Shared Qwen3.5 & Flux2-VAE retained).",
@@ -1958,7 +1991,7 @@ class MOSSImageEngine:
                 dtype=self.dtype,
             )
             self.transformer.eval().requires_grad_(False)
-            self._trim_reserved_vram(force=True, required_headroom_gb=4.50)
+            self._trim_reserved_vram(force=True, required_headroom_gb=2.50)
 
             logging.info(
                 "Loading Sovereign Flux2AutoencoderKL (FP32) from %s", vae_dir
@@ -1972,7 +2005,7 @@ class MOSSImageEngine:
 
             self._loaded_repo_id = target_repo_id
             self._current_offload_state = cpu_offload
-            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+            self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
             self.memory_guard.recalibrate_baseline()
             logging.info(
                 "MOSSImageEngine initialized (%s) in %.2fs.",
@@ -1993,7 +2026,7 @@ class MOSSImageEngine:
             ):
                 if self.transformer._lora_backups:
                     self.transformer.unfuse_lora()
-                    self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+                    self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
                 return False
 
             raw_spec = edit_lora_path.strip()
@@ -2043,7 +2076,7 @@ class MOSSImageEngine:
                 lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
             )
             del lora_sd
-            self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+            self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
             return fused > 0
 
     def _condition_single_reference(
@@ -2083,7 +2116,6 @@ class MOSSImageEngine:
             mtf_boost=request.mtf_boost,
             mask_feather_radius=request.mask_feather_radius,
         )
-
         cached_vae_tuple: Optional[
             Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Any]]
         ] = None
@@ -2175,7 +2207,7 @@ class MOSSImageEngine:
                     packed_lat = _evacuate_to_cpu(clamped_lat)
                     del raw_lat, clamped_lat
                     bundle.vae_tensor = None
-                    self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+                    self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
                 latent_mask = _evacuate_to_cpu(bundle.latent_mask)
 
             vit_embeds = _evacuate_to_cpu(bundle.vit_embeds)
@@ -2194,7 +2226,7 @@ class MOSSImageEngine:
                 vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
                 del img_splits
                 self.text_encoder.visual.clear_caches()
-                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+                self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
 
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
@@ -2219,7 +2251,7 @@ class MOSSImageEngine:
                 )
                 packed_lat = _evacuate_to_cpu(clamped_lat)
                 del img_t, raw_lat, clamped_lat
-                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+                self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
                 was_hit = False
 
             vit_embeds = None
@@ -2239,7 +2271,7 @@ class MOSSImageEngine:
                 vit_embeds = _evacuate_to_cpu(torch.cat(img_splits, dim=0))
                 del img_splits
                 self.text_encoder.visual.clear_caches()
-                self._trim_reserved_vram(force=True, required_headroom_gb=3.50)
+                self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
 
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
@@ -2455,7 +2487,7 @@ class MOSSImageEngine:
         del dummy_ids, dummy_out
         self.text_encoder.clear_caches()
         self._sync_device()
-        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+        self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
 
         sys.stdout.write(
             f"  [2/3] Warmup: 42-Layer MOSS-DiT 4D-RoPE Velocity Field ({width}x{height})...\n"
@@ -2482,9 +2514,9 @@ class MOSSImageEngine:
             skip_layers=warmup_skip,
         )
         del dummy_ctx_cpu, dummy_ctx, dummy_mask, dummy_lat
-        self.transformer.clear_caches()
+        self.transformer.clear_transient_caches()
         self._sync_device()
-        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+        self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
 
         sys.stdout.write(
             f"  [3/3] Warmup: Flux2-VAE FP32 Unpatch & Decoder ({width}x{height})...\n"
@@ -2498,7 +2530,7 @@ class MOSSImageEngine:
         dummy_dec = self.vae.decode_packed_latents(dummy_lat_vae)
         del dummy_lat_vae, dummy_dec
         self._sync_device()
-        self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+        self._trim_reserved_vram(force=True, required_headroom_gb=2.00)
         self.memory_guard.recalibrate_baseline()
 
         elapsed = time.perf_counter() - t0
@@ -2527,7 +2559,7 @@ class MOSSImageEngine:
             request.edit_lora_path, request.edit_lora_scale
         )
         if not cpu_offload:
-            self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
 
         reporter: Optional[EngineProgressReporter] = None
         if progress_callback is None:
@@ -2668,9 +2700,12 @@ class MOSSImageEngine:
                     ref_w = max(64, ((xmax - xmin + 8) // 16) * 16)
                     ref_h = max(64, ((ymax - ymin + 8) // 16) * 16)
                 else:
-                    ref_w = request.width
-                    ref_h = request.height
-
+                    ref_w, ref_h = _resolve_unboxed_reference_dims(
+                        r_path,
+                        request.width,
+                        request.height,
+                        request.edit_format,
+                    )
                 r_rec, hit = self._condition_single_reference(
                     r_path,
                     request,
@@ -2688,7 +2723,6 @@ class MOSSImageEngine:
                     is_box_ref or request.edit_format != "moss_image_edit"
                 ):
                     ref_records_for_prompt.append(r_rec)
-
                 if (
                     request.export_vizj_path
                     and self.vizinjector is not None
@@ -2720,7 +2754,7 @@ class MOSSImageEngine:
                 self.vae.to("cpu")
                 self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
             else:
-                self._trim_reserved_vram(force=True, required_headroom_gb=3.80)
+                self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
 
         effective_prompt = request.compile_effective_prompt()
         pos_hits_before = self.embed_cache.pos_hits
@@ -2766,7 +2800,7 @@ class MOSSImageEngine:
             self.text_encoder.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=11.0)
         else:
-            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
 
         if cpu_offload:
             self.transformer.to(self.device)
@@ -2928,6 +2962,14 @@ class MOSSImageEngine:
             if (ref_bboxes_list and any(b is not None for b in ref_bboxes_list))
             else None
         )
+        uncond_uses_refs = not (
+            request.edit_format in ("ai_toolkit_isolated", "ai_toolkit_full")
+            and active_ref_bboxes is None
+            and not has_control
+        )
+        uncond_ref_latents = active_ref_latents if uncond_uses_refs else None
+        uncond_ref_bboxes = active_ref_bboxes if uncond_uses_refs else None
+
         ref_zero_t = request.effective_reference_zero_timestep
         ref_iso_kv = request.effective_reference_isolated_kv
 
@@ -2940,7 +2982,6 @@ class MOSSImageEngine:
             reporter.start_stage("dit", num_passes)
 
         dit_t0 = time.perf_counter()
-
         for pass_index, timestep in enumerate(timesteps):
             if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
                 is_early = active_scheduler.current_is_early
@@ -2980,10 +3021,10 @@ class MOSSImageEngine:
                     timestep,
                     negative,
                     negative_mask,
-                    reference_latents=active_ref_latents,
-                    reference_zero_timestep=ref_zero_t,
-                    reference_isolated_kv=ref_iso_kv,
-                    reference_bboxes=active_ref_bboxes,
+                    reference_latents=uncond_ref_latents,
+                    reference_zero_timestep=ref_zero_t and uncond_uses_refs,
+                    reference_isolated_kv=ref_iso_kv and uncond_uses_refs,
+                    reference_bboxes=uncond_ref_bboxes,
                     **skip_kwargs,
                 ).sample.float()
                 prediction = uncond + current_cfg * (prediction - uncond)
@@ -3007,7 +3048,6 @@ class MOSSImageEngine:
                 prediction = prediction + request.slg_scale * (conditional - skipped)
                 del skipped
                 total_nfe += 1
-
             del conditional
 
             latents = active_scheduler.step(
@@ -3057,7 +3097,7 @@ class MOSSImageEngine:
             late_steps = 0
 
         latents_cpu = _evacuate_to_cpu(latents)
-        self.transformer.clear_caches()
+        self.transformer.clear_transient_caches()
         del (
             latents,
             timesteps,
@@ -3069,6 +3109,8 @@ class MOSSImageEngine:
             negative_mask,
             active_ref_latents,
             active_ref_bboxes,
+            uncond_ref_latents,
+            uncond_ref_bboxes,
             ref_latents_list,
             ref_bboxes_list,
             clean_init_latents,
@@ -3081,7 +3123,7 @@ class MOSSImageEngine:
             self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
             self.vae.to(self.device)
         else:
-            self._trim_reserved_vram(force=True, required_headroom_gb=4.40)
+            self._trim_reserved_vram(force=False, required_headroom_gb=2.00)
 
         if reporter is not None:
             reporter.start_stage("vae", num_imgs)
@@ -3093,12 +3135,11 @@ class MOSSImageEngine:
         decoded_cpu = _evacuate_to_cpu(decoded_gpu)
         del decoded_gpu
         self._sync_device()
-
         if cpu_offload:
             self.vae.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
         else:
-            self._trim_reserved_vram(force=True, required_headroom_gb=4.20)
+            self._trim_reserved_vram(force=False, required_headroom_gb=1.80)
 
         if self.vizinjector is not None:
             pil_images, viz_telems = self.vizinjector.postprocess_to_pil(

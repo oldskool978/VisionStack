@@ -23,8 +23,19 @@ _FP8_DTYPES: Set[torch.dtype] = {
     if (dtype := getattr(torch, name, None)) is not None
 }
 
+_FFN_TILE_TOKENS = 2048
+
 IsoKVSpec = Tuple[int, Tuple[int, ...], int]
 NormBBox = Tuple[float, float, float, float]
+ModTuple6 = Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+PiecewiseModSpec = Tuple[ModTuple6, ModTuple6, int, int]
 
 
 def _maybe_pin_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -103,6 +114,14 @@ def _situ(hidden: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _situ_inplace(hidden: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    sig_g = torch.sigmoid(gate)
+    gate.mul_(0.25).tanh_().mul_(4.0).mul_(sig_g)
+    del sig_g
+    hidden.mul_(0.04).tanh_().mul_(25.0).mul_(gate)
+    return hidden
+
+
 def validate_skip_layers(
     layers: Optional[Iterable[int]], depth: int, name: str = "skip_layers"
 ) -> Set[int]:
@@ -150,7 +169,7 @@ def _rotate(
         sin_signed = torch.cat((-sin, sin), -1).unsqueeze(-2)
         cos = torch.cat((cos, cos), -1).unsqueeze(-2)
     a, b = x.chunk(2, -1)
-    return x * cos + torch.cat((b, a), -1) * sin_signed
+    return torch.addcmul(x * cos, torch.cat((b, a), -1), sin_signed)
 
 
 def _attention(
@@ -168,74 +187,170 @@ def _attention(
         k = k.unflatten(-1, (heads, -1))
     if v.ndim == 3:
         v = v.unflatten(-1, (heads, -1))
-    q = _rotate(q, rope).transpose(1, 2)
-    k = _rotate(k, rope).transpose(1, 2)
-    v = v.transpose(1, 2)
-    q_in = q if q.dtype == v.dtype else q.to(v.dtype)
-    k_in = k if k.dtype == v.dtype else k.to(v.dtype)
-    v_in = v
+
+    q_rot = _rotate(q, rope)
+    k_rot = _rotate(k, rope)
+    if q_rot.dtype != v.dtype:
+        q_rot = q_rot.to(v.dtype)
+    if k_rot.dtype != v.dtype:
+        k_rot = k_rot.to(v.dtype)
 
     if iso_kv_spec is not None and attn_mask is None:
         target_tokens, ref_token_lengths, _ = iso_kv_spec
         total_ref = sum(ref_token_lengths)
         if total_ref > 0:
+            b_sz, total_seq, _, head_dim = q_rot.shape
             text_start = target_tokens + total_ref
-            q_c = q_in.contiguous()
-            k_c = k_in.contiguous()
-            v_c = v_in.contiguous()
-            del q_in, k_in, v_in, q, k, v
-            out_buf = torch.empty_like(q_c, memory_format=torch.contiguous_format)
+            text_len = total_seq - text_start
+            if not v.is_contiguous():
+                v = v.contiguous()
 
-            q_main = torch.cat(
-                (q_c[:, :, :target_tokens, :], q_c[:, :, text_start:, :]), dim=2
-            )
-            out_main = F.scaled_dot_product_attention(
-                q_main, k_c, v_c, attn_mask=None
-            )
-            out_buf[:, :, :target_tokens, :].copy_(out_main[:, :, :target_tokens, :])
-            out_buf[:, :, text_start:, :].copy_(out_main[:, :, target_tokens:, :])
-            del q_main, out_main
+            out_blhd = torch.empty_like(q_rot, memory_format=torch.contiguous_format)
+            k_full = k_rot.transpose(1, 2)
+            v_full = v.transpose(1, 2)
 
-            k_text = k_c[:, :, text_start:, :]
-            v_text = v_c[:, :, text_start:, :]
+            q_target = (
+                q_rot[:, :target_tokens, :, :]
+                .view(b_sz, target_tokens, heads, head_dim)
+                .transpose(1, 2)
+            )
+            out_target = F.scaled_dot_product_attention(
+                q_target, k_full, v_full, attn_mask=None
+            )
+            out_blhd[:, :target_tokens, :, :].copy_(out_target.transpose(1, 2))
+            del out_target
+
+            if text_len > 0:
+                q_text = (
+                    q_rot[:, text_start:, :, :]
+                    .view(b_sz, text_len, heads, head_dim)
+                    .transpose(1, 2)
+                )
+                out_text = F.scaled_dot_product_attention(
+                    q_text, k_full, v_full, attn_mask=None
+                )
+                out_blhd[:, text_start:, :, :].copy_(out_text.transpose(1, 2))
+                del out_text
+
+            k_text_blhd = k_rot[:, text_start:, :, :]
+            v_text_blhd = v[:, text_start:, :, :]
             cursor = target_tokens
             for r_len in ref_token_lengths:
                 next_cursor = cursor + r_len
-                q_ref = q_c[:, :, cursor:next_cursor, :]
+                q_ref = (
+                    q_rot[:, cursor:next_cursor, :, :]
+                    .view(b_sz, r_len, heads, head_dim)
+                    .transpose(1, 2)
+                )
                 if next_cursor == text_start:
-                    k_ref = k_c[:, :, cursor:, :]
-                    v_ref = v_c[:, :, cursor:, :]
+                    rem_len = total_seq - cursor
+                    k_ref = (
+                        k_rot[:, cursor:, :, :]
+                        .view(b_sz, rem_len, heads, head_dim)
+                        .transpose(1, 2)
+                    )
+                    v_ref = (
+                        v[:, cursor:, :, :]
+                        .view(b_sz, rem_len, heads, head_dim)
+                        .transpose(1, 2)
+                    )
                     out_ref = F.scaled_dot_product_attention(
                         q_ref, k_ref, v_ref, attn_mask=None
                     )
                 else:
-                    k_ref = torch.cat(
-                        (k_c[:, :, cursor:next_cursor, :], k_text), dim=2
+                    k_cat = torch.cat(
+                        (k_rot[:, cursor:next_cursor, :, :], k_text_blhd), dim=1
                     )
-                    v_ref = torch.cat(
-                        (v_c[:, :, cursor:next_cursor, :], v_text), dim=2
+                    v_cat = torch.cat(
+                        (v[:, cursor:next_cursor, :, :], v_text_blhd), dim=1
                     )
                     out_ref = F.scaled_dot_product_attention(
-                        q_ref, k_ref, v_ref, attn_mask=None
+                        q_ref,
+                        k_cat.transpose(1, 2),
+                        v_cat.transpose(1, 2),
+                        attn_mask=None,
                     )
-                    del k_ref, v_ref
-                out_buf[:, :, cursor:next_cursor, :].copy_(out_ref)
+                    del k_cat, v_cat
+                out_blhd[:, cursor:next_cursor, :, :].copy_(out_ref.transpose(1, 2))
                 del out_ref
                 cursor = next_cursor
 
-            del q_c, k_c, v_c
-            return out_buf.transpose(1, 2).flatten(2)
+            del q_rot, k_rot
+            return out_blhd.flatten(2)
 
     return (
         F.scaled_dot_product_attention(
-            q_in,
-            k_in,
-            v_in,
+            q_rot.transpose(1, 2),
+            k_rot.transpose(1, 2),
+            v.transpose(1, 2),
             attn_mask=attn_mask,
         )
         .transpose(1, 2)
         .flatten(2)
     )
+
+
+def _apply_mod_inplace(
+    y: torch.Tensor,
+    modulation: Union[torch.Tensor, ModTuple6, PiecewiseModSpec],
+    is_ffn: bool,
+) -> None:
+    if isinstance(modulation, tuple) and len(modulation) == 4:
+        mod_t, mod_z, target_tokens, total_img_tokens = modulation
+        t_shift, t_scale_p1 = (mod_t[3], mod_t[4]) if is_ffn else (mod_t[0], mod_t[1])
+        z_shift, z_scale_p1 = (mod_z[3], mod_z[4]) if is_ffn else (mod_z[0], mod_z[1])
+        y[:, :target_tokens, :].mul_(t_scale_p1).add_(t_shift)
+        y[:, target_tokens:total_img_tokens, :].mul_(z_scale_p1).add_(z_shift)
+        y[:, total_img_tokens:, :].mul_(t_scale_p1).add_(t_shift)
+        return
+
+    if isinstance(modulation, tuple):
+        shift, scale_p1 = (
+            (modulation[3], modulation[4])
+            if is_ffn
+            else (modulation[0], modulation[1])
+        )
+    else:
+        if modulation.ndim == 3:
+            shift_a, scale_a, _, shift_f, scale_f, _ = (
+                modulation[:, :, None, :].unbind(1)
+            )
+        else:
+            shift_a, scale_a, _, shift_f, scale_f, _ = modulation.unbind(1)
+        shift = shift_f if is_ffn else shift_a
+        scale_p1 = 1 + (scale_f if is_ffn else scale_a)
+
+    y.mul_(scale_p1).add_(shift)
+
+
+def _apply_gate_residual_inplace(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    modulation: Union[torch.Tensor, ModTuple6, PiecewiseModSpec],
+    is_ffn: bool,
+) -> torch.Tensor:
+    if isinstance(modulation, tuple) and len(modulation) == 4:
+        mod_t, mod_z, target_tokens, total_img_tokens = modulation
+        t_gate = mod_t[5] if is_ffn else mod_t[2]
+        z_gate = mod_z[5] if is_ffn else mod_z[2]
+        delta[:, :target_tokens, :].mul_(t_gate)
+        delta[:, target_tokens:total_img_tokens, :].mul_(z_gate)
+        delta[:, total_img_tokens:, :].mul_(t_gate)
+        return x.add_(delta)
+
+    if isinstance(modulation, tuple):
+        gate = modulation[5] if is_ffn else modulation[2]
+    else:
+        if modulation.ndim == 3:
+            _, _, gate_a, _, _, gate_f = modulation[:, :, None, :].unbind(1)
+        else:
+            _, _, gate_a, _, _, gate_f = modulation.unbind(1)
+        gate = gate_f if is_ffn else gate_a
+
+    if gate.shape[1] == 1:
+        return x.addcmul_(delta, gate.to(x.dtype))
+    delta.mul_(gate)
+    return x.add_(delta)
 
 
 class _TextBlock(nn.Module):
@@ -264,7 +379,7 @@ class _TextBlock(nn.Module):
         x = x + _linear(self.proj, _attention(q, k, v, rope, self.heads))
         y = self.norm2(x)
         return x + _linear(
-            self.ffn_down, _situ(_linear(self.ffn_up, y), _linear(self.ffn_gate, y))
+            self.ffn_down, _situ_inplace(_linear(self.ffn_up, y), _linear(self.ffn_gate, y))
         )
 
 
@@ -303,40 +418,21 @@ class _Block(nn.Module):
         self,
         x: torch.Tensor,
         rope: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        modulation: Union[
-            torch.Tensor,
-            Tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ],
-        ],
+        modulation: Union[torch.Tensor, ModTuple6, PiecewiseModSpec],
         attn_mask: Optional[torch.Tensor] = None,
         iso_kv_spec: Optional[IsoKVSpec] = None,
     ) -> torch.Tensor:
-        if isinstance(modulation, tuple):
-            shift_a, scale_a_p1, gate_a, shift_f, scale_f_p1, gate_f = modulation
-        else:
-            if modulation.ndim == 3:
-                shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
-                    modulation[:, :, None, :].unbind(1)
-                )
-            else:
-                shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
-            scale_a_p1 = 1 + scale_a
-            scale_f_p1 = 1 + scale_f
-
-        y = self.norm1(x) * scale_a_p1 + shift_a
         dtype = _resolve_compute_dtype(self.proj["q"].weight, x.dtype)
+        y = self.norm1(x)
+        _apply_mod_inplace(y, modulation, is_ffn=False)
         if y.dtype != dtype:
             y = y.to(dtype)
+
         q = self.q_norm(_linear(self.proj["q"], y).unflatten(-1, (self.heads, -1)))
         k = self.k_norm(_linear(self.proj["k"], y).unflatten(-1, (self.heads, -1)))
         v = _linear(self.proj["v"], y).unflatten(-1, (self.heads, -1))
         del y
+
         attn_out = _attention(
             q,
             k,
@@ -347,17 +443,39 @@ class _Block(nn.Module):
             iso_kv_spec=iso_kv_spec,
         )
         del q, k, v
-        x = x + _linear(self.proj["o"], attn_out) * gate_a
-        del attn_out
 
-        y = self.norm2(x) * scale_f_p1 + shift_f
+        proj_o = _linear(self.proj["o"], attn_out)
+        del attn_out
+        x = _apply_gate_residual_inplace(x.clone(), proj_o, modulation, is_ffn=False)
+        del proj_o
+
+        y = self.norm2(x)
+        _apply_mod_inplace(y, modulation, is_ffn=True)
         if y.dtype != dtype:
             y = y.to(dtype)
-        hidden, gate = _linear(self.proj["ffn_up_gate"], y).chunk(2, -1)
-        del y
-        act = _situ(hidden, gate)
-        del hidden, gate
-        return x + _linear(self.proj["ffn_down"], act) * gate_f
+
+        seq_len = y.shape[1]
+        if seq_len <= _FFN_TILE_TOKENS:
+            hidden, gate = _linear(self.proj["ffn_up_gate"], y).chunk(2, -1)
+            del y
+            act = _situ_inplace(hidden, gate)
+            del gate
+            ffn_out = _linear(self.proj["ffn_down"], act)
+            del act, hidden
+        else:
+            ffn_out = torch.empty_like(x)
+            for start in range(0, seq_len, _FFN_TILE_TOKENS):
+                end = min(start + _FFN_TILE_TOKENS, seq_len)
+                hidden, gate = _linear(
+                    self.proj["ffn_up_gate"], y[:, start:end, :]
+                ).chunk(2, -1)
+                act = _situ_inplace(hidden, gate)
+                del gate
+                ffn_out[:, start:end, :] = _linear(self.proj["ffn_down"], act)
+                del act, hidden
+            del y
+
+        return _apply_gate_residual_inplace(x, ffn_out, modulation, is_ffn=True)
 
 
 class _RoPE(nn.Module):
@@ -592,6 +710,7 @@ class MOSSImageTransformer(nn.Module):
             raise ValueError(
                 "Require dim divisible by heads, head_dim divisible by 8, and even freq_dim."
             )
+
         self.config = MOSSImageConfig(
             dim=dim,
             ffn_dim=ffn_dim,
@@ -974,22 +1093,21 @@ class MOSSImageTransformer(nn.Module):
         return r_emb
 
     def _acquire_mod_seq_buf(
-        self, total_seq: int, device: torch.device, dtype: torch.dtype
+        self, num_regimes: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         dim = self.config.dim
-        alloc_seq = ((total_seq + 255) // 256) * 256
+        alloc_regimes = max(2, int(num_regimes))
         if (
             self._mod_seq_buf is None
             or self._mod_seq_buf.device != device
             or self._mod_seq_buf.dtype != dtype
-            or self._mod_seq_buf.shape[2] < total_seq
-            or self._mod_seq_buf.shape[2] > alloc_seq * 2
+            or self._mod_seq_buf.shape[2] < alloc_regimes
             or self._mod_seq_buf.shape[3] != dim
         ):
             self._mod_seq_buf = torch.empty(
-                (1, 6, alloc_seq, dim), device=device, dtype=dtype
+                (1, 6, alloc_regimes, dim), device=device, dtype=dtype
             )
-        return self._mod_seq_buf[:, :, :total_seq, :]
+        return self._mod_seq_buf[:, :, :alloc_regimes, :]
 
     @staticmethod
     def _build_isolated_reference_mask(
@@ -1000,7 +1118,9 @@ class MOSSImageTransformer(nn.Module):
     ) -> torch.Tensor:
         total_ref = sum(ref_token_lengths)
         total_seq = target_tokens + total_ref + text_tokens
-        mask = torch.zeros((1, 1, total_seq, total_seq), dtype=torch.bool, device=device)
+        mask = torch.zeros(
+            (1, 1, total_seq, total_seq), dtype=torch.bool, device=device
+        )
         mask[:, :, :target_tokens, :] = True
         text_start = target_tokens + total_ref
         mask[:, :, text_start:, :] = True
@@ -1111,41 +1231,39 @@ class MOSSImageTransformer(nn.Module):
 
             mod_i = mod[index : index + 1]
             if mod_zero is not None and total_img_tokens > target_tokens:
-                total_seq = total_img_tokens + text_len
-                mod_i_p1 = mod_i.clone()
-                mod_i_p1[:, 1, :].add_(1.0)
-                mod_i_p1[:, 4, :].add_(1.0)
-                mod_z_p1 = mod_zero.clone()
-                mod_z_p1[:, 1, :].add_(1.0)
-                mod_z_p1[:, 4, :].add_(1.0)
-
-                mod_seq = self._acquire_mod_seq_buf(
-                    total_seq, mod_i.device, mod_i.dtype
+                mod_pair = self._acquire_mod_seq_buf(
+                    2, mod_i.device, mod_i.dtype
                 )
-                mod_seq[:, :, :target_tokens, :].copy_(mod_i_p1[:, :, None, :])
-                mod_seq[:, :, target_tokens:total_img_tokens, :].copy_(
-                    mod_z_p1[:, :, None, :]
+                mod_pair[:, :, 0, :].copy_(mod_i)
+                mod_pair[:, 1, 0, :].add_(1.0)
+                mod_pair[:, 4, 0, :].add_(1.0)
+                mod_pair[:, :, 1, :].copy_(mod_zero)
+                mod_pair[:, 1, 1, :].add_(1.0)
+                mod_pair[:, 4, 1, :].add_(1.0)
+                mod_t_tuple: ModTuple6 = tuple(  # type: ignore[assignment]
+                    mod_pair[:, :, 0:1, :].unbind(1)
                 )
-                mod_seq[:, :, total_img_tokens:, :].copy_(mod_i_p1[:, :, None, :])
-                del mod_i_p1, mod_z_p1
-                shift_a, scale_a_p1, gate_a, shift_f, scale_f_p1, gate_f = (
-                    mod_seq.unbind(1)
+                mod_z_tuple: ModTuple6 = tuple(  # type: ignore[assignment]
+                    mod_pair[:, :, 1:2, :].unbind(1)
+                )
+                active_mod: Union[ModTuple6, PiecewiseModSpec] = (
+                    mod_t_tuple,
+                    mod_z_tuple,
+                    target_tokens,
+                    total_img_tokens,
                 )
             else:
                 shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
                     mod_i[:, :, None, :].unbind(1)
                 )
-                scale_a_p1 = 1 + scale_a
-                scale_f_p1 = 1 + scale_f
-
-            active_mod = (
-                shift_a,
-                scale_a_p1,
-                gate_a,
-                shift_f,
-                scale_f_p1,
-                gate_f,
-            )
+                active_mod = (
+                    shift_a,
+                    1 + scale_a,
+                    gate_a,
+                    shift_f,
+                    1 + scale_f,
+                    gate_f,
+                )
 
             iso_kv_spec: Optional[IsoKVSpec] = None
             if reference_latents and reference_isolated_kv and ref_token_lengths:

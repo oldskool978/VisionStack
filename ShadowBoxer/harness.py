@@ -275,13 +275,16 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
         if (req.edit_lora_path and abs(req.edit_lora_scale) > 1e-6)
         else "<Disabled>"
     )
+
     print("\n" + "=" * 92)
     print("               SHADOWBOXER: OPENMOSS ARCHITECTURAL EXPLORATION HARNESS")
     print(f"                     [{banner_tag}]")
     print("=" * 92)
     print(" --- MODEL & PROMPT CONDITIONING ---")
     print(f" [M]  Active Model Variant:   {req.model_variant.upper()} ({repo_str})")
-    print(f" [1]  Prompt Mode:            {req.prompt_mode.upper()} ({n_boxes} layout boxes)")
+    print(
+        f" [1]  Prompt Mode:            {req.prompt_mode.upper()} ({n_boxes} layout boxes)"
+    )
     print(f" [2]  Positive Prompt:        {_truncate(req.prompt, 65)}")
     print(f" [3]  Negative Prompt:        {_truncate(req.negative_prompt, 65)}")
     print(f" [4]  Qwen3.5 Thinking Mode:  {think_str}")
@@ -429,31 +432,95 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
     )
     rad = np.sqrt(xx * xx + yy * yy)
 
-    ref_a = np.zeros((h, w, 3), dtype=np.uint8)
-    ref_a[..., 0] = np.clip((0.55 + 0.40 * np.cos(3.0 * xx)) * 255.0, 0, 255).astype(
-        np.uint8
+    steel_micro = 0.08 * np.sin(96.0 * xx + 2.5 * np.sin(6.0 * yy))
+    panel_seam = np.exp(-((xx + 0.12) ** 2) / 0.0008) * -0.35
+    note_mask = ((xx > -0.58) & (xx < -0.18) & (yy > -0.36) & (yy < 0.04)).astype(
+        np.float32
     )
-    ref_a[..., 1] = np.clip((0.50 + 0.40 * np.sin(3.0 * yy)) * 255.0, 0, 255).astype(
-        np.uint8
+    note_lines = (
+        note_mask
+        * (np.abs(np.sin(68.0 * yy)) > 0.86).astype(np.float32)
+        * (np.abs(np.cos(52.0 * xx)) > 0.35).astype(np.float32)
     )
-    ref_a[..., 2] = np.clip((1.0 - 0.55 * rad) * 255.0, 0, 255).astype(np.uint8)
+    ref_a_r = (
+        0.54
+        + 0.28 * np.cos(3.2 * xx)
+        + steel_micro
+        + panel_seam
+        + note_mask * (0.42 - 0.78 * note_lines)
+    )
+    ref_a_g = (
+        0.56
+        + 0.26 * np.sin(3.0 * yy)
+        + steel_micro
+        + panel_seam
+        + note_mask * (0.36 - 0.75 * note_lines)
+    )
+    ref_a_b = (
+        0.62
+        - 0.30 * rad
+        + steel_micro
+        + panel_seam
+        + note_mask * (-0.42 - 0.40 * note_lines)
+    )
+    ref_a = np.stack(
+        [
+            np.clip(ref_a_r * 255.0, 0, 255),
+            np.clip(ref_a_g * 255.0, 0, 255),
+            np.clip(ref_a_b * 255.0, 0, 255),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
     p_ref_a = dest_dir / "ref_subject_a.png"
     Image.fromarray(ref_a, mode="RGB").save(p_ref_a)
 
-    ref_b = np.zeros((h, w, 3), dtype=np.uint8)
-    ref_b[..., 0] = np.clip((0.65 - 0.35 * yy) * 255.0, 0, 255).astype(np.uint8)
-    ref_b[..., 1] = np.clip((0.45 + 0.35 * xx) * 255.0, 0, 255).astype(
-        np.uint8
+    bowl_r = np.sqrt((xx - 0.28) ** 2 + (yy - 0.26) ** 2)
+    bowl_shell = np.clip(1.0 - np.abs(bowl_r - 0.34) * 18.0, 0.0, 1.0)
+    citrus_1 = np.exp(-(((xx - 0.20) ** 2 + (yy - 0.22) ** 2) / 0.018))
+    citrus_2 = np.exp(-(((xx - 0.38) ** 2 + (yy - 0.30) ** 2) / 0.016))
+    walnut_grain = 0.10 * np.sin(
+        42.0 * (yy + 0.18 * np.sin(7.0 * xx))
+    ) + 0.04 * np.cos(110.0 * yy)
+    ref_b_r = (
+        0.58
+        - 0.24 * yy
+        + walnut_grain
+        + 0.32 * bowl_shell
+        + 0.38 * (citrus_1 + citrus_2)
     )
-    ref_b[..., 2] = np.clip(
-        (0.35 + 0.35 * np.sin(4.0 * (xx + yy))) * 255.0, 0, 255
+    ref_b_g = (
+        0.38
+        + 0.22 * xx
+        + 0.65 * walnut_grain
+        + 0.32 * bowl_shell
+        + 0.24 * citrus_1
+        + 0.34 * citrus_2
+    )
+    ref_b_b = (
+        0.24
+        + 0.18 * np.sin(4.5 * (xx - yy))
+        + 0.30 * walnut_grain
+        + 0.34 * bowl_shell
+        - 0.18 * (citrus_1 + citrus_2)
+    )
+    ref_b = np.stack(
+        [
+            np.clip(ref_b_r * 255.0, 0, 255),
+            np.clip(ref_b_g * 255.0, 0, 255),
+            np.clip(ref_b_b * 255.0, 0, 255),
+        ],
+        axis=-1,
     ).astype(np.uint8)
     p_ref_b = dest_dir / "ref_style_b.png"
     Image.fromarray(ref_b, mode="RGB").save(p_ref_b)
 
     init_img = np.zeros((h, w, 3), dtype=np.uint8)
-    init_img[..., 0] = np.clip((0.48 + 0.25 * xx) * 255.0, 0, 255).astype(np.uint8)
-    init_img[..., 1] = np.clip((0.52 - 0.20 * yy) * 255.0, 0, 255).astype(np.uint8)
+    init_img[..., 0] = np.clip(
+        (0.48 + 0.25 * xx + 0.05 * np.cos(24.0 * xx)) * 255.0, 0, 255
+    ).astype(np.uint8)
+    init_img[..., 1] = np.clip(
+        (0.52 - 0.20 * yy + 0.05 * np.sin(24.0 * yy)) * 255.0, 0, 255
+    ).astype(np.uint8)
     init_img[..., 2] = np.clip((0.56 + 0.15 * (xx * yy)) * 255.0, 0, 255).astype(
         np.uint8
     )
@@ -520,7 +587,6 @@ def run_permutation_suite(
     staged = stage_test_input_files()
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     active_base = base_req if base_req is not None else build_default_request()
-
     w = width_override or active_base.width
     h = height_override or active_base.height
     eff_steps = (
@@ -759,7 +825,6 @@ def run_custom_sweep(engine: MOSSImageEngine, base_req: GenerationRequest) -> No
         if raw_cfgs
         else [2.5, 3.5]
     )
-
     SWEEPS_DIR.mkdir(parents=True, exist_ok=True)
     total = len(shifts) * len(cfgs)
     idx = 0
