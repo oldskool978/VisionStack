@@ -500,17 +500,18 @@ class WDDMMemoryGuard:
         adaptive_trim_bytes = (
             max(
                 _VRAM_TRIM_THRESHOLD_BYTES,
-                int(snap.dedicated_total_gb * 0.94 * (1024**3)),
+                int(snap.dedicated_total_gb * 0.96 * (1024**3)),
             )
             if snap.dedicated_total_gb > 0.0
             else _VRAM_TRIM_THRESHOLD_BYTES
         )
+        low_dedicated = snap.dedicated_avail_gb < 1.00
         needs_eviction = (
             force
             or snap.is_spilling
             or (snap.contiguous_avail_gb < required_headroom_gb)
-            or (split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
-            or (reserved_bytes > adaptive_trim_bytes)
+            or (low_dedicated and split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
+            or (low_dedicated and reserved_bytes > adaptive_trim_bytes)
         )
         if needs_eviction:
             gc.collect()
