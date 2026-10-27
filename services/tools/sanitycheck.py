@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# services/tools/sanitycheck.py
 from __future__ import annotations
 
 import asyncio
@@ -374,11 +375,11 @@ def gate_3_auth_session_and_preset_sync(client: _AsgiClient) -> str:
     return token
 
 
-def gate_4_bifurcated_vault_and_references(
+def gate_4_bifurcated_vault_projects_and_references(
     client: _AsgiClient, token: str
 ) -> None:
     print(
-        "\n--- Gate 4: Bifurcated Per-User Vault, Alpha/Header Inspection & Test Asset Staging ---"
+        "\n--- Gate 4: Bifurcated Vault, Alpha/Header Probe, Gallery Promotion & .VSPROJ Packages ---"
     )
     auth_hdr = {"Authorization": f"Bearer {token}"}
 
@@ -440,6 +441,114 @@ def gate_4_bifurcated_vault_and_references(
         f"Expected .vizj extension and probed 768x512 VAE dims: {v_info}",
     )
 
+    user_images_dir = router_mod.STORAGE_ROOT / "administrator" / "images"
+    user_images_dir.mkdir(parents=True, exist_ok=True)
+    fake_job_id = "vs_sanity_promo_test"
+    fake_master_png = user_images_dir / f"{fake_job_id}_master.png"
+    fake_master_png.write_bytes(buf.getvalue())
+
+    try:
+        pr_code, _, pr_raw = client.request(
+            "POST",
+            f"/api/v1/references/from-image/{fake_job_id}",
+            headers=auth_hdr,
+            json_body={"role": "photo_ref", "variant_index": 1},
+        )
+        _assert(pr_code == 200, f"Gallery image promotion failed: {pr_code} {pr_raw}")
+        pr_info = json.loads(pr_raw.decode("utf-8"))
+        _assert(
+            pr_info["ref_id"] == png_ref_id and pr_info.get("deduplicated") is True,
+            f"Expected SHA-256 deduplicated promotion to match {png_ref_id}, got {pr_info}",
+        )
+
+        proj_draft = {
+            "title": "Album Cover Master Project",
+            "model_variant": "sft",
+            "prompt": 'Dark vinyl album cover with title "NO SLEEP FOR THE WICKED"',
+            "prompt_mode": "layout_json",
+            "width": 1024,
+            "height": 1024,
+            "init_image_path": png_ref_id,
+            "reference_image_paths": [vizj_ref_id],
+            "layout_items": [
+                {
+                    "category": "subject",
+                    "caption": "Album hero portrait",
+                    "bbox": [128, 128, 896, 896],
+                    "image_path": png_ref_id,
+                    "isolate_box_attn": 0.85,
+                    "paste_to_canvas": True,
+                }
+            ],
+        }
+        ps_code, _, ps_raw = client.request(
+            "POST",
+            "/api/v1/projects/save",
+            headers=auth_hdr,
+            json_body={
+                "project_id": "album_cover_v1",
+                "title": "Album Cover Master Project",
+                "working_draft": proj_draft,
+                "active_image_id": fake_job_id,
+                "inpaint_canvas_data_url": b64_png,
+            },
+        )
+        _assert(ps_code == 200, f"Project save failed: {ps_code} {ps_raw}")
+        saved_proj = json.loads(ps_raw.decode("utf-8"))["project"]
+        proj_id = saved_proj["project_id"]
+        _assert(
+            proj_id == "album_cover_v1" and saved_proj["asset_count"] == 2,
+            f"Unexpected saved project metadata: {saved_proj}",
+        )
+
+        dl_code, _, dl_bytes = client.request(
+            "GET", f"/api/v1/projects/{proj_id}/download", headers=auth_hdr
+        )
+        _assert(
+            dl_code == 200 and len(dl_bytes) > 256,
+            f"Project .vsproj download failed: {dl_code}",
+        )
+
+        client.request(
+            "DELETE", f"/api/v1/references/{png_ref_id}", headers=auth_hdr
+        )
+        client.request(
+            "DELETE", f"/api/v1/references/{vizj_ref_id}", headers=auth_hdr
+        )
+        _assert(
+            not (router_mod.STORAGE_ROOT / "administrator" / "uploads" / png_ref_id).exists(),
+            "Deleted reference asset still exists on disk",
+        )
+
+        ld_code, _, ld_raw = client.request(
+            "POST", f"/api/v1/projects/{proj_id}/load", headers=auth_hdr
+        )
+        _assert(ld_code == 200, f"Project load failed: {ld_code} {ld_raw}")
+        ld_data = json.loads(ld_raw.decode("utf-8"))
+        _assert(
+            png_ref_id in ld_data["restored_assets"]
+            and vizj_ref_id in ld_data["restored_assets"]
+            and ld_data["working_draft"]["init_image_path"] == png_ref_id
+            and ld_data["inpaint_canvas_data_url"] is not None,
+            f"Project load failed to self-heal and restore bundled assets: {ld_data}",
+        )
+
+        b64_vsproj = base64.b64encode(dl_bytes).decode("ascii")
+        im_code, _, im_raw = client.request(
+            "POST",
+            "/api/v1/projects/import",
+            headers=auth_hdr,
+            json_body={"filename": "album_cover_v1.vsproj", "data_url": b64_vsproj},
+        )
+        _assert(im_code == 200, f"Project import failed: {im_code} {im_raw}")
+
+        del_p_code, _, _ = client.request(
+            "DELETE", f"/api/v1/projects/{proj_id}", headers=auth_hdr
+        )
+        _assert(del_p_code == 200, f"Project delete failed: {del_p_code}")
+    finally:
+        fake_master_png.unlink(missing_ok=True)
+
     st_code, _, st_raw = client.request(
         "POST", "/api/v1/references/stage-defaults", headers=auth_hdr
     )
@@ -490,7 +599,7 @@ def gate_4_bifurcated_vault_and_references(
         _assert(d_code == 200, f"Failed deleting reference {rid}: {d_code}")
 
     print(
-        "  [+] Per-User Reference Vault      : RGBA Alpha Detection + .VIZJ Header Probe + Default Asset Staging + Cross-User Isolation Verified"
+        "  [+] Per-User Vault & .VSPROJ      : RGBA Alpha + .VIZJ Probe + Gallery Promo + Hermetic .VSPROJ Save/Load/Import Verified"
     )
 
 
@@ -563,7 +672,7 @@ def main() -> None:
     gate_1_multi_prefix_and_security_headers(client)
     gate_2_pow_bot_defense(client)
     token = gate_3_auth_session_and_preset_sync(client)
-    gate_4_bifurcated_vault_and_references(client, token)
+    gate_4_bifurcated_vault_projects_and_references(client, token)
     gate_5_queue_etag_and_spa_guard(client, token)
     if getattr(compute_queue.pipeline, "_memory_guard", None) is not None:
         try:

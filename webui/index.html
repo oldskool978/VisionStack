@@ -15,6 +15,18 @@
         <div class="brand-meta" id="hwStatusLine">Probing Sovereign Compute Daemon...</div>
       </div>
     </div>
+
+    <div class="project-toolbar">
+      <span class="project-status-badge" id="activeProjectBadge" title="Active Studio Project Package">Project: Unsaved Draft</span>
+      <button id="newProjectBtn" class="btn btn-secondary compact-btn" title="Reset workspace to a clean project draft">New</button>
+      <button id="saveProjectBtn" class="btn btn-secondary compact-btn" title="Save project state, layout boxes, mask canvas, and bound assets to your server vault">Save Project</button>
+      <button id="exportProjectBtn" class="btn btn-secondary compact-btn" title="Save and download a self-contained .vsproj archive to disk">Export .VSPROJ</button>
+      <label class="btn btn-secondary compact-btn upload-label" title="Import a portable .vsproj project package from disk">
+        Import .VSPROJ
+        <input id="importProjectInput" type="file" accept=".vsproj,.zip" hidden />
+      </label>
+    </div>
+
     <div class="telemetry-pills">
       <div class="pill" id="vramPill" title="WDDM Dedicated VRAM, Contiguous Pool &amp; Shared Spill Telemetry">
         <span class="pill-label">VRAM</span>
@@ -47,7 +59,7 @@
 
       <div class="deck-scroll">
         <div class="field-group">
-          <label class="field-label" for="titleInput">Master Title</label>
+          <label class="field-label" for="titleInput">Master Project / Artwork Title</label>
           <input id="titleInput" type="text" class="input-text" value="Untitled Vision Master" maxlength="120" />
         </div>
 
@@ -411,6 +423,8 @@
         </div>
         <div class="stage-actions">
           <span class="stage-aspect-badge" id="stageAspectBadge">1024x1024 (1:1)</span>
+          <button id="promoteViewportInitBtn" class="btn btn-secondary compact-btn" title="Stage current master output to Vault and bind as Init Image" hidden>Use as Init</button>
+          <button id="promoteViewportRefBtn" class="btn btn-secondary compact-btn" title="Stage current master output to Vault and bind as 4D Reference" hidden>Use as 4D Ref</button>
           <a id="downloadPngBtn" class="btn btn-secondary compact-btn" download hidden>Download PNG</a>
           <a id="downloadVizjBtn" class="btn btn-secondary compact-btn" download hidden>Download .VIZJ</a>
         </div>
@@ -530,14 +544,20 @@
       </div>
     </section>
 
-    <section class="panel vault-panel">
-      <div class="panel-header">
+    <section class="panel vault-panel" data-vault-mode="split">
+      <div class="panel-header vault-header">
         <h2>User Vault &amp; Gallery</h2>
+        <div class="vault-filter-tabs">
+          <button type="button" class="vault-tab-btn active" data-vault-view="split" title="Split view across Assets, Projects, and Gallery">Split</button>
+          <button type="button" class="vault-tab-btn" data-vault-view="assets" title="Full-height Reference Conditioning Assets">Assets</button>
+          <button type="button" class="vault-tab-btn" data-vault-view="projects" title="Full-height Saved Studio Projects (.vsproj)">Projects</button>
+          <button type="button" class="vault-tab-btn" data-vault-view="gallery" title="Full-height Synthesized Master Gallery">Gallery</button>
+        </div>
       </div>
 
-      <div class="vault-section">
+      <div id="vaultAssetsSection" class="vault-section assets-section">
         <div class="vault-subheader">
-          <h3>Reference Conditioning Assets</h3>
+          <h3>Reference Assets <span class="badge" id="assetCountBadge">0</span></h3>
           <div class="vault-actions-group">
             <button id="stageDefaultRefsBtn" class="btn btn-secondary compact-btn" title="Stage deterministic test reference, init, mask &amp; control assets">Stage Test Set</button>
             <label class="btn btn-secondary compact-btn upload-label">
@@ -551,7 +571,19 @@
         </div>
       </div>
 
-      <div class="vault-section gallery-section">
+      <div id="vaultProjectsSection" class="vault-section projects-section">
+        <div class="vault-subheader">
+          <h3>Saved Projects (.VSPROJ) <span class="badge" id="projectCountBadge">0</span></h3>
+          <div class="vault-actions-group">
+            <button id="vaultSaveProjectBtn" class="btn btn-secondary compact-btn" title="Save current studio state to project vault">+ Save Current</button>
+          </div>
+        </div>
+        <div id="projectList" class="project-list">
+          <div class="muted-note">Save a project to bundle your layout boxes, prompt, mask canvas, and reference assets.</div>
+        </div>
+      </div>
+
+      <div id="vaultGallerySection" class="vault-section gallery-section">
         <div class="vault-subheader">
           <h3>Synthesized Master Gallery</h3>
           <span class="badge" id="galleryCountBadge">0 items</span>
@@ -566,7 +598,7 @@
   <div id="loginModal" class="modal-backdrop" hidden>
     <div class="modal-card">
       <h3>Creator Studio Authentication</h3>
-      <p class="modal-sub">Enter your registered VisionStack creator handle (e.g., <code>administrator</code> or <code>studio</code>) to unlock your isolated reference vault and gallery.</p>
+      <p class="modal-sub">Enter your registered VisionStack creator handle (e.g., <code>administrator</code> or <code>studio</code>) to unlock your isolated reference vault, projects, and gallery.</p>
       <div class="field-group">
         <label class="field-label" for="loginUsernameInput">Creator Handle</label>
         <input id="loginUsernameInput" type="text" class="input-text" value="administrator" placeholder="administrator" />

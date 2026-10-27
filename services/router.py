@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# services/router.py
 from __future__ import annotations
 
 import os
@@ -28,6 +29,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
+import zipfile
 
 import numpy as np
 from PIL import Image
@@ -44,6 +46,7 @@ mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("image/png", ".png")
 mimetypes.add_type("image/webp", ".webp")
 mimetypes.add_type("application/octet-stream", ".vizj")
+mimetypes.add_type("application/octet-stream", ".vsproj")
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 
@@ -299,6 +302,13 @@ def _inspect_reference_file(file_path: Path, user_slug: str) -> Dict[str, Any]:
     }
 
 
+def _decode_data_url_bytes(raw_data: str) -> bytes:
+    clean = raw_data.strip()
+    if "," in clean and clean.startswith("data:"):
+        clean = clean.split(",", 1)[1]
+    return base64.b64decode(clean)
+
+
 def get_user_registry_candidates() -> List[Path]:
     if _CLI_CONFIG_FILE and _CLI_CONFIG_FILE.exists():
         return [_CLI_CONFIG_FILE.resolve()]
@@ -474,6 +484,26 @@ class AuthPayload(BaseModel):
 class ReferenceUploadPayload(BaseModel):
     filename: str = Field(default="reference.png", max_length=160)
     role: str = Field(default="photo_ref", max_length=40)
+    data_url: str = Field(..., min_length=16)
+
+
+class PromoteImagePayload(BaseModel):
+    role: str = Field(default="photo_ref", max_length=40)
+    variant_index: int = Field(default=1, ge=1, le=8)
+
+
+class ProjectSavePayload(BaseModel):
+    project_id: Optional[str] = Field(default=None, max_length=80)
+    title: str = Field(default="Untitled Studio Project", max_length=120)
+    working_draft: Dict[str, Any] = Field(default_factory=dict)
+    telemetry: Optional[Dict[str, Any]] = Field(default=None)
+    active_image_id: Optional[str] = Field(default=None, max_length=80)
+    inpaint_canvas_data_url: Optional[str] = Field(default=None)
+    include_all_vault_refs: bool = Field(default=False)
+
+
+class ProjectImportPayload(BaseModel):
+    filename: str = Field(default="project.vsproj", max_length=160)
     data_url: str = Field(..., min_length=16)
 
 
@@ -669,6 +699,347 @@ def _resolve_user_upload_path(
             if resolved.is_relative_to(allowed_root):
                 return str(resolved)
     return None
+
+
+def _collect_draft_asset_names(working_draft: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    seen = set()
+
+    def _add(raw_val: Any) -> None:
+        if isinstance(raw_val, str) and raw_val.strip():
+            name = Path(raw_val.strip()).name
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+
+    for key in ("init_image_path", "inpaint_mask_path", "control_image_path"):
+        _add(working_draft.get(key))
+
+    for r_item in working_draft.get("reference_image_paths") or []:
+        _add(r_item)
+
+    for box in working_draft.get("layout_items") or []:
+        if isinstance(box, dict):
+            _add(box.get("image_path") or box.get("image") or box.get("vizj_path"))
+
+    return names
+
+
+def _build_vsproj_package(
+    user_slug: str,
+    payload: ProjectSavePayload,
+    project_id: str,
+) -> Tuple[bytes, Dict[str, Any], Optional[bytes]]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    draft = dict(payload.working_draft or {})
+    title = (
+        payload.title.strip()
+        or str(draft.get("title") or "").strip()
+        or "Untitled Studio Project"
+    )
+    draft["title"] = title
+
+    uploads_dir = (STORAGE_ROOT / user_slug / "uploads").resolve()
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    ref_names = _collect_draft_asset_names(draft)
+    if payload.include_all_vault_refs and uploads_dir.is_dir():
+        for f in sorted(uploads_dir.iterdir()):
+            if (
+                f.is_file()
+                and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".vizj")
+                and f.name not in ref_names
+            ):
+                ref_names.append(f.name)
+
+    asset_manifest: List[Dict[str, Any]] = []
+    bundled_files: List[Tuple[str, bytes]] = []
+
+    for name in ref_names:
+        resolved_str = _resolve_user_upload_path(user_slug, name)
+        if not resolved_str:
+            continue
+        src_p = Path(resolved_str)
+        if not src_p.is_file():
+            continue
+        raw_bytes = src_p.read_bytes()
+        sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+        meta = _inspect_reference_file(src_p, user_slug)
+        asset_manifest.append(
+            {
+                "ref_id": src_p.name,
+                "sha256": sha256_hex,
+                "size_bytes": len(raw_bytes),
+                "width": meta["width"],
+                "height": meta["height"],
+                "has_alpha": meta["has_alpha"],
+                "is_vizj": meta["is_vizj"],
+            }
+        )
+        bundled_files.append((src_p.name, raw_bytes))
+
+    inpaint_canvas_bytes: Optional[bytes] = None
+    if payload.inpaint_canvas_data_url and payload.inpaint_canvas_data_url.strip():
+        try:
+            inpaint_canvas_bytes = _decode_data_url_bytes(
+                payload.inpaint_canvas_data_url
+            )
+        except Exception:
+            inpaint_canvas_bytes = None
+
+    preview_bytes: Optional[bytes] = None
+    active_img_id = payload.active_image_id or draft.get("active_image_id")
+    if isinstance(active_img_id, str) and active_img_id.strip():
+        clean_id = Path(active_img_id.strip()).name
+        cand_user_img = STORAGE_ROOT / user_slug / "images" / f"{clean_id}_master.png"
+        cand_art_img = ARTIFACTS_DIR / f"{clean_id}.png"
+        if cand_user_img.is_file():
+            preview_bytes = cand_user_img.read_bytes()
+        elif cand_art_img.is_file():
+            preview_bytes = cand_art_img.read_bytes()
+
+    manifest_data: Dict[str, Any] = {
+        "package_format": "VISIONSTACK_PROJECT_V2",
+        "project_id": project_id,
+        "title": title,
+        "user_slug": user_slug,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "width": int(draft.get("width") or 1024),
+        "height": int(draft.get("height") or 1024),
+        "model_variant": str(draft.get("model_variant") or "sft"),
+        "prompt_mode": str(draft.get("prompt_mode") or "natural"),
+        "active_image_id": active_img_id,
+        "asset_count": len(asset_manifest),
+        "assets": asset_manifest,
+        "has_inpaint_canvas": inpaint_canvas_bytes is not None,
+        "has_master_preview": preview_bytes is not None,
+        "working_draft": draft,
+        "telemetry": payload.telemetry,
+    }
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(
+        zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as zf:
+        zf.writestr(
+            "project_manifest.json",
+            json.dumps(manifest_data, indent=2, ensure_ascii=False),
+        )
+        for arc_name, data_b in bundled_files:
+            zf.writestr(f"assets/{arc_name}", data_b)
+        if inpaint_canvas_bytes is not None:
+            zf.writestr("workspace/inpaint_canvas.png", inpaint_canvas_bytes)
+        if preview_bytes is not None:
+            zf.writestr("workspace/master_preview.png", preview_bytes)
+
+    return zip_buf.getvalue(), manifest_data, preview_bytes
+
+
+def _extract_and_restore_vsproj(
+    user_slug: str,
+    raw_zip_bytes: bytes,
+    persist_to_projects_vault: bool = True,
+) -> Dict[str, Any]:
+    if len(raw_zip_bytes) > 250 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Project archive exceeds 250 MB limit.",
+        )
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw_zip_bytes), mode="r")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid or corrupted .vsproj archive: {e}",
+        )
+
+    with zf:
+        names = set(zf.namelist())
+        if "project_manifest.json" not in names:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing project_manifest.json in .vsproj archive.",
+            )
+        try:
+            manifest = json.loads(
+                zf.read("project_manifest.json").decode("utf-8")
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Malformed project_manifest.json: {e}",
+            )
+
+        uploads_dir = (STORAGE_ROOT / user_slug / "uploads").resolve()
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_sha_map: Dict[str, str] = {}
+        for f in uploads_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in (
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+                ".vizj",
+            ):
+                try:
+                    existing_sha_map[
+                        hashlib.sha256(f.read_bytes()).hexdigest()
+                    ] = f.name
+                except Exception:
+                    pass
+
+        id_remap: Dict[str, str] = {}
+        restored_assets: List[str] = []
+
+        for member in zf.namelist():
+            if not member.startswith("assets/") or member.endswith("/"):
+                continue
+            safe_name = Path(member).name
+            if not safe_name or safe_name.startswith("."):
+                continue
+            ext = Path(safe_name).suffix.lower()
+            if ext not in (".png", ".jpg", ".jpeg", ".webp", ".vizj"):
+                continue
+
+            asset_bytes = zf.read(member)
+            if len(asset_bytes) > 40 * 1024 * 1024:
+                continue
+            asset_sha = hashlib.sha256(asset_bytes).hexdigest()
+
+            cand_dest = (uploads_dir / safe_name).resolve()
+            if not cand_dest.is_relative_to(uploads_dir):
+                continue
+
+            if cand_dest.is_file():
+                cur_sha = hashlib.sha256(cand_dest.read_bytes()).hexdigest()
+                if cur_sha == asset_sha:
+                    id_remap[safe_name] = safe_name
+                    restored_assets.append(safe_name)
+                    continue
+                if asset_sha in existing_sha_map:
+                    mapped_name = existing_sha_map[asset_sha]
+                    id_remap[safe_name] = mapped_name
+                    restored_assets.append(mapped_name)
+                    continue
+                new_name = f"ref_{int(time.time() * 1000)}_{asset_sha[:6]}{ext}"
+                new_dest = uploads_dir / new_name
+                new_dest.write_bytes(asset_bytes)
+                existing_sha_map[asset_sha] = new_name
+                id_remap[safe_name] = new_name
+                restored_assets.append(new_name)
+            else:
+                cand_dest.write_bytes(asset_bytes)
+                existing_sha_map[asset_sha] = safe_name
+                id_remap[safe_name] = safe_name
+                restored_assets.append(safe_name)
+
+        draft = dict(manifest.get("working_draft") or {})
+        for single_key in (
+            "init_image_path",
+            "inpaint_mask_path",
+            "control_image_path",
+        ):
+            val = draft.get(single_key)
+            if isinstance(val, str) and val.strip():
+                b_name = Path(val.strip()).name
+                draft[single_key] = id_remap.get(b_name, b_name)
+
+        raw_refs = draft.get("reference_image_paths") or []
+        if isinstance(raw_refs, list):
+            draft["reference_image_paths"] = [
+                id_remap.get(Path(str(r)).name, Path(str(r)).name)
+                for r in raw_refs
+                if isinstance(r, str) and str(r).strip()
+            ]
+
+        raw_boxes = draft.get("layout_items") or []
+        if isinstance(raw_boxes, list):
+            updated_boxes: List[Dict[str, Any]] = []
+            for box in raw_boxes:
+                if not isinstance(box, dict):
+                    continue
+                b_copy = dict(box)
+                b_img = (
+                    b_copy.get("image_path")
+                    or b_copy.get("image")
+                    or b_copy.get("vizj_path")
+                )
+                if isinstance(b_img, str) and b_img.strip():
+                    b_name = Path(b_img.strip()).name
+                    b_copy["image_path"] = id_remap.get(b_name, b_name)
+                updated_boxes.append(b_copy)
+            draft["layout_items"] = updated_boxes
+
+        manifest["working_draft"] = draft
+
+        inpaint_data_url: Optional[str] = None
+        if "workspace/inpaint_canvas.png" in names:
+            ic_bytes = zf.read("workspace/inpaint_canvas.png")
+            inpaint_data_url = "data:image/png;base64," + base64.b64encode(
+                ic_bytes
+            ).decode("ascii")
+
+        preview_bytes: Optional[bytes] = None
+        if "workspace/master_preview.png" in names:
+            preview_bytes = zf.read("workspace/master_preview.png")
+
+    raw_proj_id = str(manifest.get("project_id") or "").strip()
+    proj_id = (
+        slugify(raw_proj_id)
+        if raw_proj_id
+        else f"proj_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    )
+    manifest["project_id"] = proj_id
+    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    projects_dir = (STORAGE_ROOT / user_slug / "projects").resolve()
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    preview_url: Optional[str] = None
+
+    if preview_bytes is not None:
+        prev_file = projects_dir / f"{proj_id}_preview.png"
+        prev_file.write_bytes(preview_bytes)
+        preview_url = (
+            f"api/v1/projects/stream/{user_slug}/{proj_id}_preview.png"
+        )
+
+    if persist_to_projects_vault:
+        vsproj_file = projects_dir / f"{proj_id}.vsproj"
+        vsproj_file.write_bytes(raw_zip_bytes)
+        summary_meta = {
+            "project_id": proj_id,
+            "title": manifest.get("title", "Untitled Studio Project"),
+            "created_at": manifest.get("created_at", manifest["updated_at"]),
+            "updated_at": manifest["updated_at"],
+            "width": manifest.get("width", 1024),
+            "height": manifest.get("height", 1024),
+            "model_variant": manifest.get("model_variant", "sft"),
+            "prompt_mode": manifest.get("prompt_mode", "natural"),
+            "asset_count": len(restored_assets),
+            "size_bytes": len(raw_zip_bytes),
+            "preview_url": preview_url,
+            "download_url": f"api/v1/projects/{proj_id}/download",
+        }
+        (projects_dir / f"{proj_id}.json").write_text(
+            json.dumps(summary_meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    return {
+        "status": "loaded",
+        "project_id": proj_id,
+        "title": manifest.get("title", "Untitled Studio Project"),
+        "working_draft": draft,
+        "telemetry": manifest.get("telemetry"),
+        "restored_assets": restored_assets,
+        "id_remap": id_remap,
+        "inpaint_canvas_data_url": inpaint_data_url,
+        "preview_url": preview_url,
+        "download_url": f"api/v1/projects/{proj_id}/download",
+    }
 
 
 class EnginePipeline:
@@ -939,10 +1310,14 @@ class EnginePipeline:
                     "framing_mode": resp.framing_mode_used,
                     "input_role": resp.input_role_used,
                     "mask_blend_mode": getattr(
-                        resp, "mask_blend_mode_used", str(gen_req.mask_blend_mode or "auto")
+                        resp,
+                        "mask_blend_mode_used",
+                        str(gen_req.mask_blend_mode or "auto"),
                     ),
                     "invert_inpaint_mask": getattr(
-                        resp, "invert_inpaint_mask_used", bool(gen_req.invert_inpaint_mask)
+                        resp,
+                        "invert_inpaint_mask_used",
+                        bool(gen_req.invert_inpaint_mask),
                     ),
                     "reference_zero_timestep": resp.reference_zero_timestep_used,
                     "reference_isolated_kv": resp.reference_isolated_kv_used,
@@ -1392,6 +1767,7 @@ async def login(payload: AuthPayload):
     user_dir = STORAGE_ROOT / raw_slug
     (user_dir / "images").mkdir(parents=True, exist_ok=True)
     (user_dir / "uploads").mkdir(parents=True, exist_ok=True)
+    (user_dir / "projects").mkdir(parents=True, exist_ok=True)
     history_file = user_dir / "history.json"
 
     images: List[Dict[str, Any]] = []
@@ -1526,11 +1902,8 @@ async def upload_reference_asset(
     token = authorization.replace("Bearer ", "").strip() if authorization else None
     slug = verify_session_token(token)
 
-    raw_data = payload.data_url.strip()
-    if "," in raw_data and raw_data.startswith("data:"):
-        raw_data = raw_data.split(",", 1)[1]
     try:
-        binary = base64.b64decode(raw_data)
+        binary = _decode_data_url_bytes(payload.data_url)
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1569,6 +1942,71 @@ async def upload_reference_asset(
     meta = _inspect_reference_file(dest_file, slug)
     meta["filename"] = payload.filename
     meta["role"] = payload.role
+    return meta
+
+
+@api_router.post("/references/from-image/{image_id}")
+async def promote_gallery_image_to_reference(
+    image_id: str,
+    payload: Optional[PromoteImagePayload] = None,
+    authorization: Optional[str] = Header(None),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else None
+    slug = verify_session_token(token)
+    clean_id = Path(image_id).name
+    var_idx = int(payload.variant_index) if payload is not None else 1
+    role = str(payload.role) if payload is not None else "photo_ref"
+
+    user_images_dir = (STORAGE_ROOT / slug / "images").resolve()
+    if var_idx <= 1:
+        candidates = [
+            user_images_dir / f"{clean_id}_master.png",
+            user_images_dir / f"{clean_id}.png",
+            ARTIFACTS_DIR / f"{clean_id}.png",
+        ]
+    else:
+        candidates = [
+            user_images_dir / f"{clean_id}_master_{var_idx}.png",
+            ARTIFACTS_DIR / f"{clean_id}_{var_idx}.png",
+        ]
+
+    src_file: Optional[Path] = None
+    for c in candidates:
+        if c.is_file():
+            src_file = c
+            break
+
+    if src_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Gallery image '{clean_id}' not found for vault promotion.",
+        )
+
+    raw_bytes = src_file.read_bytes()
+    target_sha = hashlib.sha256(raw_bytes).hexdigest()
+    uploads_dir = (STORAGE_ROOT / slug / "uploads").resolve()
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    for existing_f in uploads_dir.iterdir():
+        if existing_f.is_file() and existing_f.suffix.lower() == ".png":
+            try:
+                if (
+                    hashlib.sha256(existing_f.read_bytes()).hexdigest()
+                    == target_sha
+                ):
+                    meta = _inspect_reference_file(existing_f, slug)
+                    meta["role"] = role
+                    meta["deduplicated"] = True
+                    return meta
+            except Exception:
+                pass
+
+    dest_name = f"ref_{clean_id}_{target_sha[:6]}.png"
+    dest_file = uploads_dir / dest_name
+    dest_file.write_bytes(raw_bytes)
+    meta = _inspect_reference_file(dest_file, slug)
+    meta["role"] = role
+    meta["deduplicated"] = False
     return meta
 
 
@@ -1666,6 +2104,223 @@ async def delete_reference_asset(
     ):
         target.unlink(missing_ok=True)
     return {"status": "deleted", "ref_id": safe_name}
+
+
+@api_router.post("/projects/save")
+async def save_studio_project(
+    payload: ProjectSavePayload,
+    authorization: Optional[str] = Header(None),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else None
+    slug = verify_session_token(token)
+
+    raw_id = (payload.project_id or "").strip()
+    proj_id = (
+        slugify(raw_id)
+        if raw_id
+        else f"proj_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    )
+
+    projects_dir = (STORAGE_ROOT / slug / "projects").resolve()
+    projects_dir.mkdir(parents=True, exist_ok=True)
+
+    zip_bytes, manifest_data, preview_bytes = _build_vsproj_package(
+        slug, payload, proj_id
+    )
+    vsproj_path = projects_dir / f"{proj_id}.vsproj"
+    vsproj_path.write_bytes(zip_bytes)
+
+    preview_url: Optional[str] = None
+    if preview_bytes is not None:
+        prev_file = projects_dir / f"{proj_id}_preview.png"
+        prev_file.write_bytes(preview_bytes)
+        preview_url = f"api/v1/projects/stream/{slug}/{proj_id}_preview.png"
+
+    summary = {
+        "project_id": proj_id,
+        "title": manifest_data["title"],
+        "created_at": manifest_data["created_at"],
+        "updated_at": manifest_data["updated_at"],
+        "width": manifest_data["width"],
+        "height": manifest_data["height"],
+        "model_variant": manifest_data["model_variant"],
+        "prompt_mode": manifest_data["prompt_mode"],
+        "asset_count": manifest_data["asset_count"],
+        "size_bytes": len(zip_bytes),
+        "preview_url": preview_url,
+        "download_url": f"api/v1/projects/{proj_id}/download",
+    }
+    meta_file = projects_dir / f"{proj_id}.json"
+    meta_file.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return {"status": "saved", "project": summary}
+
+
+@api_router.get("/projects")
+async def list_studio_projects(authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "").strip() if authorization else None
+    slug = verify_session_token(token)
+    projects_dir = (STORAGE_ROOT / slug / "projects").resolve()
+    if not projects_dir.is_dir():
+        return {"projects": []}
+
+    items: List[Dict[str, Any]] = []
+    for vs_file in sorted(
+        projects_dir.glob("*.vsproj"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        proj_id = vs_file.stem
+        meta_file = projects_dir / f"{proj_id}.json"
+        if meta_file.is_file():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                meta["size_bytes"] = vs_file.stat().st_size
+                meta.setdefault(
+                    "download_url", f"api/v1/projects/{proj_id}/download"
+                )
+                items.append(meta)
+                continue
+            except Exception:
+                pass
+        st = vs_file.stat()
+        items.append(
+            {
+                "project_id": proj_id,
+                "title": proj_id,
+                "created_at": datetime.fromtimestamp(
+                    st.st_mtime, tz=timezone.utc
+                ).isoformat(),
+                "updated_at": datetime.fromtimestamp(
+                    st.st_mtime, tz=timezone.utc
+                ).isoformat(),
+                "width": 1024,
+                "height": 1024,
+                "model_variant": "sft",
+                "prompt_mode": "natural",
+                "asset_count": 0,
+                "size_bytes": st.st_size,
+                "preview_url": None,
+                "download_url": f"api/v1/projects/{proj_id}/download",
+            }
+        )
+    return {"projects": items}
+
+
+@api_router.post("/projects/{project_id}/load")
+async def load_studio_project(
+    project_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else None
+    slug = verify_session_token(token)
+    safe_id = slugify(Path(project_id).stem)
+    projects_dir = (STORAGE_ROOT / slug / "projects").resolve()
+    vsproj_file = (projects_dir / f"{safe_id}.vsproj").resolve()
+
+    if not vsproj_file.is_file() or not vsproj_file.is_relative_to(projects_dir):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{safe_id}' not found in user vault.",
+        )
+
+    return _extract_and_restore_vsproj(
+        slug,
+        vsproj_file.read_bytes(),
+        persist_to_projects_vault=False,
+    )
+
+
+@api_router.post("/projects/import")
+async def import_studio_project(
+    payload: ProjectImportPayload,
+    authorization: Optional[str] = Header(None),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else None
+    slug = verify_session_token(token)
+    try:
+        raw_zip = _decode_data_url_bytes(payload.data_url)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid base64 .vsproj payload.",
+        )
+    return _extract_and_restore_vsproj(
+        slug, raw_zip, persist_to_projects_vault=True
+    )
+
+
+@api_router.get("/projects/{project_id}/download")
+async def download_studio_project(
+    project_id: str,
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = None,
+):
+    auth_token = token or (
+        authorization.replace("Bearer ", "").strip() if authorization else None
+    )
+    slug = verify_session_token(auth_token)
+    safe_id = slugify(Path(project_id).stem)
+    projects_dir = (STORAGE_ROOT / slug / "projects").resolve()
+    vsproj_file = (projects_dir / f"{safe_id}.vsproj").resolve()
+
+    if not vsproj_file.is_file() or not vsproj_file.is_relative_to(projects_dir):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{safe_id}' not found.",
+        )
+
+    return FileResponse(
+        str(vsproj_file),
+        media_type="application/octet-stream",
+        filename=f"{safe_id}.vsproj",
+        headers={
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+@api_router.get("/projects/stream/{user_slug}/{filename}")
+async def stream_project_preview(user_slug: str, filename: str):
+    safe_slug = slugify(user_slug)
+    safe_name = Path(filename).name
+    projects_dir = (STORAGE_ROOT / safe_slug / "projects").resolve()
+    target = (projects_dir / safe_name).resolve()
+    if not target.is_file() or not target.is_relative_to(projects_dir):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project preview not found.",
+        )
+    return FileResponse(
+        str(target),
+        media_type="image/png",
+        headers={
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
+@api_router.delete("/projects/{project_id}")
+async def delete_studio_project(
+    project_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else None
+    slug = verify_session_token(token)
+    safe_id = slugify(Path(project_id).stem)
+    projects_dir = (STORAGE_ROOT / slug / "projects").resolve()
+    for suffix in (
+        f"{safe_id}.vsproj",
+        f"{safe_id}.json",
+        f"{safe_id}_preview.png",
+    ):
+        cand = (projects_dir / suffix).resolve()
+        if cand.is_file() and cand.is_relative_to(projects_dir):
+            cand.unlink(missing_ok=True)
+    return {"status": "deleted", "project_id": safe_id}
 
 
 @api_router.post("/synthesize")
@@ -1951,6 +2606,7 @@ def mount_static_and_spa() -> None:
             or path_lower.startswith("jobs/")
             or path_lower.startswith("images/")
             or path_lower.startswith("references")
+            or path_lower.startswith("projects")
             or path_lower.startswith("presets/")
             or path_lower.startswith("health")
             or path_lower.startswith("themes/")

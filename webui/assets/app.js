@@ -2,6 +2,9 @@
 (() => {
   "use strict";
 
+  const DEFAULT_PROMPT_TEXT =
+    'A wide view of a sleek brushed-steel refrigerator beside a warm walnut kitchen counter with a ceramic bowl of fresh citrus fruit. A small yellow sticky note on the refrigerator door is handwritten in crisp black marker: "Remember to test SFT & Base permutations @ 1024x1024"';
+
   const DEFAULT_LAYOUT_ITEMS = [
     {
       category: "refrigerator",
@@ -51,6 +54,7 @@
     engineDefaults: {},
     layoutItems: JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS)),
     references: [],
+    projects: [],
     gallery: [],
     bindings: {
       init_image_path: null,
@@ -58,6 +62,11 @@
       control_image_path: null,
       reference_image_paths: []
     },
+    activeProjectId: null,
+    activeProjectTitle: null,
+    activeImageId: null,
+    activeVariantIndex: 1,
+    lastTelemetry: null,
     activeJobId: null,
     activeEventSource: null,
     brushMode: "paint",
@@ -113,6 +122,17 @@
       x = t;
     }
     return x || 1;
+  }
+
+  function updateProjectBadge() {
+    const badge = el("activeProjectBadge");
+    if (!badge) return;
+    if (state.activeProjectId) {
+      const label = state.activeProjectTitle || state.activeProjectId;
+      badge.textContent = `Project: ${label}`;
+    } else {
+      badge.textContent = "Project: Unsaved Draft";
+    }
   }
 
   function computeStageGeometry() {
@@ -447,7 +467,7 @@
       }
       state.gallery = Array.isArray(data.images) ? data.images : [];
       renderGallery();
-      await refreshReferences();
+      await Promise.all([refreshReferences(), refreshProjects()]);
       hideLoginModal();
     } catch (err) {
       const msgBox = el("loginErrorMsg");
@@ -523,8 +543,20 @@
     } catch (_) {}
   }
 
+  async function refreshProjects() {
+    if (!state.token) return;
+    try {
+      const data = await apiFetch("api/v1/projects");
+      state.projects = (data && Array.isArray(data.projects)) ? data.projects : [];
+      renderProjectVault();
+    } catch (_) {}
+  }
+
   function renderReferenceVault() {
     const container = el("referenceList");
+    const badge = el("assetCountBadge");
+    if (badge) badge.textContent = String(state.references.length);
+
     if (!state.references.length) {
       container.innerHTML = `<div class="muted-note">No reference assets staged in your user vault.</div>`;
       return;
@@ -609,6 +641,263 @@
         renderSpatialLayoutEditor();
       });
     });
+  }
+
+  function renderProjectVault() {
+    const container = el("projectList");
+    const badge = el("projectCountBadge");
+    if (badge) badge.textContent = String(state.projects.length);
+    if (!container) return;
+
+    if (!state.projects.length) {
+      container.innerHTML = `<div class="muted-note">Save a project to bundle your layout boxes, prompt, mask canvas, and reference assets.</div>`;
+      return;
+    }
+
+    container.innerHTML = "";
+    for (const proj of state.projects) {
+      const card = document.createElement("div");
+      const isCurrent = state.activeProjectId === proj.project_id;
+      card.className = `project-card ${isCurrent ? "active-project" : ""}`;
+      const sizeKb = ((proj.size_bytes || 0) / 1024).toFixed(1);
+      const dims = `${proj.width || 1024}x${proj.height || 1024}`;
+      const dlHref = `api/v1/projects/${encodeURIComponent(proj.project_id)}/download?token=${encodeURIComponent(state.token)}`;
+
+      card.innerHTML = `
+        <div class="project-card-top">
+          <span class="project-title-text" title="${proj.title || proj.project_id}">${proj.title || proj.project_id}</span>
+          <button class="btn-link" data-del-proj="${proj.project_id}">Delete</button>
+        </div>
+        <div class="ref-meta-badges">
+          <span class="meta-tag">${(proj.model_variant || "sft").toUpperCase()}</span>
+          <span class="meta-tag">${dims}</span>
+          <span class="meta-tag">${proj.asset_count || 0} assets</span>
+          <span class="meta-tag">${sizeKb} KB</span>
+        </div>
+        <div class="project-actions">
+          <button class="btn btn-secondary compact-btn" data-load-proj="${proj.project_id}">Load Project</button>
+          <a class="btn btn-secondary compact-btn" href="${dlHref}" download="${proj.project_id}.vsproj">Export .VSPROJ</a>
+        </div>
+      `;
+      container.appendChild(card);
+    }
+
+    container.querySelectorAll("[data-load-proj]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const projId = btn.getAttribute("data-load-proj");
+        await loadProjectFromVault(projId);
+      });
+    });
+
+    container.querySelectorAll("[data-del-proj]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const projId = btn.getAttribute("data-del-proj");
+        await apiFetch(`api/v1/projects/${encodeURIComponent(projId)}`, { method: "DELETE" });
+        if (state.activeProjectId === projId) {
+          state.activeProjectId = null;
+          state.activeProjectTitle = null;
+          updateProjectBadge();
+        }
+        await refreshProjects();
+      });
+    });
+  }
+
+  function hasInpaintCanvasContent() {
+    const canvas = el("inpaintCanvas");
+    if (!canvas) return false;
+    const ctx = canvas.getContext("2d");
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let i = 0; i < data.length; i += 16) {
+      if (data[i] > 4) return true;
+    }
+    return false;
+  }
+
+  function loadCanvasFromDataUrl(dataUrl) {
+    const canvas = el("inpaintCanvas");
+    if (!canvas || !dataUrl) return;
+    const ctx = canvas.getContext("2d");
+    const img = new Image();
+    img.onload = () => {
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    };
+    img.src = dataUrl;
+  }
+
+  function resetToNewProjectDraft() {
+    state.activeProjectId = null;
+    state.activeProjectTitle = null;
+    state.activeImageId = null;
+    state.lastTelemetry = null;
+    el("titleInput").value = "Untitled Vision Master";
+    el("promptInput").value = DEFAULT_PROMPT_TEXT;
+    el("negativePromptInput").value = "";
+    el("layoutSummaryInput").value = "";
+    state.layoutItems = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+    state.bindings.init_image_path = null;
+    state.bindings.inpaint_mask_path = null;
+    state.bindings.control_image_path = null;
+    state.bindings.reference_image_paths = [];
+    const canvas = el("inpaintCanvas");
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    updateProjectBadge();
+    renderBindingsCard();
+    renderReferenceVault();
+    renderProjectVault();
+    renderSpatialLayoutEditor();
+  }
+
+  async function saveCurrentProject(downloadAfterSave = false) {
+    if (!state.token) {
+      showLoginModal();
+      return;
+    }
+    const saveBtn = el("saveProjectBtn");
+    const expBtn = el("exportProjectBtn");
+    saveBtn.disabled = true;
+    expBtn.disabled = true;
+
+    try {
+      const draft = collectDeckPayload();
+      const canvas = el("inpaintCanvas");
+      const maskDataUrl = (canvas && hasInpaintCanvasContent()) ? canvas.toDataURL("image/png") : null;
+      const res = await apiFetch("api/v1/projects/save", {
+        method: "POST",
+        body: {
+          project_id: state.activeProjectId || null,
+          title: draft.title,
+          working_draft: draft,
+          telemetry: state.lastTelemetry,
+          active_image_id: state.activeImageId,
+          inpaint_canvas_data_url: maskDataUrl,
+          include_all_vault_refs: false
+        }
+      });
+      if (res && res.project) {
+        state.activeProjectId = res.project.project_id;
+        state.activeProjectTitle = res.project.title;
+        updateProjectBadge();
+        await refreshProjects();
+        if (downloadAfterSave) {
+          const dlUrl = `api/v1/projects/${encodeURIComponent(res.project.project_id)}/download?token=${encodeURIComponent(state.token)}`;
+          const a = document.createElement("a");
+          a.href = dlUrl;
+          a.download = `${res.project.project_id}.vsproj`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }
+      }
+    } catch (err) {
+      alert(`Project save failed: ${err.message}`);
+    } finally {
+      saveBtn.disabled = false;
+      expBtn.disabled = false;
+    }
+  }
+
+  async function loadProjectFromVault(projectId) {
+    if (!state.token) {
+      showLoginModal();
+      return;
+    }
+    try {
+      const res = await apiFetch(`api/v1/projects/${encodeURIComponent(projectId)}/load`, {
+        method: "POST"
+      });
+      if (!res) return;
+      state.activeProjectId = res.project_id;
+      state.activeProjectTitle = res.title;
+      updateProjectBadge();
+      await Promise.all([refreshReferences(), refreshProjects()]);
+      restoreDraftToStudio({
+        title: res.title,
+        working_draft: res.working_draft,
+        telemetry: res.telemetry,
+        image_url: res.preview_url
+      });
+      if (res.inpaint_canvas_data_url) {
+        loadCanvasFromDataUrl(res.inpaint_canvas_data_url);
+      }
+    } catch (err) {
+      alert(`Failed loading project: ${err.message}`);
+    }
+  }
+
+  async function importProjectFromFile(file) {
+    if (!state.token) {
+      showLoginModal();
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const res = await apiFetch("api/v1/projects/import", {
+          method: "POST",
+          body: {
+            filename: file.name,
+            data_url: reader.result
+          }
+        });
+        if (!res) return;
+        state.activeProjectId = res.project_id;
+        state.activeProjectTitle = res.title;
+        updateProjectBadge();
+        await Promise.all([refreshReferences(), refreshProjects()]);
+        restoreDraftToStudio({
+          title: res.title,
+          working_draft: res.working_draft,
+          telemetry: res.telemetry,
+          image_url: res.preview_url
+        });
+        if (res.inpaint_canvas_data_url) {
+          loadCanvasFromDataUrl(res.inpaint_canvas_data_url);
+        }
+      } catch (err) {
+        alert(`Failed importing .vsproj package: ${err.message}`);
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function promoteGalleryImageToVault(imageId, bindMode = "ref", variantIndex = 1) {
+    if (!state.token || !imageId) return;
+    try {
+      const meta = await apiFetch(`api/v1/references/from-image/${encodeURIComponent(imageId)}`, {
+        method: "POST",
+        body: {
+          role: "photo_ref",
+          variant_index: variantIndex
+        }
+      });
+      if (!meta || !meta.ref_id) return;
+      await refreshReferences();
+      if (bindMode === "init") {
+        state.bindings.init_image_path = meta.ref_id;
+        if (parseFloat(el("denoiseInput").value) >= 1.0) {
+          el("denoiseInput").value = "0.75";
+        }
+      } else {
+        if (!state.bindings.reference_image_paths.includes(meta.ref_id)) {
+          state.bindings.reference_image_paths.push(meta.ref_id);
+        }
+        if (el("editFormatSelect").value === "standard") {
+          el("editFormatSelect").value = "ai_toolkit_isolated";
+        }
+      }
+      renderBindingsCard();
+      renderReferenceVault();
+      renderSpatialLayoutEditor();
+    } catch (err) {
+      alert(`Failed promoting image to vault: ${err.message}`);
+    }
   }
 
   function matchPrimaryAssetAspect() {
@@ -1340,6 +1629,14 @@
     const img = el("masterOutputImage");
     const dlPng = el("downloadPngBtn");
     const strip = el("batchThumbStrip");
+    const promoInitBtn = el("promoteViewportInitBtn");
+    const promoRefBtn = el("promoteViewportRefBtn");
+
+    const resolvedId = jobStatus.job_id || jobStatus.image_id || null;
+    if (resolvedId) {
+      state.activeImageId = resolvedId;
+      state.activeVariantIndex = 1;
+    }
 
     if (jobStatus.image_url) {
       const allUrls = [jobStatus.image_url].concat(jobStatus.additional_image_urls || []);
@@ -1348,6 +1645,9 @@
       el("emptyViewportState").hidden = true;
       dlPng.href = allUrls[0];
       dlPng.hidden = false;
+
+      if (promoInitBtn) promoInitBtn.hidden = !state.activeImageId;
+      if (promoRefBtn) promoRefBtn.hidden = !state.activeImageId;
 
       if (strip) {
         if (allUrls.length > 1) {
@@ -1360,6 +1660,7 @@
             th.addEventListener("click", () => {
               img.src = `${u}?t=${Date.now()}`;
               dlPng.href = u;
+              state.activeVariantIndex = idx + 1;
               strip.querySelectorAll(".batch-thumb").forEach((elThumb) => elThumb.classList.remove("active"));
               th.classList.add("active");
             });
@@ -1382,6 +1683,7 @@
 
     const t = jobStatus.telemetry;
     if (t) {
+      state.lastTelemetry = t;
       el("tSolverVal").textContent = `${(t.early_solver || "heun").toUpperCase()} -> ${(t.late_solver || "ipndm").toUpperCase()} (${t.total_nfe} NFE)`;
       el("tLatencyVal").textContent = `${Number(t.generation_time_seconds).toFixed(2)}s (${Number(t.step_latency_ms).toFixed(0)}ms/st)`;
       const contig = t.wddm_contiguous_avail_gb !== undefined ? ` | ${Number(t.wddm_contiguous_avail_gb).toFixed(1)}G free` : "";
@@ -1403,7 +1705,8 @@
     if (draft.prompt_mode) el("promptModeSelect").value = draft.prompt_mode;
     if (draft.prompt !== undefined) el("promptInput").value = draft.prompt;
     if (draft.layout_summary !== undefined && el("layoutSummaryInput")) {
-      el("layoutSummaryInput").value = draft.layout_summary || "";
+      const sumVal = draft.layout_summary || "";
+      el("layoutSummaryInput").value = sumVal === draft.prompt ? "" : sumVal;
     }
     if (draft.negative_prompt !== undefined) el("negativePromptInput").value = draft.negative_prompt;
     if (draft.system_prompt !== undefined) el("systemPromptInput").value = draft.system_prompt || "";
@@ -1467,7 +1770,7 @@
     if (draft.edit_lora_path !== undefined) el("editLoraSelect").value = draft.edit_lora_path || "";
     if (draft.edit_lora_scale !== undefined) el("loraScaleInput").value = draft.edit_lora_scale;
 
-    if (Array.isArray(draft.layout_items) && draft.layout_items.length > 0) {
+    if (Array.isArray(draft.layout_items)) {
       state.layoutItems = JSON.parse(JSON.stringify(draft.layout_items));
     }
 
@@ -1504,10 +1807,12 @@
           <img src="${item.image_url}" alt="${item.title || "Master"}" loading="lazy" />
         </div>
         <div class="gallery-meta">
-          <div class="gallery-title">${item.title || "Untitled Vision Master"}${batchBadge}</div>
+          <div class="gallery-title" title="${item.title || "Untitled Vision Master"}">${item.title || "Untitled Vision Master"}${batchBadge}</div>
           <div class="gallery-sub">${(item.model_variant || "sft").toUpperCase()} // ${item.width}x${item.height} // ${solverTag} // Seed ${item.seed}</div>
           <div class="gallery-actions">
-            <button class="btn btn-secondary compact-btn" data-restore-id="${item.image_id}">Restore Draft</button>
+            <button class="btn btn-secondary compact-btn" data-restore-id="${item.image_id}">Restore</button>
+            <button class="btn btn-secondary compact-btn" data-promo-init="${item.image_id}" title="Promote image to Vault and bind as Init Image">-&gt; Init</button>
+            <button class="btn btn-secondary compact-btn" data-promo-ref="${item.image_id}" title="Promote image to Vault and bind as 4D Reference">-&gt; 4D Ref</button>
             <button class="btn btn-secondary compact-btn" data-del-img="${item.image_id}">Delete</button>
           </div>
         </div>
@@ -1528,6 +1833,20 @@
         const id = btn.getAttribute("data-restore-id");
         const found = state.gallery.find((g) => g.image_id === id);
         if (found) restoreDraftToStudio(found);
+      });
+    });
+
+    container.querySelectorAll("[data-promo-init]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-promo-init");
+        await promoteGalleryImageToVault(id, "init", 1);
+      });
+    });
+
+    container.querySelectorAll("[data-promo-ref]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-promo-ref");
+        await promoteGalleryImageToVault(id, "ref", 1);
       });
     });
 
@@ -1744,6 +2063,33 @@
       applyThemeVariables(ev.target.value);
     });
 
+    el("newProjectBtn").addEventListener("click", resetToNewProjectDraft);
+    el("saveProjectBtn").addEventListener("click", () => saveCurrentProject(false));
+    el("vaultSaveProjectBtn").addEventListener("click", () => saveCurrentProject(false));
+    el("exportProjectBtn").addEventListener("click", () => saveCurrentProject(true));
+
+    el("importProjectInput").addEventListener("change", async (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      try {
+        await importProjectFromFile(file);
+      } finally {
+        ev.target.value = "";
+      }
+    });
+
+    el("promoteViewportInitBtn").addEventListener("click", async () => {
+      if (state.activeImageId) {
+        await promoteGalleryImageToVault(state.activeImageId, "init", state.activeVariantIndex);
+      }
+    });
+
+    el("promoteViewportRefBtn").addEventListener("click", async () => {
+      if (state.activeImageId) {
+        await promoteGalleryImageToVault(state.activeImageId, "ref", state.activeVariantIndex);
+      }
+    });
+
     document.querySelectorAll(".tab-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
@@ -1753,6 +2099,17 @@
         if (target) target.classList.add("active");
         syncStageAspectAndGuides();
         syncUnderlayLayers();
+      });
+    });
+
+    const vaultPanel = document.querySelector(".vault-panel");
+    document.querySelectorAll("[data-vault-view]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("[data-vault-view]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        if (vaultPanel) {
+          vaultPanel.setAttribute("data-vault-mode", btn.getAttribute("data-vault-view"));
+        }
       });
     });
 
@@ -1882,6 +2239,7 @@
   async function bootstrapStudio() {
     bindEventListeners();
     initInpaintCanvas();
+    updateProjectBadge();
     await loadThemeRegistry();
     await pollHealthTelemetry(true);
     syncStageAspectAndGuides();
