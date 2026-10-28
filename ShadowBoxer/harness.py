@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
+# ShadowBoxer/harness.py
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, fields, is_dataclass
 import json
 import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
@@ -23,9 +23,7 @@ from PIL import Image
 import torch
 
 from engine import MOSSImageEngine
-import schema
 from schema import (
-    BASELINE_ENGINE_DEFAULTS,
     DEFAULT_LAYOUT_ITEMS,
     DEFAULT_PRESET_FILENAME,
     GenerationRequest,
@@ -33,6 +31,7 @@ from schema import (
     SUPPORTED_EDIT_FORMATS,
     SUPPORTED_FRAMING_MODES,
     SUPPORTED_INPUT_ROLES,
+    SUPPORTED_MASK_BLEND_MODES,
     SUPPORTED_MODELS,
     SUPPORTED_PROMPT_MODES,
     SUPPORTED_SOLVERS,
@@ -59,44 +58,9 @@ DEFAULT_LAYOUT_SUMMARY = (
 )
 
 
-def _valid_request_fields() -> Set[str]:
-    model_fields = getattr(GenerationRequest, "model_fields", None)
-    if isinstance(model_fields, dict):
-        return set(model_fields.keys())
-    v1_fields = getattr(GenerationRequest, "__fields__", None)
-    if isinstance(v1_fields, dict):
-        return set(v1_fields.keys())
-    if is_dataclass(GenerationRequest):
-        return {f.name for f in fields(GenerationRequest)}
-    return set()
-
-
 def _normalize_request_kwargs(raw: Dict[str, Any]) -> Dict[str, Any]:
-    data = dict(raw)
-    valid = _valid_request_fields()
-    if "layout_boxes" in data and "layout_items" not in data:
-        if not valid or "layout_items" in valid:
-            data["layout_items"] = data.pop("layout_boxes")
-    if "layout_coords_are_pixels" in data and "coords_are_pixels" in valid:
-        data["coords_are_pixels"] = data.pop("layout_coords_are_pixels")
-    if valid:
-        return {k: v for k, v in data.items() if k in valid}
-    return data
-
-
-def _get_layout_items(req: GenerationRequest) -> List[Dict[str, Any]]:
-    items = getattr(req, "layout_items", None)
-    if items is None:
-        items = getattr(req, "layout_boxes", None)
-    return list(items) if items else []
-
-
-def _set_layout_items(req: GenerationRequest, items: List[Dict[str, Any]]) -> None:
-    valid = _valid_request_fields()
-    if "layout_items" in valid or hasattr(req, "layout_items"):
-        setattr(req, "layout_items", items)
-    elif "layout_boxes" in valid or hasattr(req, "layout_boxes"):
-        setattr(req, "layout_boxes", items)
+    valid = set(GenerationRequest.model_fields.keys())
+    return {k: v for k, v in raw.items() if k in valid}
 
 
 def _graceful_exit(engine: Optional[MOSSImageEngine], code: int = 0) -> None:
@@ -147,7 +111,7 @@ def build_default_request() -> GenerationRequest:
         "early_cfg": float(d.get("early_cfg", 3.2)),
         "late_cfg": float(d.get("late_cfg", 2.8)),
         "uncond_skip_layers": list(d.get("uncond_skip_layers", [24])),
-        "slg_layers": list(d.get("slg_layers", [])),
+        "slg_layers": list(d.get("slg_layers", [24])),
         "slg_scale": float(d.get("slg_scale", 0.0)),
         "slg_start": float(d.get("slg_start", 0.20)),
         "slg_stop": float(d.get("slg_stop", 0.70)),
@@ -160,6 +124,8 @@ def build_default_request() -> GenerationRequest:
         "cpu_offload": bool(d.get("cpu_offload", False)),
         "prepass_warmup": bool(d.get("prepass_warmup", True)),
         "denoise_strength": float(d.get("denoise_strength", 1.0)),
+        "mask_blend_mode": str(d.get("mask_blend_mode", "auto")),
+        "invert_inpaint_mask": bool(d.get("invert_inpaint_mask", False)),
         "edit_format": str(d.get("edit_format", "standard")),
         "framing_mode": str(d.get("framing_mode", "inscribed")),
         "input_role": str(d.get("input_role", "photo_ref")),
@@ -179,39 +145,18 @@ def build_default_request() -> GenerationRequest:
 
 
 def request_to_dict(req: GenerationRequest) -> Dict[str, Any]:
-    if hasattr(req, "to_dict") and callable(req.to_dict):
-        return req.to_dict()
-    if hasattr(req, "model_dump") and callable(req.model_dump):
-        return req.model_dump()
-    if is_dataclass(req):
-        return asdict(req)
-    return dict(req.__dict__)
+    return req.to_dict()
 
 
 def request_from_dict(data: Dict[str, Any]) -> GenerationRequest:
     merged = request_to_dict(build_default_request())
     merged.update(_normalize_request_kwargs(data))
-    norm_data = _normalize_request_kwargs(merged)
-    if hasattr(GenerationRequest, "from_dict") and callable(
-        getattr(GenerationRequest, "from_dict")
-    ):
-        return GenerationRequest.from_dict(norm_data)
-    if hasattr(GenerationRequest, "model_validate") and callable(
-        getattr(GenerationRequest, "model_validate")
-    ):
-        return GenerationRequest.model_validate(norm_data)
-    return GenerationRequest(**norm_data)
+    return GenerationRequest.from_dict(_normalize_request_kwargs(merged))
 
 
 def _clone_request(req: GenerationRequest, **updates: Any) -> GenerationRequest:
     norm_updates = _normalize_request_kwargs(updates)
-    if hasattr(req, "model_copy") and callable(req.model_copy):
-        return req.model_copy(update=norm_updates, deep=True)
-    merged = request_to_dict(req)
-    if "layout_items" in merged and isinstance(merged["layout_items"], list):
-        merged["layout_items"] = [dict(x) for x in merged["layout_items"]]
-    merged.update(norm_updates)
-    return request_from_dict(merged)
+    return req.model_copy(update=norm_updates, deep=True)
 
 
 def load_or_create_initial_request(
@@ -238,11 +183,7 @@ def load_or_create_initial_request(
 
 
 def save_request_json(req: GenerationRequest, path: Path) -> None:
-    if hasattr(req, "save_preset") and callable(req.save_preset):
-        req.save_preset(path)
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(request_to_dict(req), indent=2), encoding="utf-8")
+    req.save_preset(path)
 
 
 load_request_from_json = lambda path: load_or_create_initial_request(path)[0]
@@ -268,12 +209,12 @@ def _short_path(p: Optional[str]) -> str:
 
 def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     repo_str = SUPPORTED_MODELS.get(req.model_variant.lower(), req.repo_id or "Custom")
-    n_boxes = len(_get_layout_items(req))
+    n_boxes = len(req.layout_items or [])
     think_str = "ENABLED (<think>)" if req.enable_thinking else "DISABLED (</think>)"
     slg_str = (
         f"Layers {req.slg_layers} | Scale: {req.slg_scale:.2f} [{req.slg_start:.2f}-{req.slg_stop:.2f}]"
-        if (req.slg_layers and req.slg_scale > 0.0)
-        else "DISABLED"
+        if (req.slg_layers and req.slg_scale and req.slg_scale > 0.0)
+        else f"DISABLED (Pre-staged: {req.slg_layers})"
     )
     refs_str = (
         ", ".join(Path(p).name for p in req.reference_image_paths)
@@ -290,6 +231,7 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
         if req.uncond_uses_references is None
         else ("ON" if req.uncond_uses_references else "OFF")
     )
+    mask_alg_str = f"{req.mask_blend_mode or 'auto'}{'(Inv)' if req.invert_inpaint_mask else ''}"
 
     print("\n" + "=" * 92)
     print("               SHADOWBOXER: OPENMOSS ARCHITECTURAL EXPLORATION HARNESS")
@@ -321,7 +263,7 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     )
     print(" --- VIZINJECTOR FILE INPUT, INPAINT, CONTROL & AGENTIC EDITING ---")
     print(
-        f" [12] Init Image & Inpaint:   Init: {_short_path(req.init_image_path)} (Denoise: {req.denoise_strength:.2f}) | Mask: {_short_path(req.inpaint_mask_path)}"
+        f" [12] Init, Inpaint & Algebra:Init: {_short_path(req.init_image_path)} (Denoise: {req.denoise_strength:.2f}) | Mask: {_short_path(req.inpaint_mask_path)} [{mask_alg_str}]"
     )
     print(
         f" [13] Multi-Reference (4D):   {refs_str} | Control Map: {_short_path(req.control_image_path)}"
@@ -362,7 +304,7 @@ def render_telemetry_report(
         if resp.viztoken_active
         else "FALLBACK TOKENIZER"
     )
-
+    mask_tag = f"{resp.mask_blend_mode_used}{'(Inv)' if resp.invert_inpaint_mask_used else ''}"
     print("\n" + "=" * 92)
     print("                          SHADOWBOXER: OPENMOSS TELEMETRY REPORT")
     print("=" * 92)
@@ -402,7 +344,7 @@ def render_telemetry_report(
         f"Vision Conditioner:     {resp.vizinjector_backend} | Ref Cache Hit: {resp.reference_cache_hit}"
     )
     print(
-        f"Conditioning Routing:   Edit={resp.edit_format_used} | Framing={resp.framing_mode_used} | Role={resp.input_role_used} | t_ref=0: {resp.reference_zero_timestep_used} | IsoKV: {resp.reference_isolated_kv_used} | BoxIso: {resp.box_attn_isolation_used:.2f} | UncondRefs: {resp.uncond_uses_references_used} | BoxSplat: {resp.composite_box_images_used} | LoRA: {resp.edit_lora_active}"
+        f"Conditioning Routing:   Edit={resp.edit_format_used} | Framing={resp.framing_mode_used} | Role={resp.input_role_used} | Mask={mask_tag} | t_ref=0: {resp.reference_zero_timestep_used} | IsoKV: {resp.reference_isolated_kv_used} | BoxIso: {resp.box_attn_isolation_used:.2f} | UncondRefs: {resp.uncond_uses_references_used} | BoxSplat: {resp.composite_box_images_used} | LoRA: {resp.edit_lora_active}"
     )
     print(f"Schedule Regime:        {sched_str} | Shift: {resp.shift_used:.2f}")
     print(
@@ -606,7 +548,6 @@ def run_permutation_suite(
     staged = stage_test_input_files()
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     active_base = base_req if base_req is not None else build_default_request()
-
     w = width_override or active_base.width
     h = height_override or active_base.height
     eff_steps = (
@@ -633,12 +574,14 @@ def run_permutation_suite(
         early_cfg=3.0,
         late_cfg=3.0,
         guidance_scale=3.0,
-        slg_layers=[],
+        slg_layers=[24],
         slg_scale=0.0,
         eta=0.0,
         s_noise=1.0,
         init_image_path=None,
         inpaint_mask_path=None,
+        mask_blend_mode="auto",
+        invert_inpaint_mask=False,
         control_image_path=None,
         reference_image_paths=[],
         export_vizj_path=None,
@@ -649,8 +592,9 @@ def run_permutation_suite(
         edit_lora_scale=0.0,
         box_attn_isolation=0.0,
         composite_box_images_to_init=False,
-        layout_items=_get_layout_items(active_base)
-        or [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
+        layout_items=list(active_base.layout_items)
+        if active_base.layout_items
+        else [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
     )
 
     vectors: List[Tuple[str, GenerationRequest]] = [
@@ -805,6 +749,8 @@ def run_permutation_suite(
             "prompt_cache_hit": resp.prompt_cache_hit,
             "ref_cache_hit": resp.reference_cache_hit,
             "shared_prefix_tokens": resp.common_prefix_tokens,
+            "mask_blend_mode": resp.mask_blend_mode_used,
+            "invert_mask": resp.invert_inpaint_mask_used,
             "t_ref_zero": resp.reference_zero_timestep_used,
             "iso_kv": resp.reference_isolated_kv_used,
             "box_iso": round(resp.box_attn_isolation_used, 3),
@@ -876,7 +822,6 @@ def interactive_loop(
 ) -> None:
     req = initial_req
     active_tag = banner_tag
-
     while True:
         render_menu(req, active_tag)
         try:
@@ -957,8 +902,8 @@ def interactive_loop(
                     if req.prompt_mode.lower() == "natural"
                     else "natural"
                 )
-                if not _get_layout_items(req):
-                    _set_layout_items(req, [dict(b) for b in DEFAULT_LAYOUT_ITEMS])
+                if not req.layout_items:
+                    req.layout_items = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
             elif cmd == "2":
                 new_p = input("Enter Positive Prompt (Blank to keep current): ").strip()
                 if new_p:
@@ -1036,9 +981,10 @@ def interactive_loop(
                     req.slg_layers = _parse_int_list(sl_in)
                 if req.slg_layers:
                     sc_in = input(
-                        f"SLG Scale (Current: {req.slg_scale:.2f}, Suggested: 0.50): "
+                        f"SLG Scale (Current: {req.slg_scale:.2f}, 0.0=Off, Suggested: 0.50): "
                     ).strip()
-                    req.slg_scale = float(sc_in) if sc_in else 0.50
+                    if sc_in:
+                        req.slg_scale = max(0.0, float(sc_in))
                 else:
                     req.slg_scale = 0.0
             elif cmd == "11":
@@ -1070,6 +1016,38 @@ def interactive_loop(
                     req.inpaint_mask_path = None
                 elif mk_in:
                     req.inpaint_mask_path = mk_in
+                print(
+                    f"Supported Mask Blend Modes: {', '.join(SUPPORTED_MASK_BLEND_MODES)}"
+                )
+                mb_in = (
+                    input(
+                        f"Mask Blend Mode (Current: {req.mask_blend_mode or 'auto'}): "
+                    )
+                    .strip()
+                    .lower()
+                )
+                if mb_in in SUPPORTED_MASK_BLEND_MODES:
+                    req.mask_blend_mode = mb_in
+                inv_in = input(
+                    f"Invert Composed Inpaint Mask? [y/N] (Current: {req.invert_inpaint_mask}): "
+                ).strip()
+                if inv_in:
+                    req.invert_inpaint_mask = inv_in.lower() in (
+                        "y",
+                        "yes",
+                        "1",
+                        "true",
+                    )
+                pr_in = input(
+                    f"Preserve Canvas Outside Layout Boxes? [y/N] (Current: {req.preserve_canvas_outside_boxes}): "
+                ).strip()
+                if pr_in:
+                    req.preserve_canvas_outside_boxes = pr_in.lower() in (
+                        "y",
+                        "yes",
+                        "1",
+                        "true",
+                    )
             elif cmd == "13":
                 rf_in = input(
                     "Reference Image Paths comma-sep or 'none': "
@@ -1250,6 +1228,13 @@ def main() -> None:
     parser.add_argument("--box_attn_isolation", type=float, default=None)
     parser.add_argument("--composite_box_images", action="store_true")
     parser.add_argument(
+        "--mask_blend_mode",
+        type=str,
+        choices=SUPPORTED_MASK_BLEND_MODES,
+        default=None,
+    )
+    parser.add_argument("--invert_mask", action="store_true")
+    parser.add_argument(
         "--model_variant",
         "--variant",
         dest="model_variant",
@@ -1271,6 +1256,7 @@ def main() -> None:
         cfg_path = ROOT_DIR / cfg_path
 
     req, banner_tag = load_or_create_initial_request(cfg_path)
+
     if args.prompt is not None:
         req.prompt = args.prompt
     if args.system_prompt is not None:
@@ -1281,6 +1267,10 @@ def main() -> None:
         req.box_attn_isolation = max(0.0, min(1.0, float(args.box_attn_isolation)))
     if args.composite_box_images:
         req.composite_box_images_to_init = True
+    if args.mask_blend_mode is not None:
+        req.mask_blend_mode = args.mask_blend_mode
+    if args.invert_mask:
+        req.invert_inpaint_mask = True
     if args.model_variant is not None:
         req.model_variant = args.model_variant
         req.repo_id = None

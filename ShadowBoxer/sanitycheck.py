@@ -76,6 +76,7 @@ from schema import (
     bbox_to_pixel_rect,
     compile_layout_prompt,
     get_active_engine_defaults,
+    get_canonical_box_order,
     has_custom_default_preset,
     pixel_bbox_to_abs_centralized,
     reconcile_layout_summary_quotes,
@@ -143,6 +144,7 @@ def gate_1_native_subsystems() -> None:
         _assert(
             tok.has_fast_tables, "SWISS5 fast tables not active in qwen35.ranks.bin"
         )
+
         raw_p1 = "A brushed-steel refrigerator with sticky note 'OPENMOSS'"
         raw_p2 = "A brushed-steel refrigerator with sticky note 'AGENTIC PASS 2'"
         p1 = render_qwen35_chat_prompt(
@@ -157,6 +159,7 @@ def gate_1_native_subsystems() -> None:
         )
         ids_1 = tok.encode(p1, allowed_special="all")
         ids_2 = tok.encode(p2, allowed_special="all")
+
         chat_ids_1 = tok.encode_chat(
             raw_p1,
             enable_thinking=True,
@@ -167,6 +170,7 @@ def gate_1_native_subsystems() -> None:
             ids_1 == chat_ids_1,
             "Zero-alloc encode_chat diverged from full-string ChatML encode",
         )
+
         for think_flag in (True, False):
             for p_counts in (None, [2304, 576]):
                 for sys_p in (None, "You are a spatial composition architect."):
@@ -196,6 +200,7 @@ def gate_1_native_subsystems() -> None:
                                 ),
                                 f"encode_chat parity failure for thinking={think_flag}, patches={p_counts}, sys={sys_p is not None}, trace={t_trace is not None}, vis_id={vis_id}",
                             )
+
         shared_pfx = MOSSImageTokenizer.find_common_prefix(ids_1, ids_2)
         _assert(
             shared_pfx > 150, f"Expected shared prefix > 150 tokens, got {shared_pfx}"
@@ -213,6 +218,7 @@ def gate_1_native_subsystems() -> None:
         print(
             f"  [+] VizInjector Backend      : {viz.backend_name} (Vulkan Active: {viz.vulkan_active})"
         )
+
         yy, xx = np.meshgrid(
             np.linspace(-1.0, 1.0, 512, dtype=np.float32),
             np.linspace(-1.0, 1.0, 512, dtype=np.float32),
@@ -339,6 +345,7 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             "Expected initial neg miss",
         )
         p_cache.insert(neg_tokens, h_neg)
+
         _ = p_cache.lookup(neg_tokens, dev, is_negative=True)
         _assert(
             p_cache.pos_hits == 0,
@@ -364,6 +371,7 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             hit_mm is not None and hit_mm.device.type == dev.type,
             "Multimodal prompt cache lookup failed",
         )
+
     print(
         f"  [+] PromptEmbedCache         : Pinned={stored_cpu.is_pinned() if has_gpu else 'CPU'} | NonInferenceCPU=True | PrefixSplice={p_cache.last_common_prefix_len} tok"
     )
@@ -390,6 +398,7 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             vae_key_v7 == vae_key_v8 and vae_key_v8 == vae_key_cc,
             "Aspect-matching 'never_crop', 'inscribed', and 'cover_crop' must canonicalize to the same VAE cache key",
         )
+
         with torch.inference_mode():
             rec_in = CachedReferenceRecord(
                 packed_latents=torch.randn((1, 128, 32, 32), device=dev),
@@ -401,6 +410,7 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
                 viz_meta=None,
             )
             pinned_rec = r_cache.insert(key_v7, rec_in, vae_key=vae_key_v7)
+
         if has_gpu:
             _assert(
                 pinned_rec.packed_latents is not None
@@ -441,6 +451,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         next(meta_dit.parameters()).is_meta,
         "_MetaWeightInitMode failed to place parameters on meta device",
     )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_sf = Path(tmpdir) / "diffusion_pytorch_model.safetensors"
         save_safetensors(
@@ -453,6 +464,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             not next(meta_dit.parameters()).is_meta,
             "load_sharded_safetensors_into left parameters on meta device",
         )
+
         ptrs_before = {k: p.data_ptr() for k, p in meta_dit.named_parameters()}
         with torch.no_grad():
             meta_dit.layers[0].proj["q"].weight.zero_()
@@ -504,7 +516,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         )
         _assert(
             bool(iso_mask[0, 0, t_tok + 5, t_tok + r1_tok + 5].item()) is False,
-            "Ref 1 must not attend to Ref 2",
+            "Disjoint Ref 1 must not attend to Ref 2",
         )
         _assert(
             bool(iso_mask[0, 0, t_tok + 5, t_tok + r1_tok + r2_tok + 2].item())
@@ -534,12 +546,40 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             rope_4d_fp32,
             8,
             attn_mask=None,
-            iso_kv_spec=(t_tok, (r1_tok, r2_tok), 16),
+            iso_kv_spec=(t_tok, (r1_tok, r2_tok), 16, ((0,), (1,))),
         )
         iso_diff = float((attn_masked - attn_partitioned).abs().max().item())
         _assert(
             iso_diff < 1e-5,
             f"Block-partitioned FlashAttention IsoKV diverged from boolean mask: {iso_diff}",
+        )
+
+        overlap_boxes = [(0.125, 0.125, 0.75, 0.75), (0.25, 0.25, 0.875, 0.875)]
+        collab_mask = dit._get_isolated_reference_mask(
+            t_tok, [r1_tok, r2_tok], 16, dev, ref_bboxes=overlap_boxes
+        )
+        _assert(
+            bool(collab_mask[0, 0, t_tok + 5, t_tok + r1_tok + 5].item()) is True,
+            "Overlapping reference boxes must collaborate in IsoKV attention",
+        )
+        attn_collab_masked = _attention(
+            q_test, k_test, v_test, rope_4d_fp32, 8, attn_mask=collab_mask
+        )
+        attn_collab_part = _attention(
+            q_test,
+            k_test,
+            v_test,
+            rope_4d_fp32,
+            8,
+            attn_mask=None,
+            iso_kv_spec=(t_tok, (r1_tok, r2_tok), 16, ((0, 1), (0, 1))),
+        )
+        collab_diff = float(
+            (attn_collab_masked - attn_collab_part).abs().max().item()
+        )
+        _assert(
+            collab_diff < 1e-5,
+            f"Collaborative block-partitioned IsoKV diverged from mask: {collab_diff}",
         )
 
         bias_none = dit._get_box_aperture_bias(
@@ -606,8 +646,8 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         )
         ref_phase_slice = phase_boxed[64 : 64 + 16, 2:4, 0]
         _assert(
-            float(ref_phase_slice.min().item()) >= -1e-4,
-            "Bottom-right box-translated 4D-RoPE phase should reside in positive quadrant",
+            float(ref_phase_slice.min().item()) >= 0.0,
+            "Cell-centered bottom-right box-translated 4D-RoPE phase must reside strictly in positive quadrant",
         )
 
         t_step_1 = torch.tensor([500.0], device=dev)
@@ -743,7 +783,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             "clear_caches must flush _box_aperture_bias_cache",
         )
     print(
-        f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap (0-Alloc) + Box-4D-RoPE + RegionalApertureBias + FlashIsoKV (diff={iso_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
+        f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap (0-Alloc) + CellCenter-4D-RoPE + CollaborativeIsoKV (diff={collab_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
     )
 
     orig_q_weight = dit.layers[0].proj["q"].weight.data.detach().float().clone()
@@ -1092,6 +1132,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     _assert(
         "bf16" in DTYPE_MAP and "fp16" in DTYPE_LOOKUP,
         "Refinery DTYPE_MAP/DTYPE_LOOKUP missing",
@@ -1204,6 +1245,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and abs(float(BASELINE_ENGINE_DEFAULTS["early_cfg"]) - 3.2) < 1e-6
         and abs(float(BASELINE_ENGINE_DEFAULTS["late_cfg"]) - 2.8) < 1e-6
         and BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"] == [24]
+        and BASELINE_ENGINE_DEFAULTS["slg_layers"] == [24]
         and BASELINE_ENGINE_DEFAULTS["mask_blend_mode"] == "auto"
         and BASELINE_ENGINE_DEFAULTS["invert_inpaint_mask"] is False,
         f"Expected V03 Heun->IPNDM baseline defaults, got {BASELINE_ENGINE_DEFAULTS}",
@@ -1327,6 +1369,21 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         f"compile_layout_prompt failed single-point-of-truth quote reconciliation: {compiled_reconciled}",
     )
 
+    box_subject_item = {
+        "category": "person",
+        "caption": "Subject portrait in moody lighting",
+        "bbox": [256, 256, 768, 768],
+        "image_path": "box_subject.png",
+        "isolate_box_attn": 0.9,
+        "paste_to_canvas": True,
+        "z_order": 1,
+    }
+    box_text_item = {
+        "category": "text",
+        "text": "SHADOWBOXER",
+        "bbox": [64, 256, 192, 768],
+        "z_order": 5,
+    }
     req_poly = GenerationRequest(
         prompt="A cinematic composition with a portrait and tattoo overlay",
         prompt_mode="layout_json",
@@ -1334,26 +1391,35 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         width=1024,
         layout_coords_are_pixels=True,
         reference_image_paths=["global_scene.png"],
+        layout_items=[box_subject_item, box_text_item],
+    )
+    req_poly_rev = GenerationRequest(
+        prompt="A cinematic composition with a portrait and tattoo overlay",
+        prompt_mode="layout_json",
+        height=1024,
+        width=1024,
+        layout_coords_are_pixels=True,
+        reference_image_paths=["global_scene.png"],
         layout_items=[
-            {
-                "category": "person",
-                "caption": "Subject portrait in moody lighting",
-                "bbox": [256, 256, 768, 768],
-                "image_path": "box_subject.png",
-                "isolate_box_attn": 0.9,
-                "paste_to_canvas": True,
-            },
-            {
-                "category": "text",
-                "text": "SHADOWBOXER",
-                "bbox": [64, 256, 192, 768],
-            },
+            dict(box_text_item, z_order=1),
+            dict(box_subject_item, z_order=9),
         ],
     )
-    ref_specs, box_pic_map = req_poly.resolve_visual_references()
     _assert(
-        len(ref_specs) == 2 and box_pic_map == {0: 2},
-        f"Expected 2 visual references with box 0 mapped to Picture 2, got {box_pic_map}",
+        get_canonical_box_order(
+            req_poly_rev.layout_items, height=1024, width=1024, coords_are_pixels=True
+        )
+        == [1, 0],
+        "Canonical coarse-to-fine box sort failed to order larger subject box before smaller text box",
+    )
+    ref_specs, box_pic_map = req_poly.resolve_visual_references()
+    ref_specs_rev, box_pic_map_rev = req_poly_rev.resolve_visual_references()
+    _assert(
+        len(ref_specs) == 2
+        and box_pic_map == {0: 2}
+        and box_pic_map_rev == {1: 2}
+        and [s["path"] for s in ref_specs] == [s["path"] for s in ref_specs_rev],
+        f"Expected permutation-invariant visual reference specs, got {box_pic_map} vs {box_pic_map_rev}",
     )
     _assert(
         ref_specs[0]["norm_bbox"] is None
@@ -1363,12 +1429,15 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         f"Unexpected reference spec mapping: {ref_specs}",
     )
     compiled_poly = req_poly.compile_effective_prompt()
+    compiled_poly_rev = req_poly_rev.compile_effective_prompt()
     _assert(
-        '"reference": "Picture 2"' in compiled_poly
+        compiled_poly == compiled_poly_rev
+        and '"reference": "Picture 2"' in compiled_poly
         and "box_subject.png" not in compiled_poly
         and "isolate_box_attn" not in compiled_poly
-        and "paste_to_canvas" not in compiled_poly,
-        "Polymorphic layout compiler failed to bind 'Picture 2' or leaked internal box routing keys",
+        and "paste_to_canvas" not in compiled_poly
+        and "z_order" not in compiled_poly,
+        "Polymorphic layout compiler failed permutation invariance or leaked internal box routing keys",
     )
     _assert(
         req_poly.effective_reference_zero_timestep is True
@@ -1510,10 +1579,11 @@ def gate_5_refinery_schema_and_snapshots() -> None:
 
     with torch.inference_mode():
         base_canvas = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
-        box_lat = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
+        box_lat_a = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
+        box_lat_b = torch.full((1, 128, 16, 16), -1.5, device="cpu", dtype=torch.float32)
         splat_canvas, splat_alpha = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
-            splat_entries=[(box_lat, (0.25, 0.25, 0.75, 0.75), None, 0.75)],
+            splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.75)],
             h_lat=32,
             w_lat=32,
             latent_channels=128,
@@ -1530,6 +1600,32 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and float(splat_canvas[0, 0, 0, 0].item()) == 0.0
             and 0.0 < float(splat_canvas[0, 0, 8, 16].item()) < 2.5,
             "splat_box_latents_to_canvas failed interior/feather/exterior composite values",
+        )
+
+        entry_1 = (box_lat_a, (0.125, 0.125, 0.625, 0.625), None, 0.75)
+        entry_2 = (box_lat_b, (0.375, 0.375, 0.875, 0.875), None, 0.75)
+        canvas_12, alpha_12 = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[entry_1, entry_2],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=2.0,
+            device=dev,
+        )
+        canvas_21, alpha_21 = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[entry_2, entry_1],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=2.0,
+            device=dev,
+        )
+        _assert(
+            float((canvas_12 - canvas_21).abs().max().item()) < 1e-6
+            and float((alpha_12 - alpha_21).abs().max().item()) < 1e-6,
+            "splat_box_latents_to_canvas violated commutative permutation invariance on overlapping boxes",
         )
 
     for fmt in ("moss_image_edit", "ai_toolkit_isolated", "control_color_depth"):
@@ -1555,7 +1651,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + QuoteSync + ComposableMaskAlgebra + Box-Conformal Framing + Latent Splatting Verified"
+        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + CanonicalSort + ComposableMaskAlgebra + CommutativeSplat Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)
@@ -1574,11 +1670,13 @@ def main() -> None:
         "          SHADOWBOXER SOVEREIGN ENGINE CONVERGENCE & 5-GATE AUDIT SUITE"
     )
     print("=" * 92)
+
     gate_1_native_subsystems()
     gate_2_pinned_memory_and_cache_isolation()
     gate_3_models_zero_alloc_and_lora()
     gate_4_schedulers_and_prng()
     gate_5_refinery_schema_and_snapshots()
+
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 92)
     print(

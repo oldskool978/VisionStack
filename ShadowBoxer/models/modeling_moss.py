@@ -27,7 +27,11 @@ _FP8_DTYPES: Set[torch.dtype] = {
 _FFN_TILE_TOKENS = 2048
 _BOX_ISOLATION_LOGIT_SCALE = -20.0
 
-IsoKVSpec = Tuple[int, Tuple[int, ...], int]
+CollabGroups = Tuple[Tuple[int, ...], ...]
+IsoKVSpec = Union[
+    Tuple[int, Tuple[int, ...], int],
+    Tuple[int, Tuple[int, ...], int, CollabGroups],
+]
 NormBBox = Tuple[float, float, float, float]
 ModTuple6 = Tuple[
     torch.Tensor,
@@ -160,6 +164,40 @@ def _normalize_ref_bboxes(
     return tuple(out)
 
 
+def _boxes_intersect(box_a: Optional[NormBBox], box_b: Optional[NormBBox]) -> bool:
+    if box_a is None or box_b is None:
+        return False
+    ay0, ax0, ay1, ax1 = box_a
+    by0, bx0, by1, bx1 = box_b
+    inter_h = min(ay1, by1) - max(ay0, by0)
+    inter_w = min(ax1, bx1) - max(ax0, bx0)
+    return (inter_h > 1e-5) and (inter_w > 1e-5)
+
+
+def _compute_collaborating_ref_groups(
+    num_refs: int,
+    norm_boxes: Tuple[Optional[NormBBox], ...],
+) -> CollabGroups:
+    if num_refs <= 0:
+        return ()
+    groups: List[Tuple[int, ...]] = []
+    for i in range(num_refs):
+        box_i = norm_boxes[i] if i < len(norm_boxes) else None
+        if box_i is None:
+            groups.append((i,))
+            continue
+        peers: List[int] = []
+        for j in range(num_refs):
+            if i == j:
+                peers.append(j)
+            else:
+                box_j = norm_boxes[j] if j < len(norm_boxes) else None
+                if _boxes_intersect(box_i, box_j):
+                    peers.append(j)
+        groups.append(tuple(peers))
+    return tuple(groups)
+
+
 def _normalize_box_isolation(
     norm_boxes: Tuple[Optional[NormBBox], ...],
     reference_box_isolation: Optional[Union[float, Sequence[Optional[float]]]],
@@ -220,16 +258,18 @@ def _attention(
         k_rot = k_rot.to(v.dtype)
 
     if iso_kv_spec is not None and attn_mask is None:
-        target_tokens, ref_token_lengths, _ = iso_kv_spec
+        if len(iso_kv_spec) == 4:
+            target_tokens, ref_token_lengths, _, collab_groups = iso_kv_spec  # type: ignore[misc]
+        else:
+            target_tokens, ref_token_lengths, _ = iso_kv_spec  # type: ignore[misc]
+            collab_groups = tuple((i,) for i in range(len(ref_token_lengths)))
         total_ref = sum(ref_token_lengths)
         if total_ref > 0:
             b_sz, total_seq, _, head_dim = q_rot.shape
             text_start = target_tokens + total_ref
             text_len = total_seq - text_start
-
             if not v.is_contiguous():
                 v = v.contiguous()
-
             out_blhd = torch.empty_like(q_rot, memory_format=torch.contiguous_format)
             k_full = k_rot.transpose(1, 2)
             v_full = v.transpose(1, 2)
@@ -265,25 +305,38 @@ def _attention(
                 out_blhd[:, text_start:, :, :].copy_(out_text.transpose(1, 2))
                 del out_text
 
+            ref_spans: List[Tuple[int, int]] = []
+            span_cursor = target_tokens
+            for r_len in ref_token_lengths:
+                ref_spans.append((span_cursor, span_cursor + r_len))
+                span_cursor += r_len
+
             k_text_blhd = k_rot[:, text_start:, :, :]
             v_text_blhd = v[:, text_start:, :, :]
-            cursor = target_tokens
-            for r_len in ref_token_lengths:
-                next_cursor = cursor + r_len
+
+            for r_idx, (c_start, c_end) in enumerate(ref_spans):
+                r_len = c_end - c_start
+                if r_len <= 0:
+                    continue
                 q_ref = (
-                    q_rot[:, cursor:next_cursor, :, :]
+                    q_rot[:, c_start:c_end, :, :]
                     .view(b_sz, r_len, heads, head_dim)
                     .transpose(1, 2)
                 )
-                if next_cursor == text_start:
-                    rem_len = total_seq - cursor
+                peers = (
+                    collab_groups[r_idx]
+                    if r_idx < len(collab_groups)
+                    else (r_idx,)
+                )
+                if len(peers) == 1 and peers[0] == r_idx and c_end == text_start:
+                    rem_len = total_seq - c_start
                     k_ref = (
-                        k_rot[:, cursor:, :, :]
+                        k_rot[:, c_start:, :, :]
                         .view(b_sz, rem_len, heads, head_dim)
                         .transpose(1, 2)
                     )
                     v_ref = (
-                        v[:, cursor:, :, :]
+                        v[:, c_start:, :, :]
                         .view(b_sz, rem_len, heads, head_dim)
                         .transpose(1, 2)
                     )
@@ -291,23 +344,27 @@ def _attention(
                         q_ref, k_ref, v_ref, attn_mask=None
                     )
                 else:
-                    k_cat = torch.cat(
-                        (k_rot[:, cursor:next_cursor, :, :], k_text_blhd), dim=1
-                    )
-                    v_cat = torch.cat(
-                        (v[:, cursor:next_cursor, :, :], v_text_blhd), dim=1
-                    )
+                    k_pieces = [
+                        k_rot[:, ref_spans[p][0] : ref_spans[p][1], :, :]
+                        for p in peers
+                    ]
+                    v_pieces = [
+                        v[:, ref_spans[p][0] : ref_spans[p][1], :, :]
+                        for p in peers
+                    ]
+                    k_pieces.append(k_text_blhd)
+                    v_pieces.append(v_text_blhd)
+                    k_cat = torch.cat(k_pieces, dim=1)
+                    v_cat = torch.cat(v_pieces, dim=1)
                     out_ref = F.scaled_dot_product_attention(
                         q_ref,
                         k_cat.transpose(1, 2),
                         v_cat.transpose(1, 2),
                         attn_mask=None,
                     )
-                    del k_cat, v_cat
-                out_blhd[:, cursor:next_cursor, :, :].copy_(out_ref.transpose(1, 2))
+                    del k_cat, v_cat, k_pieces, v_pieces
+                out_blhd[:, c_start:c_end, :, :].copy_(out_ref.transpose(1, 2))
                 del out_ref
-                cursor = next_cursor
-
             del q_rot, k_rot
             return out_blhd.flatten(2)
 
@@ -335,7 +392,6 @@ def _attention(
             )
             out_blhd[:, :target_tokens, :, :].copy_(out_target.transpose(1, 2))
             del out_target
-
             rem_tokens = total_seq - target_tokens
             q_rest = (
                 q_rot[:, target_tokens:, :, :]
@@ -496,10 +552,12 @@ class _Block(nn.Module):
         _apply_mod_inplace(y, modulation, is_ffn=False)
         if y.dtype != dtype:
             y = y.to(dtype)
+
         q = self.q_norm(_linear(self.proj["q"], y).unflatten(-1, (self.heads, -1)))
         k = self.k_norm(_linear(self.proj["k"], y).unflatten(-1, (self.heads, -1)))
         v = _linear(self.proj["v"], y).unflatten(-1, (self.heads, -1))
         del y
+
         attn_out = _attention(
             q,
             k,
@@ -520,6 +578,7 @@ class _Block(nn.Module):
         _apply_mod_inplace(y, modulation, is_ffn=True)
         if y.dtype != dtype:
             y = y.to(dtype)
+
         seq_len = y.shape[1]
         if seq_len <= _FFN_TILE_TOKENS:
             hidden, gate = _linear(self.proj["ffn_up_gate"], y).chunk(2, -1)
@@ -540,6 +599,7 @@ class _Block(nn.Module):
                 ffn_out[:, start:end, :] = _linear(self.proj["ffn_down"], act)
                 del act, hidden
             del y
+
         return _apply_gate_residual_inplace(x, ffn_out, modulation, is_ffn=True)
 
 
@@ -611,35 +671,23 @@ class _RoPE(nn.Module):
 
         if ref_shapes:
             norm_boxes = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+            h_f = float(height)
+            w_f = float(width)
             for r_idx, ((rh, rw), r_box) in enumerate(
                 zip(ref_shapes, norm_boxes), start=1
             ):
                 if r_box is not None:
                     uy0, ux0, uy1, ux1 = r_box
-                    y_start = uy0 * (height - 1) - cy
-                    y_end = uy1 * (height - 1) - cy
-                    x_start = ux0 * (width - 1) - cx
-                    x_end = ux1 * (width - 1) - cx
-                    if rh > 1:
-                        y_axis = torch.linspace(
-                            y_start, y_end, rh, device=device, dtype=torch.float32
-                        )
-                    else:
-                        y_axis = torch.tensor(
-                            [0.5 * (y_start + y_end)],
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                    if rw > 1:
-                        x_axis = torch.linspace(
-                            x_start, x_end, rw, device=device, dtype=torch.float32
-                        )
-                    else:
-                        x_axis = torch.tensor(
-                            [0.5 * (x_start + x_end)],
-                            device=device,
-                            dtype=torch.float32,
-                        )
+                    row_centers = (
+                        torch.arange(rh, device=device, dtype=torch.float32) + 0.5
+                    ) / float(max(1, rh))
+                    col_centers = (
+                        torch.arange(rw, device=device, dtype=torch.float32) + 0.5
+                    ) / float(max(1, rw))
+                    u_y = uy0 + row_centers * (uy1 - uy0)
+                    u_x = ux0 + col_centers * (ux1 - ux0)
+                    y_axis = (u_y - 0.5) * h_f
+                    x_axis = (u_x - 0.5) * w_f
                     gh, gw = torch.meshgrid(y_axis, x_axis, indexing="ij")
                     ref_coord = torch.stack(
                         (
@@ -769,7 +817,6 @@ class MOSSImageTransformer(nn.Module):
             freq_dim = config.freq_dim
             latent_channels = config.latent_channels
             rope_base = config.rope_base
-
         if dim % num_heads or (dim // num_heads) % 8 or freq_dim % 2:
             raise ValueError(
                 "Require dim divisible by heads, head_dim divisible by 8, and even freq_dim."
@@ -801,7 +848,7 @@ class MOSSImageTransformer(nn.Module):
         self._lora_backups: Dict[str, torch.Tensor] = {}
         self._active_lora_tag: Optional[str] = None
         self._isolated_mask_cache: OrderedDict[
-            Tuple[int, Tuple[int, ...], int, str], torch.Tensor
+            Tuple[Any, ...], torch.Tensor
         ] = OrderedDict()
         self._box_aperture_bias_cache: OrderedDict[
             Tuple[Any, ...], torch.Tensor
@@ -948,6 +995,7 @@ class MOSSImageTransformer(nn.Module):
                 else rank
             )
             eff_scale = float(scale) * (alpha / max(rank, 1.0))
+
             delta = (lora_b @ lora_a) * eff_scale
             if delta.shape == param.shape:
                 if param.dtype in _FP8_DTYPES:
@@ -1012,7 +1060,6 @@ class MOSSImageTransformer(nn.Module):
                 w_dtype,
                 self._active_lora_tag,
             )
-
         cached = self._time_mod_cache.get(cache_key)
         if cached is not None:
             self._time_mod_cache.move_to_end(cache_key)
@@ -1185,6 +1232,7 @@ class MOSSImageTransformer(nn.Module):
         ref_token_lengths: List[int],
         text_tokens: int,
         device: torch.device,
+        collab_groups: Optional[CollabGroups] = None,
     ) -> torch.Tensor:
         total_ref = sum(ref_token_lengths)
         total_seq = target_tokens + total_ref + text_tokens
@@ -1194,11 +1242,21 @@ class MOSSImageTransformer(nn.Module):
         mask[:, :, :target_tokens, :] = True
         text_start = target_tokens + total_ref
         mask[:, :, text_start:, :] = True
+
+        ref_spans: List[Tuple[int, int]] = []
         cursor = target_tokens
         for r_len in ref_token_lengths:
-            mask[:, :, cursor : cursor + r_len, cursor : cursor + r_len] = True
-            mask[:, :, cursor : cursor + r_len, text_start:] = True
+            ref_spans.append((cursor, cursor + r_len))
             cursor += r_len
+
+        for r_idx, (c_start, c_end) in enumerate(ref_spans):
+            mask[:, :, c_start:c_end, c_start:c_end] = True
+            mask[:, :, c_start:c_end, text_start:] = True
+            if collab_groups and r_idx < len(collab_groups):
+                for peer_idx in collab_groups[r_idx]:
+                    if 0 <= peer_idx < len(ref_spans):
+                        p_start, p_end = ref_spans[peer_idx]
+                        mask[:, :, c_start:c_end, p_start:p_end] = True
         return mask
 
     def _get_isolated_reference_mask(
@@ -1207,8 +1265,20 @@ class MOSSImageTransformer(nn.Module):
         ref_token_lengths: List[int],
         text_tokens: int,
         device: torch.device,
+        ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> torch.Tensor:
-        key = (target_tokens, tuple(ref_token_lengths), text_tokens, str(device))
+        dummy_shapes = [(1, 1) for _ in ref_token_lengths]
+        norm_boxes = _normalize_ref_bboxes(dummy_shapes, ref_bboxes)
+        collab_groups = _compute_collaborating_ref_groups(
+            len(ref_token_lengths), norm_boxes
+        )
+        key = (
+            target_tokens,
+            tuple(ref_token_lengths),
+            text_tokens,
+            collab_groups,
+            str(device),
+        )
         cached = self._isolated_mask_cache.get(key)
         if cached is not None:
             self._isolated_mask_cache.move_to_end(key)
@@ -1218,6 +1288,7 @@ class MOSSImageTransformer(nn.Module):
             ref_token_lengths=ref_token_lengths,
             text_tokens=text_tokens,
             device=device,
+            collab_groups=collab_groups,
         )
         self._isolated_mask_cache[key] = mask
         while len(self._isolated_mask_cache) > 8:
@@ -1242,6 +1313,7 @@ class MOSSImageTransformer(nn.Module):
         bias = torch.zeros(
             (1, 1, target_tokens, total_seq), dtype=dtype, device=device
         )
+
         yy = torch.arange(height, device=device, dtype=torch.float32).unsqueeze(1) + 0.5
         xx = torch.arange(width, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
         feather = max(0.25, float(feather_radius_lat))
@@ -1353,7 +1425,6 @@ class MOSSImageTransformer(nn.Module):
             or encoder_hidden_states.shape[0] != batch
         ):
             raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
-
         mask = encoder_attention_mask
         mod, head = self._compute_time_modulation(
             timestep, batch, hidden_states.device
@@ -1368,6 +1439,11 @@ class MOSSImageTransformer(nn.Module):
                 (int(r.shape[-2]), int(r.shape[-1])) for r in reference_latents
             ]
 
+        norm_boxes = _normalize_ref_bboxes(ref_shapes, reference_bboxes)
+        collab_groups = _compute_collaborating_ref_groups(
+            len(ref_shapes) if ref_shapes else 0, norm_boxes
+        )
+
         outputs: List[torch.Tensor] = []
         target_tokens = height * width
         act_dtype = _resolve_compute_dtype(self.video_embedder.weight)
@@ -1375,11 +1451,9 @@ class MOSSImageTransformer(nn.Module):
         for index in range(batch):
             video = hidden_states[index : index + 1].flatten(2).transpose(1, 2)
             video = _linear(self.video_embedder, video.to(act_dtype).contiguous())
-
             seq_parts = [video]
             total_img_tokens = target_tokens
             ref_token_lengths: List[int] = []
-
             if reference_latents:
                 for ref_lat in reference_latents:
                     r_emb = self._get_or_compute_ref_projection(
@@ -1442,7 +1516,12 @@ class MOSSImageTransformer(nn.Module):
 
             iso_kv_spec: Optional[IsoKVSpec] = None
             if reference_latents and reference_isolated_kv and ref_token_lengths:
-                iso_kv_spec = (target_tokens, tuple(ref_token_lengths), text_len)
+                iso_kv_spec = (
+                    target_tokens,
+                    tuple(ref_token_lengths),
+                    text_len,
+                    collab_groups,
+                )
 
             target_attn_bias: Optional[torch.Tensor] = None
             if (
@@ -1474,7 +1553,6 @@ class MOSSImageTransformer(nn.Module):
                         iso_kv_spec=iso_kv_spec,
                         target_attn_bias=target_attn_bias,
                     )
-
             x = self.final_norm_video(
                 x[:, :target_tokens].to(self.final_norm_video.weight.dtype)
             )
@@ -1484,6 +1562,5 @@ class MOSSImageTransformer(nn.Module):
             )
             x = _linear(self.final_linear_video, x.to(act_dtype))
             outputs.append(x.transpose(1, 2).reshape(1, -1, height, width))
-
         sample = torch.cat(outputs, dim=0)
         return TransformerOutput(sample=sample) if return_dict else (sample,)

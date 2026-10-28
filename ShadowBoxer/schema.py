@@ -13,11 +13,14 @@ SHADOWBOXER_ROOT = Path(__file__).resolve().parent
 DEFAULT_PRESET_FILENAME = "default.json"
 
 SUPPORTED_SOLVERS = ["euler", "heun", "ipndm", "sde_gpu_pp", "multitree"]
+
 SUPPORTED_MODELS = {
     "sft": "OpenMOSS-Team/MOSS-Image-SFT",
     "base": "OpenMOSS-Team/MOSS-Image-Base",
 }
+
 SUPPORTED_PROMPT_MODES = ["natural", "layout", "layout_json"]
+
 SUPPORTED_FRAMING_MODES = [
     "inscribed",
     "cover_crop",
@@ -25,7 +28,9 @@ SUPPORTED_FRAMING_MODES = [
     "stretch",
     "never_crop",
 ]
+
 SUPPORTED_INPUT_ROLES = ["photo_ref", "color_map", "depth_map", "inpaint_mask"]
+
 SUPPORTED_EDIT_FORMATS = [
     "standard",
     "moss_image_edit",
@@ -33,6 +38,7 @@ SUPPORTED_EDIT_FORMATS = [
     "ai_toolkit_full",
     "control_color_depth",
 ]
+
 SUPPORTED_MASK_BLEND_MODES = [
     "auto",
     "union",
@@ -48,21 +54,23 @@ DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = [
         "caption": "A sleek brushed-steel refrigerator door with a small yellow sticky note",
         "bbox": [32, 48, 992, 592],
         "enabled": True,
+        "z_order": 1,
     },
     {
         "category": "text",
         "text": "Remember to test SFT & Base permutations @ 1024x1024",
         "bbox": [288, 144, 544, 480],
         "enabled": True,
+        "z_order": 3,
     },
     {
         "category": "bowl",
         "caption": "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
         "bbox": [592, 608, 976, 976],
         "enabled": True,
+        "z_order": 2,
     },
 ]
-DEFAULT_LAYOUT_BOXES = DEFAULT_LAYOUT_ITEMS
 
 BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "model_variant": "sft",
@@ -84,7 +92,7 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "early_cfg": 3.2,
     "late_cfg": 2.8,
     "uncond_skip_layers": [24],
-    "slg_layers": [],
+    "slg_layers": [24],
     "slg_scale": 0.0,
     "slg_start": 0.20,
     "slg_stop": 0.70,
@@ -137,6 +145,7 @@ _INTERNAL_BOX_KEYS = {
     "inpaint_box",
     "isolate_box_attn",
     "paste_to_canvas",
+    "z_order",
     "id",
     "label",
     "enabled",
@@ -215,6 +224,55 @@ def bbox_to_normalized(
     )
 
 
+def canonical_box_sort_key(
+    item: Dict[str, Any],
+    height: int = 1024,
+    width: int = 1024,
+    coords_are_pixels: bool = True,
+) -> Tuple[float, float, float, float, float, str, str, str]:
+    bbox = item.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        uy0, ux0, uy1, ux1 = bbox_to_normalized(
+            bbox, height=height, width=width, coords_are_pixels=coords_are_pixels
+        )
+    else:
+        uy0, ux0, uy1, ux1 = 0.0, 0.0, 1.0, 1.0
+    area = round((uy1 - uy0) * (ux1 - ux0), 6)
+    uyc = round(0.5 * (uy0 + uy1), 6)
+    uxc = round(0.5 * (ux0 + ux1), 6)
+    cat = str(item.get("category") or ("text" if "text" in item else "region")).strip()
+    body = str(item.get("text") if "text" in item else (item.get("caption") or "")).strip()
+    img_p = str(
+        item.get("image_path") or item.get("image") or item.get("vizj_path") or ""
+    ).strip()
+    return (-area, uyc, uxc, round(uy0, 6), round(ux0, 6), cat, body, img_p)
+
+
+def get_canonical_box_order(
+    items: Sequence[Dict[str, Any]],
+    height: int = 1024,
+    width: int = 1024,
+    coords_are_pixels: bool = True,
+) -> List[int]:
+    keyed: List[Tuple[Tuple[Any, ...], int]] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict) or item.get("enabled", True) is False:
+            continue
+        keyed.append(
+            (
+                canonical_box_sort_key(
+                    item,
+                    height=height,
+                    width=width,
+                    coords_are_pixels=coords_are_pixels,
+                ),
+                idx,
+            )
+        )
+    keyed.sort(key=lambda pair: pair[0])
+    return [idx for _, idx in keyed]
+
+
 def reconcile_layout_summary_quotes(
     caption: str,
     active_texts: Sequence[str],
@@ -254,10 +312,12 @@ def compile_layout_prompt(
 ) -> str:
     normalized_items: List[Dict[str, Any]] = []
     active_texts: List[str] = []
+    canonical_indices = get_canonical_box_order(
+        items, height=height, width=width, coords_are_pixels=coords_are_pixels
+    )
 
-    for idx, item in enumerate(items):
-        if not isinstance(item, dict) or item.get("enabled", True) is False:
-            continue
+    for idx in canonical_indices:
+        item = items[idx]
         raw_entry = dict(item)
         bbox = raw_entry.get("bbox")
         clean_entry: Dict[str, Any] = {}
@@ -267,24 +327,20 @@ def compile_layout_prompt(
             if isinstance(v, str) and not v.strip():
                 continue
             clean_entry[k] = v
-
         if "category" not in clean_entry:
             clean_entry["category"] = "text" if "text" in clean_entry else "region"
-
         if clean_entry.get("category") == "text" and isinstance(
             clean_entry.get("text"), str
         ):
             txt_val = clean_entry["text"].strip()
             if txt_val:
                 active_texts.append(txt_val)
-
         if (
             box_picture_map
             and idx in box_picture_map
             and "reference" not in clean_entry
         ):
             clean_entry["reference"] = f"Picture {box_picture_map[idx]}"
-
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
             v0, v1, v2, v3 = (
                 float(bbox[0]),
@@ -316,7 +372,6 @@ def compile_layout_prompt(
                 )
             else:
                 clean_entry["bbox"] = [int(round(v)) for v in (v0, v1, v2, v3)]
-
         normalized_items.append(clean_entry)
 
     reconciled_caption = reconcile_layout_summary_quotes(caption, active_texts)
@@ -380,7 +435,10 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 str(val) if (isinstance(val, str) and val.strip()) else None
             )
 
-    if "layout_coords_are_pixels" in data and data["layout_coords_are_pixels"] is not None:
+    if (
+        "layout_coords_are_pixels" in data
+        and data["layout_coords_are_pixels"] is not None
+    ):
         harvested["layout_coords_are_pixels"] = bool(data["layout_coords_are_pixels"])
 
     for dim_key in ("height", "width"):
@@ -608,7 +666,6 @@ def has_custom_default_preset() -> bool:
 class GenerationRequest(BaseModel):
     model_variant: str = Field(default="sft")
     repo_id: Optional[str] = Field(default=None)
-
     prompt: str = Field(default="")
     negative_prompt: str = Field(default="")
     system_prompt: Optional[str] = Field(default=None)
@@ -624,7 +681,6 @@ class GenerationRequest(BaseModel):
 
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1024, ge=256, le=2048)
-
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     shift: Optional[float] = Field(default=None, ge=0.1, le=20.0)
     use_v2_grid: Optional[bool] = Field(default=None)
@@ -675,7 +731,6 @@ class GenerationRequest(BaseModel):
     uncond_uses_references: Optional[bool] = Field(default=None)
     edit_lora_path: Optional[str] = Field(default=None)
     edit_lora_scale: float = Field(default=1.0, ge=0.0, le=4.0)
-
     export_vizj_path: Optional[str] = Field(default=None)
     export_vizj_tier: int = Field(default=2, ge=0, le=2)
 
@@ -685,16 +740,6 @@ class GenerationRequest(BaseModel):
     device: str = Field(default="cuda")
     cpu_offload: Optional[bool] = Field(default=None)
     prepass_warmup: Optional[bool] = Field(default=None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_legacy_keys(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            out = dict(data)
-            if "layout_boxes" in out and "layout_items" not in out:
-                out["layout_items"] = out.pop("layout_boxes")
-            return out
-        return data
 
     @field_validator("uncond_skip_layers", "slg_layers", mode="before")
     @classmethod
@@ -729,12 +774,10 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]
         ):
             self.num_inference_steps = int(active["num_inference_steps"])
-
         if self.shift is None or (
             use_custom and self.shift == BASELINE_ENGINE_DEFAULTS["shift"]
         ):
             self.shift = float(active["shift"])
-
         if self.use_v2_grid is None or (
             use_custom and self.use_v2_grid == BASELINE_ENGINE_DEFAULTS["use_v2_grid"]
         ):
@@ -745,12 +788,10 @@ class GenerationRequest(BaseModel):
             and self.early_solver == BASELINE_ENGINE_DEFAULTS["early_solver"]
         ):
             self.early_solver = str(active["early_solver"])
-
         if self.late_solver is None or (
             use_custom and self.late_solver == BASELINE_ENGINE_DEFAULTS["late_solver"]
         ):
             self.late_solver = str(active["late_solver"])
-
         if self.handoff_threshold is None or (
             use_custom
             and self.handoff_threshold
@@ -784,22 +825,18 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"]
         ):
             self.uncond_skip_layers = list(active["uncond_skip_layers"])
-
         if self.slg_layers is None or (
             use_custom and self.slg_layers == BASELINE_ENGINE_DEFAULTS["slg_layers"]
         ):
             self.slg_layers = list(active["slg_layers"])
-
         if self.slg_scale is None or (
             use_custom and self.slg_scale == BASELINE_ENGINE_DEFAULTS["slg_scale"]
         ):
             self.slg_scale = float(active["slg_scale"])
-
         if self.slg_start is None or (
             use_custom and self.slg_start == BASELINE_ENGINE_DEFAULTS["slg_start"]
         ):
             self.slg_start = float(active["slg_start"])
-
         if self.slg_stop is None or (
             use_custom and self.slg_stop == BASELINE_ENGINE_DEFAULTS["slg_stop"]
         ):
@@ -809,7 +846,6 @@ class GenerationRequest(BaseModel):
             use_custom and self.eta == BASELINE_ENGINE_DEFAULTS["eta"]
         ):
             self.eta = float(active["eta"])
-
         if self.s_noise is None or (
             use_custom and self.s_noise == BASELINE_ENGINE_DEFAULTS["s_noise"]
         ):
@@ -821,7 +857,6 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["max_sequence_length"]
         ):
             self.max_sequence_length = int(active["max_sequence_length"])
-
         if self.enable_thinking is None or (
             use_custom
             and self.enable_thinking == BASELINE_ENGINE_DEFAULTS["enable_thinking"]
@@ -833,23 +868,19 @@ class GenerationRequest(BaseModel):
             and self.framing_mode == BASELINE_ENGINE_DEFAULTS["framing_mode"]
         ):
             self.framing_mode = str(active["framing_mode"])
-
         if self.input_role is None or (
             use_custom and self.input_role == BASELINE_ENGINE_DEFAULTS["input_role"]
         ):
             self.input_role = str(active["input_role"])
-
         if self.edit_format is None or (
             use_custom and self.edit_format == BASELINE_ENGINE_DEFAULTS["edit_format"]
         ):
             self.edit_format = str(active["edit_format"])
-
         if self.mask_blend_mode is None or (
             use_custom
             and self.mask_blend_mode == BASELINE_ENGINE_DEFAULTS["mask_blend_mode"]
         ):
             self.mask_blend_mode = str(active.get("mask_blend_mode", "auto"))
-
         if self.invert_inpaint_mask is None or (
             use_custom
             and self.invert_inpaint_mask
@@ -858,56 +889,47 @@ class GenerationRequest(BaseModel):
             self.invert_inpaint_mask = bool(
                 active.get("invert_inpaint_mask", False)
             )
-
         if self.max_vit_patches is None or (
             use_custom
             and self.max_vit_patches == BASELINE_ENGINE_DEFAULTS["max_vit_patches"]
         ):
             self.max_vit_patches = int(active["max_vit_patches"])
-
         if self.deband_8bit is None or (
             use_custom and self.deband_8bit == BASELINE_ENGINE_DEFAULTS["deband_8bit"]
         ):
             self.deband_8bit = bool(active["deband_8bit"])
-
         if self.prefer_vulkan is None or (
             use_custom
             and self.prefer_vulkan == BASELINE_ENGINE_DEFAULTS["prefer_vulkan"]
         ):
             self.prefer_vulkan = bool(active["prefer_vulkan"])
-
         if self.mtf_boost is None or (
             use_custom and self.mtf_boost == BASELINE_ENGINE_DEFAULTS["mtf_boost"]
         ):
             self.mtf_boost = float(active["mtf_boost"])
-
         if self.soft_knee_tau is None or (
             use_custom
             and self.soft_knee_tau == BASELINE_ENGINE_DEFAULTS["soft_knee_tau"]
         ):
             self.soft_knee_tau = float(active["soft_knee_tau"])
-
         if self.mask_feather_radius is None or (
             use_custom
             and self.mask_feather_radius
             == BASELINE_ENGINE_DEFAULTS["mask_feather_radius"]
         ):
             self.mask_feather_radius = float(active["mask_feather_radius"])
-
         if self.latent_clamp_sigma is None or (
             use_custom
             and self.latent_clamp_sigma
             == BASELINE_ENGINE_DEFAULTS["latent_clamp_sigma"]
         ):
             self.latent_clamp_sigma = float(active["latent_clamp_sigma"])
-
         if self.apply_bayer_dither is None or (
             use_custom
             and self.apply_bayer_dither
             == BASELINE_ENGINE_DEFAULTS["apply_bayer_dither"]
         ):
             self.apply_bayer_dither = bool(active["apply_bayer_dither"])
-
         if self.use_reference_cache is None or (
             use_custom
             and self.use_reference_cache
@@ -923,14 +945,12 @@ class GenerationRequest(BaseModel):
             self.preserve_canvas_outside_boxes = bool(
                 active.get("preserve_canvas_outside_boxes", False)
             )
-
         if self.box_attn_isolation is None or (
             use_custom
             and self.box_attn_isolation
             == BASELINE_ENGINE_DEFAULTS["box_attn_isolation"]
         ):
             self.box_attn_isolation = float(active.get("box_attn_isolation", 0.0))
-
         if self.composite_box_images_to_init is None or (
             use_custom
             and self.composite_box_images_to_init
@@ -939,7 +959,6 @@ class GenerationRequest(BaseModel):
             self.composite_box_images_to_init = bool(
                 active.get("composite_box_images_to_init", False)
             )
-
         if (
             self.uncond_uses_references is None
             and active.get("uncond_uses_references") is not None
@@ -950,13 +969,11 @@ class GenerationRequest(BaseModel):
             use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]
         ):
             self.cpu_offload = bool(active["cpu_offload"])
-
         if self.prepass_warmup is None or (
             use_custom
             and self.prepass_warmup == BASELINE_ENGINE_DEFAULTS["prepass_warmup"]
         ):
             self.prepass_warmup = bool(active["prepass_warmup"])
-
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1020,9 +1037,15 @@ class GenerationRequest(BaseModel):
                     }
                 )
 
-        for idx, item in enumerate(self.layout_items):
-            if not isinstance(item, dict) or item.get("enabled", True) is False:
-                continue
+        canonical_indices = get_canonical_box_order(
+            self.layout_items,
+            height=self.height,
+            width=self.width,
+            coords_are_pixels=self.layout_coords_are_pixels,
+        )
+
+        for idx in canonical_indices:
+            item = self.layout_items[idx]
             img_p = (
                 item.get("image_path")
                 or item.get("image")
@@ -1110,7 +1133,6 @@ class GenerationRequest(BaseModel):
                     "denoise_strength": box_dn,
                 }
             )
-
         return specs, box_pic_map
 
     @property
@@ -1256,7 +1278,6 @@ class GenerationResponse(BaseModel):
     s_noise_used: float
     enable_thinking_used: bool
     viztoken_active: bool = Field(default=True)
-    tiktalkin_active: bool = Field(default=True)
     vizinjector_active: bool = Field(default=False)
     vizinjector_backend: str = Field(default="PyTorch Fallback")
     prompt_cache_hit: bool

@@ -1,4 +1,3 @@
-// webui/assets/app.js
 (() => {
   "use strict";
 
@@ -11,6 +10,7 @@
       caption: "A sleek brushed-steel refrigerator door with a small yellow sticky note",
       bbox: [32, 48, 992, 592],
       enabled: true,
+      z_order: 1,
       inpaint_box: false,
       paste_to_canvas: false,
       image_path: "",
@@ -24,6 +24,7 @@
       text: "Remember to test SFT & Base permutations @ 1024x1024",
       bbox: [288, 144, 544, 480],
       enabled: true,
+      z_order: 3,
       inpaint_box: false,
       paste_to_canvas: false,
       image_path: "",
@@ -37,6 +38,7 @@
       caption: "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
       bbox: [592, 608, 976, 976],
       enabled: true,
+      z_order: 2,
       inpaint_box: false,
       paste_to_canvas: false,
       image_path: "",
@@ -47,12 +49,15 @@
     }
   ];
 
+  const MAX_MASK_HISTORY = 20;
+
   const state = {
     token: localStorage.getItem("vs_session_token") || "",
     user: null,
     themes: {},
     engineDefaults: {},
     layoutItems: JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS)),
+    selectedBoxIndex: 0,
     references: [],
     projects: [],
     gallery: [],
@@ -69,8 +74,13 @@
     lastTelemetry: null,
     activeJobId: null,
     activeEventSource: null,
+    showViewportHud: false,
+    showCompareSplit: false,
     brushMode: "paint",
-    isPainting: false
+    isPainting: false,
+    lastPaintPt: null,
+    maskUndoStack: [],
+    maskRedoStack: []
   };
 
   const el = (id) => document.getElementById(id);
@@ -124,6 +134,70 @@
     return x || 1;
   }
 
+  function ensureBoxZOrders() {
+    state.layoutItems.forEach((b, idx) => {
+      if (typeof b.z_order !== "number" || Number.isNaN(b.z_order)) {
+        b.z_order = idx + 1;
+      }
+    });
+  }
+
+  function snapCoord(val, maxDim, bypassSnap = false) {
+    const clamped = Math.max(0, Math.min(maxDim, Math.round(val)));
+    const snapEnabled = el("snapGridCheck") ? el("snapGridCheck").checked : true;
+    if (!snapEnabled || bypassSnap) return clamped;
+    return Math.max(0, Math.min(maxDim, Math.round(clamped / 16) * 16));
+  }
+
+  function pixelToAbsCentralized(ymin, xmin, ymax, xmax, height, width) {
+    const cy = Math.floor(height / 2);
+    const cx = Math.floor(width / 2);
+    return [
+      Math.round(ymin) - cy,
+      Math.round(xmin) - cx,
+      Math.round(ymax) - cy,
+      Math.round(xmax) - cx
+    ];
+  }
+
+  function canonicalBoxSortKey(item, height, width) {
+    const bbox = Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox : [0, 0, height, width];
+    const hDenom = Math.max(1, height);
+    const wDenom = Math.max(1, width);
+    const uy0 = Math.max(0.0, Math.min(1.0, Math.min(bbox[0], bbox[2]) / hDenom));
+    const ux0 = Math.max(0.0, Math.min(1.0, Math.min(bbox[1], bbox[3]) / wDenom));
+    const uy1 = Math.max(uy0, Math.min(1.0, Math.max(bbox[0], bbox[2]) / hDenom));
+    const ux1 = Math.max(ux0, Math.min(1.0, Math.max(bbox[1], bbox[3]) / wDenom));
+    const area = Number(((uy1 - uy0) * (ux1 - ux0)).toFixed(6));
+    const uyc = Number((0.5 * (uy0 + uy1)).toFixed(6));
+    const uxc = Number((0.5 * (ux0 + ux1)).toFixed(6));
+    const cat = String(item.category || (item.text !== undefined ? "text" : "region")).trim();
+    const body = String(item.text !== undefined ? item.text : (item.caption || "")).trim();
+    const img = String(item.image_path || "").trim();
+    return [-area, uyc, uxc, Number(uy0.toFixed(6)), Number(ux0.toFixed(6)), cat, body, img];
+  }
+
+  function compareCanonicalKeys(ka, kb) {
+    for (let i = 0; i < ka.length; i++) {
+      if (ka[i] < kb[i]) return -1;
+      if (ka[i] > kb[i]) return 1;
+    }
+    return 0;
+  }
+
+  function getCanonicalEnabledBoxIndices(height, width) {
+    const keyed = [];
+    state.layoutItems.forEach((item, idx) => {
+      if (!item || item.enabled === false) return;
+      keyed.push({
+        idx,
+        key: canonicalBoxSortKey(item, height, width)
+      });
+    });
+    keyed.sort((a, b) => compareCanonicalKeys(a.key, b.key));
+    return keyed.map((entry) => entry.idx);
+  }
+
   function updateProjectBadge() {
     const badge = el("activeProjectBadge");
     if (!badge) return;
@@ -135,19 +209,23 @@
     }
   }
 
-  function computeStageGeometry() {
+  function resolveContainerBounds(containerId, fallbackSize = 512) {
+    const node = el(containerId);
+    if (!node) return { availW: fallbackSize, availH: fallbackSize };
+    const rect = node.getBoundingClientRect();
+    const availW = rect.width > 64 ? rect.width - 40 : fallbackSize;
+    const availH = rect.height > 64 ? rect.height - 40 : fallbackSize;
+    return { availW: Math.max(240, availW), availH: Math.max(240, availH) };
+  }
+
+  function computeStageGeometry(containerId = "spatialStageContainer") {
     const canvasW = Math.max(256, Math.min(2048, parseInt(el("widthInput").value, 10) || 1024));
     const canvasH = Math.max(256, Math.min(2048, parseInt(el("heightInput").value, 10) || 1024));
-    const maxStagePx = 512;
-    let stageW = maxStagePx;
-    let stageH = maxStagePx;
-    if (canvasW >= canvasH) {
-      stageW = maxStagePx;
-      stageH = Math.max(128, Math.round((maxStagePx * canvasH) / canvasW));
-    } else {
-      stageH = maxStagePx;
-      stageW = Math.max(128, Math.round((maxStagePx * canvasW) / canvasH));
-    }
+    const { availW, availH } = resolveContainerBounds(containerId, 560);
+    const fitScale = Math.min(availW / canvasW, availH / canvasH);
+    const stageW = Math.max(192, Math.round(canvasW * fitScale));
+    const stageH = Math.max(192, Math.round(canvasH * fitScale));
+
     const div = gcd(canvasW / 16, canvasH / 16);
     const arW = Math.round((canvasW / 16) / div);
     const arH = Math.round((canvasH / 16) / div);
@@ -155,6 +233,11 @@
     if (badge) {
       badge.textContent = `${canvasW}x${canvasH} (${arW}:${arH})`;
     }
+    const hudReadout = el("spatialHudReadout");
+    if (hudReadout) {
+      hudReadout.textContent = `Latent Grid: ${canvasW / 16}x${canvasH / 16} (16px stride)`;
+    }
+
     return {
       canvasW,
       canvasH,
@@ -191,6 +274,10 @@
     const url = resolveUnderlayUrl();
     const layoutImg = el("spatialUnderlayImg");
     const inpaintImg = el("inpaintUnderlayImg");
+    const viewportUnderlay = el("viewportUnderlayImage");
+    const compareBtn = el("toggleCompareSplitBtn");
+    const compareSlider = el("viewportCompareSlider");
+    const masterImg = el("masterOutputImage");
     const layoutOp = parseFloat(el("layoutUnderlayOpacity").value) || 0.45;
     const inpaintOp = parseFloat(el("inpaintUnderlayOpacity").value) || 0.55;
 
@@ -210,6 +297,27 @@
         inpaintImg.hidden = false;
       } else {
         inpaintImg.hidden = true;
+      }
+    }
+    if (compareBtn) {
+      const hasMaster = Boolean(masterImg && !masterImg.hidden && masterImg.getAttribute("src"));
+      compareBtn.hidden = !(hasMaster && url);
+      if (!url && state.showCompareSplit) {
+        state.showCompareSplit = false;
+        compareBtn.classList.remove("active");
+      }
+    }
+    if (viewportUnderlay && masterImg && compareSlider) {
+      if (state.showCompareSplit && url && !masterImg.hidden) {
+        viewportUnderlay.src = url;
+        viewportUnderlay.hidden = false;
+        compareSlider.hidden = false;
+        const pct = parseFloat(compareSlider.value) || 50;
+        masterImg.style.clipPath = `inset(0 0 0 ${pct}%)`;
+      } else {
+        viewportUnderlay.hidden = true;
+        compareSlider.hidden = true;
+        masterImg.style.clipPath = "";
       }
     }
   }
@@ -249,14 +357,19 @@
     if (!el("syncQuotesCheck") || !el("syncQuotesCheck").checked) return;
     if (!newText || !newText.trim()) return;
     const targetOld = (oldText || "").trim();
+    const width = parseInt(el("widthInput").value, 10) || 1024;
+    const height = parseInt(el("heightInput").value, 10) || 1024;
+    const canonicalIndices = getCanonicalEnabledBoxIndices(height, width);
+
     for (const inputId of ["promptInput", "layoutSummaryInput"]) {
       const field = el(inputId);
       if (!field || !field.value) continue;
       if (targetOld && field.value.includes(`"${targetOld}"`)) {
         field.value = field.value.replace(`"${targetOld}"`, `"${newText}"`);
       } else {
-        const activeTexts = state.layoutItems
-          .filter((b) => b.enabled !== false && (b.category === "text" || b.text !== undefined) && String(b.text || "").trim())
+        const activeTexts = canonicalIndices
+          .map((idx) => state.layoutItems[idx])
+          .filter((b) => (b.category === "text" || b.text !== undefined) && String(b.text || "").trim())
           .map((b) => String(b.text).trim());
         field.value = reconcileSummaryQuotesJs(field.value, activeTexts);
       }
@@ -337,7 +450,7 @@
     if (Array.isArray(defaults.uncond_skip_layers)) {
       el("skipLayersInput").value = defaults.uncond_skip_layers.join(", ");
     }
-    if (Array.isArray(defaults.slg_layers)) {
+    if (Array.isArray(defaults.slg_layers) && defaults.slg_layers.length > 0) {
       el("slgLayersInput").value = defaults.slg_layers.join(", ");
     }
     if (defaults.slg_scale !== undefined) el("slgScaleInput").value = defaults.slg_scale;
@@ -385,7 +498,7 @@
     } else {
       el("editLoraSelect").value = "";
     }
-    if (defaults.edit_lora_scale !== undefined) el("loraScaleInput").value = defaults.edit_lora_scale;
+    if (defaults.edit_lora_scale !== undefined) el("loraScaleInput").value = defaults.lora_scale ?? defaults.edit_lora_scale;
     renderBindingsCard();
   }
 
@@ -459,12 +572,15 @@
         }
         applyThemeVariables(data.theme.theme_id);
       }
+
       if (data.engine_defaults && Object.keys(state.engineDefaults).length === 0) {
         applyEngineDefaultsToDeck(data.engine_defaults);
       }
       if (Array.isArray(data.default_layout_items) && data.default_layout_items.length > 0 && state.layoutItems.length === 0) {
         state.layoutItems = JSON.parse(JSON.stringify(data.default_layout_items));
+        ensureBoxZOrders();
       }
+
       state.gallery = Array.isArray(data.images) ? data.images : [];
       renderGallery();
       await Promise.all([refreshReferences(), refreshProjects()]);
@@ -511,8 +627,9 @@
     }
 
     if (!activeSources.length) {
-      return hasSplatBoxes && !hasInit ? "Box Splatting (Soft Feather Alpha)" : "Img2Img Full-Canvas Denoise";
+      return hasSplatBoxes && !hasInit ? "Commutative Box Splatting (Soft Feather)" : "Img2Img Full-Canvas Denoise";
     }
+
     const opStr = activeSources.length > 1 ? ` [${blendMode.toUpperCase()}]` : "";
     const invStr = invert ? " (INVERTED)" : "";
     return `${activeSources.join(" + ")}${opStr}${invStr}`;
@@ -556,7 +673,6 @@
     const container = el("referenceList");
     const badge = el("assetCountBadge");
     if (badge) badge.textContent = String(state.references.length);
-
     if (!state.references.length) {
       container.innerHTML = `<div class="muted-note">No reference assets staged in your user vault.</div>`;
       return;
@@ -574,7 +690,7 @@
       card.innerHTML = `
         <div class="ref-card-top">
           <span title="${ref.ref_id}">${ref.ref_id}</span>
-          <button class="btn-link" data-del-ref="${ref.ref_id}">Delete</button>
+          <button type="button" class="btn-link" data-del-ref="${ref.ref_id}">Delete</button>
         </div>
         <div class="ref-meta-badges">
           <span class="meta-tag">${dimsLabel}</span>
@@ -583,10 +699,10 @@
           ${vizjBadge}
         </div>
         <div class="ref-bind-btns">
-          <button class="btn btn-secondary compact-btn ${isGlobalRef ? "active" : ""}" data-bind-role="ref" data-ref-id="${ref.ref_id}">4D Ref</button>
-          <button class="btn btn-secondary compact-btn ${state.bindings.init_image_path === ref.ref_id ? "active" : ""}" data-bind-role="init" data-ref-id="${ref.ref_id}">Init Img</button>
-          <button class="btn btn-secondary compact-btn ${state.bindings.inpaint_mask_path === ref.ref_id ? "active" : ""}" data-bind-role="mask" data-ref-id="${ref.ref_id}">Mask</button>
-          <button class="btn btn-secondary compact-btn ${state.bindings.control_image_path === ref.ref_id ? "active" : ""}" data-bind-role="ctrl" data-ref-id="${ref.ref_id}">Control</button>
+          <button type="button" class="btn btn-secondary compact-btn ${isGlobalRef ? "active" : ""}" data-bind-role="ref" data-ref-id="${ref.ref_id}">4D Ref</button>
+          <button type="button" class="btn btn-secondary compact-btn ${state.bindings.init_image_path === ref.ref_id ? "active" : ""}" data-bind-role="init" data-ref-id="${ref.ref_id}">Init Img</button>
+          <button type="button" class="btn btn-secondary compact-btn ${state.bindings.inpaint_mask_path === ref.ref_id ? "active" : ""}" data-bind-role="mask" data-ref-id="${ref.ref_id}">Mask</button>
+          <button type="button" class="btn btn-secondary compact-btn ${state.bindings.control_image_path === ref.ref_id ? "active" : ""}" data-bind-role="ctrl" data-ref-id="${ref.ref_id}">Control</button>
         </div>
       `;
       container.appendChild(card);
@@ -648,12 +764,10 @@
     const badge = el("projectCountBadge");
     if (badge) badge.textContent = String(state.projects.length);
     if (!container) return;
-
     if (!state.projects.length) {
       container.innerHTML = `<div class="muted-note">Save a project to bundle your layout boxes, prompt, mask canvas, and reference assets.</div>`;
       return;
     }
-
     container.innerHTML = "";
     for (const proj of state.projects) {
       const card = document.createElement("div");
@@ -666,7 +780,7 @@
       card.innerHTML = `
         <div class="project-card-top">
           <span class="project-title-text" title="${proj.title || proj.project_id}">${proj.title || proj.project_id}</span>
-          <button class="btn-link" data-del-proj="${proj.project_id}">Delete</button>
+          <button type="button" class="btn-link" data-del-proj="${proj.project_id}">Delete</button>
         </div>
         <div class="ref-meta-badges">
           <span class="meta-tag">${(proj.model_variant || "sft").toUpperCase()}</span>
@@ -675,7 +789,7 @@
           <span class="meta-tag">${sizeKb} KB</span>
         </div>
         <div class="project-actions">
-          <button class="btn btn-secondary compact-btn" data-load-proj="${proj.project_id}">Load Project</button>
+          <button type="button" class="btn btn-secondary compact-btn" data-load-proj="${proj.project_id}">Load Project</button>
           <a class="btn btn-secondary compact-btn" href="${dlHref}" download="${proj.project_id}.vsproj">Export .VSPROJ</a>
         </div>
       `;
@@ -703,12 +817,59 @@
     });
   }
 
+  function pushMaskHistorySnapshot() {
+    const canvas = el("inpaintCanvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    state.maskUndoStack.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    if (state.maskUndoStack.length > MAX_MASK_HISTORY) {
+      state.maskUndoStack.shift();
+    }
+    state.maskRedoStack.length = 0;
+    updateMaskHistoryButtons();
+  }
+
+  function updateMaskHistoryButtons() {
+    const undoBtn = el("undoMaskBtn");
+    const redoBtn = el("redoMaskBtn");
+    if (undoBtn) undoBtn.disabled = state.maskUndoStack.length === 0;
+    if (redoBtn) redoBtn.disabled = state.maskRedoStack.length === 0;
+  }
+
+  function undoMaskStroke() {
+    const canvas = el("inpaintCanvas");
+    if (!canvas || state.maskUndoStack.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    state.maskRedoStack.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    const prev = state.maskUndoStack.pop();
+    if (prev.width !== canvas.width || prev.height !== canvas.height) {
+      canvas.width = prev.width;
+      canvas.height = prev.height;
+    }
+    ctx.putImageData(prev, 0, 0);
+    updateMaskHistoryButtons();
+  }
+
+  function redoMaskStroke() {
+    const canvas = el("inpaintCanvas");
+    if (!canvas || state.maskRedoStack.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    state.maskUndoStack.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    const next = state.maskRedoStack.pop();
+    if (next.width !== canvas.width || next.height !== canvas.height) {
+      canvas.width = next.width;
+      canvas.height = next.height;
+    }
+    ctx.putImageData(next, 0, 0);
+    updateMaskHistoryButtons();
+  }
+
   function hasInpaintCanvasContent() {
     const canvas = el("inpaintCanvas");
     if (!canvas) return false;
     const ctx = canvas.getContext("2d");
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let i = 0; i < data.length; i += 16) {
+    for (let i = 0; i < data.length; i += 32) {
       if (data[i] > 4) return true;
     }
     return false;
@@ -720,6 +881,7 @@
     const ctx = canvas.getContext("2d");
     const img = new Image();
     img.onload = () => {
+      pushMaskHistorySnapshot();
       ctx.fillStyle = "#000000";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
@@ -737,6 +899,8 @@
     el("negativePromptInput").value = "";
     el("layoutSummaryInput").value = "";
     state.layoutItems = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+    ensureBoxZOrders();
+    state.selectedBoxIndex = 0;
     state.bindings.init_image_path = null;
     state.bindings.inpaint_mask_path = null;
     state.bindings.control_image_path = null;
@@ -746,6 +910,9 @@
       const ctx = canvas.getContext("2d");
       ctx.fillStyle = "#000000";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
+      state.maskUndoStack.length = 0;
+      state.maskRedoStack.length = 0;
+      updateMaskHistoryButtons();
     }
     updateProjectBadge();
     renderBindingsCard();
@@ -763,7 +930,6 @@
     const expBtn = el("exportProjectBtn");
     saveBtn.disabled = true;
     expBtn.disabled = true;
-
     try {
       const draft = collectDeckPayload();
       const canvas = el("inpaintCanvas");
@@ -936,10 +1102,10 @@
       const sy = cleanH / oldH;
       for (const b of state.layoutItems) {
         if (Array.isArray(b.bbox) && b.bbox.length === 4) {
-          const ny0 = Math.max(0, Math.min(cleanH - 16, Math.round(b.bbox[0] * sy)));
-          const nx0 = Math.max(0, Math.min(cleanW - 16, Math.round(b.bbox[1] * sx)));
-          const ny1 = Math.max(ny0 + 16, Math.min(cleanH, Math.round(b.bbox[2] * sy)));
-          const nx1 = Math.max(nx0 + 16, Math.min(cleanW, Math.round(b.bbox[3] * sx)));
+          const ny0 = snapCoord(b.bbox[0] * sy, cleanH - 16);
+          const nx0 = snapCoord(b.bbox[1] * sx, cleanW - 16);
+          const ny1 = Math.max(ny0 + 16, snapCoord(b.bbox[2] * sy, cleanH));
+          const nx1 = Math.max(nx0 + 16, snapCoord(b.bbox[3] * sx, cleanW));
           b.bbox = [ny0, nx0, ny1, nx1];
         }
       }
@@ -949,38 +1115,43 @@
   }
 
   function syncStageAspectAndGuides() {
-    const geom = computeStageGeometry();
+    const layoutGeom = computeStageGeometry("spatialStageContainer");
     const spatialStage = el("spatialStage");
     if (spatialStage) {
-      spatialStage.style.width = `${geom.stageW}px`;
-      spatialStage.style.height = `${geom.stageH}px`;
+      spatialStage.style.width = `${layoutGeom.stageW}px`;
+      spatialStage.style.height = `${layoutGeom.stageH}px`;
+      const cellPxX = Math.max(4, layoutGeom.stageW / (layoutGeom.canvasW / 16));
+      const cellPxY = Math.max(4, layoutGeom.stageH / (layoutGeom.canvasH / 16));
+      spatialStage.style.backgroundSize = `${cellPxX}px ${cellPxY}px`;
     }
 
+    const inpaintGeom = computeStageGeometry("inpaintStageWrap");
     const inpaintContainer = el("inpaintStageContainer");
     const inpaintCanvas = el("inpaintCanvas");
     if (inpaintContainer && inpaintCanvas) {
-      inpaintContainer.style.width = `${geom.stageW}px`;
-      inpaintContainer.style.height = `${geom.stageH}px`;
-      if (inpaintCanvas.width !== geom.stageW || inpaintCanvas.height !== geom.stageH) {
+      inpaintContainer.style.width = `${inpaintGeom.stageW}px`;
+      inpaintContainer.style.height = `${inpaintGeom.stageH}px`;
+      if (inpaintCanvas.width !== inpaintGeom.canvasW || inpaintCanvas.height !== inpaintGeom.canvasH) {
         const tmp = document.createElement("canvas");
         tmp.width = inpaintCanvas.width;
         tmp.height = inpaintCanvas.height;
         tmp.getContext("2d").drawImage(inpaintCanvas, 0, 0);
-        inpaintCanvas.width = geom.stageW;
-        inpaintCanvas.height = geom.stageH;
+        inpaintCanvas.width = inpaintGeom.canvasW;
+        inpaintCanvas.height = inpaintGeom.canvasH;
         const ctx = inpaintCanvas.getContext("2d");
         ctx.fillStyle = "#000000";
-        ctx.fillRect(0, 0, geom.stageW, geom.stageH);
-        ctx.drawImage(tmp, 0, 0, geom.stageW, geom.stageH);
+        ctx.fillRect(0, 0, inpaintGeom.canvasW, inpaintGeom.canvasH);
+        ctx.drawImage(tmp, 0, 0, inpaintGeom.canvasW, inpaintGeom.canvasH);
       }
     }
-    renderInpaintBoxGuides(geom);
+    renderInpaintBoxGuides(inpaintGeom);
+    renderViewportBoxesHud();
   }
 
   function renderInpaintBoxGuides(geomInput) {
     const overlay = el("inpaintBoxesOverlay");
     if (!overlay) return;
-    const geom = geomInput || computeStageGeometry();
+    const geom = geomInput || computeStageGeometry("inpaintStageWrap");
     overlay.innerHTML = "";
     state.layoutItems.forEach((item, idx) => {
       if (item.enabled === false || !Array.isArray(item.bbox) || item.bbox.length !== 4) return;
@@ -989,10 +1160,36 @@
       guide.className = "inpaint-box-guide";
       guide.style.top = `${Math.round(ymin * geom.scaleY)}px`;
       guide.style.left = `${Math.round(xmin * geom.scaleX)}px`;
-      guide.style.width = `${Math.max(16, Math.round((xmax - xmin) * geom.scaleX))}px`;
-      guide.style.height = `${Math.max(16, Math.round((ymax - ymin) * geom.scaleY))}px`;
+      guide.style.width = `${Math.max(12, Math.round((xmax - xmin) * geom.scaleX))}px`;
+      guide.style.height = `${Math.max(12, Math.round((ymax - ymin) * geom.scaleY))}px`;
       guide.textContent = `#${idx + 1} ${item.category || "box"}`;
       overlay.appendChild(guide);
+    });
+  }
+
+  function renderViewportBoxesHud() {
+    const hud = el("viewportBoxesHud");
+    if (!hud) return;
+    hud.hidden = !state.showViewportHud;
+    if (!state.showViewportHud) return;
+    const canvasW = Math.max(256, parseInt(el("widthInput").value, 10) || 1024);
+    const canvasH = Math.max(256, parseInt(el("heightInput").value, 10) || 1024);
+    const { boxPicMap } = computeBoxPictureBindings();
+    hud.innerHTML = "";
+    state.layoutItems.forEach((item, idx) => {
+      if (item.enabled === false || !Array.isArray(item.bbox) || item.bbox.length !== 4) return;
+      const [ymin, xmin, ymax, xmax] = item.bbox;
+      const isText = item.category === "text" || item.text !== undefined;
+      const boxDiv = document.createElement("div");
+      boxDiv.className = `viewport-hud-box ${isText ? "text-hud" : ""}`;
+      boxDiv.style.top = `${((ymin / canvasH) * 100).toFixed(2)}%`;
+      boxDiv.style.left = `${((xmin / canvasW) * 100).toFixed(2)}%`;
+      boxDiv.style.width = `${(((xmax - xmin) / canvasW) * 100).toFixed(2)}%`;
+      boxDiv.style.height = `${(((ymax - ymin) / canvasH) * 100).toFixed(2)}%`;
+      const picTag = boxPicMap[idx] ? ` [Pic ${boxPicMap[idx]}]` : "";
+      const label = isText ? `T: "${item.text || ""}"` : `${item.category || "region"}${picTag}`;
+      boxDiv.textContent = `#${idx + 1} ${label}`;
+      hud.appendChild(boxDiv);
     });
   }
 
@@ -1005,18 +1202,9 @@
     return res;
   }
 
-  function pixelToAbsCentralized(ymin, xmin, ymax, xmax, height, width) {
-    const cy = (height - 1) / 2.0;
-    const cx = (width - 1) / 2.0;
-    return [
-      Math.round(ymin - cy),
-      Math.round(xmin - cx),
-      Math.round(ymax - cy),
-      Math.round(xmax - cx)
-    ];
-  }
-
   function computeBoxPictureBindings() {
+    const width = parseInt(el("widthInput").value, 10) || 1024;
+    const height = parseInt(el("heightInput").value, 10) || 1024;
     const globalRole = (el("inputRoleSelect").value || "photo_ref").toLowerCase();
     const editFormat = (el("editFormatSelect").value || "standard").toLowerCase();
     const globalEmitsVit = globalRole === "photo_ref" && editFormat !== "moss_image_edit";
@@ -1025,9 +1213,11 @@
     let ditRefCounter = state.bindings.reference_image_paths.length;
     const boxPicMap = {};
     const boxDitMap = {};
+    const canonicalIndices = getCanonicalEnabledBoxIndices(height, width);
 
-    state.layoutItems.forEach((b, idx) => {
-      if (b.enabled === false) return;
+    for (const idx of canonicalIndices) {
+      const b = state.layoutItems[idx];
+      if (!b || b.enabled === false) continue;
       if (b.image_path && String(b.image_path).trim() !== "") {
         ditRefCounter += 1;
         boxDitMap[idx] = ditRefCounter;
@@ -1037,8 +1227,8 @@
           boxPicMap[idx] = vitPicCounter;
         }
       }
-    });
-    return { boxPicMap, boxDitMap };
+    }
+    return { boxPicMap, boxDitMap, canonicalIndices };
   }
 
   function updateCompiledJsonPreview() {
@@ -1046,13 +1236,13 @@
     const height = parseInt(el("heightInput").value, 10) || 1024;
     const summaryOverride = el("layoutSummaryInput") ? el("layoutSummaryInput").value.trim() : "";
     const rawCaption = summaryOverride || (el("promptInput").value || "").trim();
-    const { boxPicMap, boxDitMap } = computeBoxPictureBindings();
+    const { boxPicMap, boxDitMap, canonicalIndices } = computeBoxPictureBindings();
 
     const items = [];
     const activeTexts = [];
-
-    state.layoutItems.forEach((b, idx) => {
-      if (b.enabled === false) return;
+    for (const idx of canonicalIndices) {
+      const b = state.layoutItems[idx];
+      if (!b || b.enabled === false) continue;
       const entry = { category: b.category || (b.text !== undefined ? "text" : "region") };
       if (b.text !== undefined && String(b.text).trim() !== "") {
         entry.text = b.text;
@@ -1069,7 +1259,7 @@
         entry.bbox = pixelToAbsCentralized(b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], height, width);
       }
       items.push(entry);
-    });
+    }
 
     const reconciledCaption = reconcileSummaryQuotesJs(rawCaption, activeTexts);
     const payload = {
@@ -1091,13 +1281,72 @@
       }
     }
     renderBindingsCard();
+    renderViewportBoxesHud();
+  }
+
+  function highlightSelectedBoxInDom() {
+    const boxesLayer = el("spatialBoxesLayer");
+    const listContainer = el("boxListContainer");
+    if (boxesLayer) {
+      boxesLayer.querySelectorAll(".spatial-box").forEach((boxEl) => {
+        const idx = parseInt(boxEl.getAttribute("data-box-idx"), 10);
+        const item = state.layoutItems[idx];
+        const baseZ = item && typeof item.z_order === "number" ? item.z_order : idx + 1;
+        if (idx === state.selectedBoxIndex) {
+          boxEl.classList.add("selected-box");
+          boxEl.style.zIndex = String(100 + baseZ);
+        } else {
+          boxEl.classList.remove("selected-box");
+          boxEl.style.zIndex = String(baseZ);
+        }
+      });
+    }
+    if (listContainer) {
+      listContainer.querySelectorAll(".box-card").forEach((cardEl) => {
+        const idx = parseInt(cardEl.getAttribute("data-card-idx"), 10);
+        cardEl.classList.toggle("selected-card", idx === state.selectedBoxIndex);
+      });
+    }
+  }
+
+  function cycleOverlappingBoxes(canvasX = null, canvasY = null) {
+    const enabledIndices = [];
+    state.layoutItems.forEach((b, idx) => {
+      if (b.enabled === false || !Array.isArray(b.bbox) || b.bbox.length !== 4) return;
+      if (canvasX !== null && canvasY !== null) {
+        const [y0, x0, y1, x1] = b.bbox;
+        if (canvasY >= y0 && canvasY <= y1 && canvasX >= x0 && canvasX <= x1) {
+          enabledIndices.push(idx);
+        }
+      } else {
+        enabledIndices.push(idx);
+      }
+    });
+    if (!enabledIndices.length) return;
+    const curPos = enabledIndices.indexOf(state.selectedBoxIndex);
+    state.selectedBoxIndex = enabledIndices[(curPos + 1) % enabledIndices.length];
+    highlightSelectedBoxInDom();
+    const listContainer = el("boxListContainer");
+    if (listContainer) {
+      const targetCard = listContainer.querySelector(`[data-card-idx="${state.selectedBoxIndex}"]`);
+      if (targetCard) targetCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
+  function shiftBoxZOrder(idx, delta) {
+    ensureBoxZOrders();
+    const target = state.layoutItems[idx];
+    if (!target) return;
+    target.z_order = Math.max(1, (target.z_order || 1) + delta);
+    state.selectedBoxIndex = idx;
+    renderSpatialLayoutEditor();
   }
 
   function renderSpatialLayoutEditor() {
-    const geom = computeStageGeometry();
+    ensureBoxZOrders();
+    const geom = computeStageGeometry("spatialStageContainer");
     syncStageAspectAndGuides();
     syncUnderlayLayers();
-
     const boxesLayer = el("spatialBoxesLayer");
     const listContainer = el("boxListContainer");
     if (!boxesLayer || !listContainer) return;
@@ -1119,20 +1368,24 @@
       const effFraming = item.framing_mode || (globalFraming === "never_crop" ? "inscribed" : globalFraming);
       const effIso = item.isolate_box_attn !== null && item.isolate_box_attn !== undefined ? item.isolate_box_attn : (hasBoundRef ? globalIso : 0.0);
       const effSplat = item.paste_to_canvas !== null && item.paste_to_canvas !== undefined ? Boolean(item.paste_to_canvas) : (hasBoundRef && globalSplat);
+      const isSelected = idx === state.selectedBoxIndex;
+      const baseZ = typeof item.z_order === "number" ? item.z_order : idx + 1;
 
       if (isEnabled) {
         const boxEl = document.createElement("div");
-        boxEl.className = `spatial-box ${isText ? "text-box" : ""} ${hasBoundRef ? "ref-bound-box" : ""}`;
+        boxEl.className = `spatial-box ${isText ? "text-box" : ""} ${hasBoundRef ? "ref-bound-box" : ""} ${isSelected ? "selected-box" : ""}`;
+        boxEl.setAttribute("data-box-idx", String(idx));
+        boxEl.style.zIndex = String(isSelected ? 100 + baseZ : baseZ);
         boxEl.style.top = `${Math.round(ymin * geom.scaleY)}px`;
         boxEl.style.left = `${Math.round(xmin * geom.scaleX)}px`;
-        boxEl.style.width = `${Math.max(24, Math.round((xmax - xmin) * geom.scaleX))}px`;
-        boxEl.style.height = `${Math.max(24, Math.round((ymax - ymin) * geom.scaleY))}px`;
+        boxEl.style.width = `${Math.max(20, Math.round((xmax - xmin) * geom.scaleX))}px`;
+        boxEl.style.height = `${Math.max(20, Math.round((ymax - ymin) * geom.scaleY))}px`;
 
         const thumbHtml = refMeta && !refMeta.is_vizj
-          ? `<img class="spatial-box-thumb" src="${refMeta.url}" alt="" style="object-fit: ${framingModeToCssObjectFit(effFraming)};" />`
+          ? `<div class="spatial-box-thumb-clip"><img class="spatial-box-thumb" src="${refMeta.url}" alt="" style="object-fit: ${framingModeToCssObjectFit(effFraming)};" /></div>`
           : "";
 
-        const badges = [];
+        const badges = [`<span class="box-mini-pill">Z${baseZ}</span>`];
         if (boxPicMap[idx]) {
           badges.push(`<span class="box-mini-pill">Pic ${boxPicMap[idx]}</span>`);
         } else if (boxDitMap[idx]) {
@@ -1148,72 +1401,86 @@
           badges.push(`<span class="box-mini-pill">Inpaint</span>`);
         }
 
+        const handlesHtml = ["nw", "n", "ne", "e", "se", "s", "sw", "w"]
+          .map((dir) => `<div class="spatial-box-handle" data-handle="${dir}" data-box-idx="${idx}"></div>`)
+          .join("");
+
         const labelText = isText ? `T: "${item.text || ""}"` : `${item.category}: ${item.caption || ""}`;
         boxEl.innerHTML = `
           ${thumbHtml}
           <div class="spatial-box-tag">[#${idx + 1}] ${labelText}</div>
           <div class="spatial-box-badges">${badges.join("")}</div>
-          <div class="spatial-box-resize" data-resize-idx="${idx}"></div>
+          ${handlesHtml}
         `;
 
         boxEl.addEventListener("mousedown", (ev) => {
-          if (ev.target.hasAttribute("data-resize-idx")) return;
+          const handleDir = ev.target.getAttribute("data-handle");
+          if (ev.altKey && !handleDir) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const stageRect = el("spatialStage").getBoundingClientRect();
+            const clickX = (ev.clientX - stageRect.left) / geom.scaleX;
+            const clickY = (ev.clientY - stageRect.top) / geom.scaleY;
+            cycleOverlappingBoxes(clickX, clickY);
+            return;
+          }
+
+          state.selectedBoxIndex = idx;
+          highlightSelectedBoxInDom();
+          el("spatialStage").focus();
+
           ev.preventDefault();
+          ev.stopPropagation();
           const startX = ev.clientX;
           const startY = ev.clientY;
           const [origY0, origX0, origY1, origX1] = item.bbox;
           const boxW = origX1 - origX0;
           const boxH = origY1 - origY0;
 
-          function onMove(moveEv) {
-            const dx = Math.round((moveEv.clientX - startX) / geom.scaleX);
-            const dy = Math.round((moveEv.clientY - startY) / geom.scaleY);
-            const nx0 = Math.max(0, Math.min(geom.canvasW - boxW, origX0 + dx));
-            const ny0 = Math.max(0, Math.min(geom.canvasH - boxH, origY0 + dy));
-            item.bbox = [ny0, nx0, ny0 + boxH, nx0 + boxW];
-            boxEl.style.top = `${Math.round(ny0 * geom.scaleY)}px`;
-            boxEl.style.left = `${Math.round(nx0 * geom.scaleX)}px`;
+          function updateDomAndReadouts() {
+            const [cy0, cx0, cy1, cx1] = item.bbox;
+            boxEl.style.top = `${Math.round(cy0 * geom.scaleY)}px`;
+            boxEl.style.left = `${Math.round(cx0 * geom.scaleX)}px`;
+            boxEl.style.width = `${Math.max(20, Math.round((cx1 - cx0) * geom.scaleX))}px`;
+            boxEl.style.height = `${Math.max(20, Math.round((cy1 - cy0) * geom.scaleY))}px`;
             const hdr = listContainer.querySelector(`[data-box-coord-hdr="${idx}"]`);
             if (hdr) {
-              const cc = pixelToAbsCentralized(item.bbox[0], item.bbox[1], item.bbox[2], item.bbox[3], geom.canvasH, geom.canvasW);
+              const cc = pixelToAbsCentralized(cy0, cx0, cy1, cx1, geom.canvasH, geom.canvasW);
               hdr.textContent = `#${idx + 1} [${cc.join(", ")}]`;
             }
-            renderInpaintBoxGuides(geom);
+            renderInpaintBoxGuides();
             updateCompiledJsonPreview();
           }
 
-          function onUp() {
-            window.removeEventListener("mousemove", onMove);
-            window.removeEventListener("mouseup", onUp);
-          }
-
-          window.addEventListener("mousemove", onMove);
-          window.addEventListener("mouseup", onUp);
-        });
-
-        const resizeHandle = boxEl.querySelector("[data-resize-idx]");
-        resizeHandle.addEventListener("mousedown", (ev) => {
-          ev.stopPropagation();
-          ev.preventDefault();
-          const startX = ev.clientX;
-          const startY = ev.clientY;
-          const [origY0, origX0, origY1, origX1] = item.bbox;
-
           function onMove(moveEv) {
-            const dx = Math.round((moveEv.clientX - startX) / geom.scaleX);
-            const dy = Math.round((moveEv.clientY - startY) / geom.scaleY);
-            const nx1 = Math.max(origX0 + 32, Math.min(geom.canvasW, origX1 + dx));
-            const ny1 = Math.max(origY0 + 32, Math.min(geom.canvasH, origY1 + dy));
-            item.bbox = [origY0, origX0, ny1, nx1];
-            boxEl.style.width = `${Math.max(24, Math.round((nx1 - origX0) * geom.scaleX))}px`;
-            boxEl.style.height = `${Math.max(24, Math.round((ny1 - origY0) * geom.scaleY))}px`;
-            const hdr = listContainer.querySelector(`[data-box-coord-hdr="${idx}"]`);
-            if (hdr) {
-              const cc = pixelToAbsCentralized(item.bbox[0], item.bbox[1], item.bbox[2], item.bbox[3], geom.canvasH, geom.canvasW);
-              hdr.textContent = `#${idx + 1} [${cc.join(", ")}]`;
+            const dx = (moveEv.clientX - startX) / geom.scaleX;
+            const dy = (moveEv.clientY - startY) / geom.scaleY;
+            const freeMotion = moveEv.altKey;
+
+            if (!handleDir) {
+              const nx0 = snapCoord(Math.max(0, Math.min(geom.canvasW - boxW, origX0 + dx)), geom.canvasW - boxW, freeMotion);
+              const ny0 = snapCoord(Math.max(0, Math.min(geom.canvasH - boxH, origY0 + dy)), geom.canvasH - boxH, freeMotion);
+              item.bbox = [ny0, nx0, ny0 + boxH, nx0 + boxW];
+            } else {
+              let ny0 = origY0;
+              let nx0 = origX0;
+              let ny1 = origY1;
+              let nx1 = origX1;
+              if (handleDir.includes("n")) {
+                ny0 = Math.min(ny1 - 32, snapCoord(origY0 + dy, geom.canvasH - 32, freeMotion));
+              }
+              if (handleDir.includes("s")) {
+                ny1 = Math.max(ny0 + 32, snapCoord(origY1 + dy, geom.canvasH, freeMotion));
+              }
+              if (handleDir.includes("w")) {
+                nx0 = Math.min(nx1 - 32, snapCoord(origX0 + dx, geom.canvasW - 32, freeMotion));
+              }
+              if (handleDir.includes("e")) {
+                nx1 = Math.max(nx0 + 32, snapCoord(origX1 + dx, geom.canvasW, freeMotion));
+              }
+              item.bbox = [ny0, nx0, ny1, nx1];
             }
-            renderInpaintBoxGuides(geom);
-            updateCompiledJsonPreview();
+            updateDomAndReadouts();
           }
 
           function onUp() {
@@ -1241,17 +1508,23 @@
       const curFraming = item.framing_mode || "";
       const isoVal = item.isolate_box_attn !== null && item.isolate_box_attn !== undefined ? item.isolate_box_attn : "";
       const dnVal = item.denoise_strength !== null && item.denoise_strength !== undefined ? item.denoise_strength : "";
-
       const cCoords = pixelToAbsCentralized(ymin, xmin, ymax, xmax, geom.canvasH, geom.canvasW);
+
       const card = document.createElement("div");
-      card.className = `box-card ${!isEnabled ? "disabled-card" : ""}`;
+      card.className = `box-card ${!isEnabled ? "disabled-card" : ""} ${isSelected ? "selected-card" : ""}`;
+      card.setAttribute("data-card-idx", String(idx));
       card.innerHTML = `
         <div class="box-card-header">
           <label class="checkbox-inline">
             <input type="checkbox" data-box-enabled="${idx}" ${isEnabled ? "checked" : ""} />
             <strong data-box-coord-hdr="${idx}">#${idx + 1} [${cCoords.join(", ")}]</strong>
           </label>
-          <button class="btn-link" data-remove-box="${idx}">Remove</button>
+          <div class="box-z-controls">
+            <span class="tiny-muted" title="UI Stack Layer">Z:${baseZ}</span>
+            <button type="button" class="z-btn" data-z-up="${idx}" title="Bring box forward in UI pointer stack">&uarr;</button>
+            <button type="button" class="z-btn" data-z-down="${idx}" title="Send box backward in UI pointer stack">&darr;</button>
+            <button type="button" class="btn-link" data-remove-box="${idx}">Remove</button>
+          </div>
         </div>
         <div class="field-row two-col">
           <input type="text" class="input-text" data-box-cat="${idx}" value="${item.category || ""}" placeholder="Category" />
@@ -1280,19 +1553,41 @@
           <input type="number" class="input-text" data-box-dn="${idx}" value="${dnVal}" min="0.05" max="1.0" step="0.05" placeholder="Denoise (Inherit)" title="Per-box latent splat denoise strength [0.05 - 1.0]" />
         </div>
         <div class="box-flags-row">
-          <label class="checkbox-inline" title="Restrict canvas inpainting strictly to this box aperture">
+          <label class="checkbox-inline" title="Restrict canvas inpainting to this box aperture">
             <input type="checkbox" data-box-inpaint="${idx}" ${item.inpaint_box ? "checked" : ""} />
             <span>Inpaint Box Only</span>
           </label>
-          <label class="checkbox-inline" title="Splat this box's reference latents onto the initial canvas">
+          <label class="checkbox-inline" title="Commutatively splat this box's reference latents onto the initial canvas">
             <input type="checkbox" data-box-paste="${idx}" ${item.paste_to_canvas ? "checked" : ""} />
             <span>Splat to Canvas</span>
           </label>
         </div>
       `;
+
+      card.addEventListener("mouseenter", () => {
+        state.selectedBoxIndex = idx;
+        highlightSelectedBoxInDom();
+      });
+      card.addEventListener("click", () => {
+        state.selectedBoxIndex = idx;
+        highlightSelectedBoxInDom();
+      });
+
       listContainer.appendChild(card);
     });
 
+    listContainer.querySelectorAll("[data-z-up]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        shiftBoxZOrder(parseInt(btn.getAttribute("data-z-up"), 10), 1);
+      });
+    });
+    listContainer.querySelectorAll("[data-z-down]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        shiftBoxZOrder(parseInt(btn.getAttribute("data-z-down"), 10), -1);
+      });
+    });
     listContainer.querySelectorAll("[data-box-enabled]").forEach((chk) => {
       chk.addEventListener("change", () => {
         const i = parseInt(chk.getAttribute("data-box-enabled"), 10);
@@ -1300,15 +1595,15 @@
         renderSpatialLayoutEditor();
       });
     });
-
     listContainer.querySelectorAll("[data-remove-box]").forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
         const i = parseInt(btn.getAttribute("data-remove-box"), 10);
         state.layoutItems.splice(i, 1);
+        state.selectedBoxIndex = Math.max(0, Math.min(state.selectedBoxIndex, state.layoutItems.length - 1));
         renderSpatialLayoutEditor();
       });
     });
-
     listContainer.querySelectorAll("[data-box-cat]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-cat"), 10);
@@ -1316,7 +1611,6 @@
         updateCompiledJsonPreview();
       });
     });
-
     listContainer.querySelectorAll("[data-box-desc]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-desc"), 10);
@@ -1329,15 +1623,14 @@
         } else {
           target.caption = inp.value;
         }
-        const stageTags = boxesLayer.querySelectorAll(".spatial-box-tag");
-        if (stageTags[i]) {
+        const stageBox = boxesLayer.querySelector(`.spatial-box[data-box-idx="${i}"] .spatial-box-tag`);
+        if (stageBox) {
           const isT = target.category === "text" || target.text !== undefined;
-          stageTags[i].textContent = `[#${i + 1}] ${isT ? `T: "${target.text || ""}"` : `${target.category}: ${target.caption || ""}`}`;
+          stageBox.textContent = `[#${i + 1}] ${isT ? `T: "${target.text || ""}"` : `${target.category}: ${target.caption || ""}`}`;
         }
         updateCompiledJsonPreview();
       });
     });
-
     listContainer.querySelectorAll("[data-box-img]").forEach((sel) => {
       sel.addEventListener("change", () => {
         const i = parseInt(sel.getAttribute("data-box-img"), 10);
@@ -1345,7 +1638,6 @@
         renderSpatialLayoutEditor();
       });
     });
-
     listContainer.querySelectorAll("[data-box-role]").forEach((sel) => {
       sel.addEventListener("change", () => {
         const i = parseInt(sel.getAttribute("data-box-role"), 10);
@@ -1353,7 +1645,6 @@
         renderSpatialLayoutEditor();
       });
     });
-
     listContainer.querySelectorAll("[data-box-framing]").forEach((sel) => {
       sel.addEventListener("change", () => {
         const i = parseInt(sel.getAttribute("data-box-framing"), 10);
@@ -1361,7 +1652,6 @@
         renderSpatialLayoutEditor();
       });
     });
-
     listContainer.querySelectorAll("[data-box-iso]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-iso"), 10);
@@ -1369,14 +1659,12 @@
         renderBindingsCard();
       });
     });
-
     listContainer.querySelectorAll("[data-box-dn]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-dn"), 10);
         state.layoutItems[i].denoise_strength = parseOptionalFloat(inp.value, 0.05, 1.0);
       });
     });
-
     listContainer.querySelectorAll("[data-box-inpaint]").forEach((chk) => {
       chk.addEventListener("change", () => {
         const i = parseInt(chk.getAttribute("data-box-inpaint"), 10);
@@ -1384,7 +1672,6 @@
         renderSpatialLayoutEditor();
       });
     });
-
     listContainer.querySelectorAll("[data-box-paste]").forEach((chk) => {
       chk.addEventListener("change", () => {
         const i = parseInt(chk.getAttribute("data-box-paste"), 10);
@@ -1400,11 +1687,10 @@
     const canvas = el("inpaintCanvas");
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
-    const geom = computeStageGeometry();
     const w = canvas.width;
     const h = canvas.height;
     const featherLat = Math.max(0.25, parseFloat(el("featherInput").value) || 1.25);
-    const featherPx = Math.max(1.0, featherLat * 16.0 * ((geom.scaleX + geom.scaleY) * 0.5));
+    const featherPx = Math.max(1.0, featherLat * 16.0);
 
     const enabledBoxes = state.layoutItems.filter(
       (b) => b.enabled !== false && Array.isArray(b.bbox) && b.bbox.length === 4
@@ -1413,22 +1699,17 @@
     const activeBoxes = flaggedBoxes.length > 0 ? flaggedBoxes : enabledBoxes;
     if (!activeBoxes.length) return;
 
+    pushMaskHistorySnapshot();
     const imgData = ctx.getImageData(0, 0, w, h);
     const data = imgData.data;
-    const scaledBoxes = activeBoxes.map((b) => [
-      b.bbox[0] * geom.scaleY,
-      b.bbox[1] * geom.scaleX,
-      b.bbox[2] * geom.scaleY,
-      b.bbox[3] * geom.scaleX
-    ]);
 
     for (let py = 0; py < h; py++) {
       const yy = py + 0.5;
       for (let px = 0; px < w; px++) {
         const xx = px + 0.5;
         let maxVal = 0.0;
-        for (let k = 0; k < scaledBoxes.length; k++) {
-          const [ly0, lx0, ly1, lx1] = scaledBoxes[k];
+        for (let k = 0; k < activeBoxes.length; k++) {
+          const [ly0, lx0, ly1, lx1] = activeBoxes[k].bbox;
           const dy = Math.max(0.0, ly0 - yy, yy - ly1);
           const dx = Math.max(0.0, lx0 - xx, xx - lx1);
           const dist = Math.sqrt(dy * dy + dx * dx);
@@ -1455,6 +1736,7 @@
   function invertInpaintCanvasPixels() {
     const canvas = el("inpaintCanvas");
     if (!canvas) return;
+    pushMaskHistorySnapshot();
     const ctx = canvas.getContext("2d");
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const data = imgData.data;
@@ -1468,31 +1750,109 @@
     ctx.putImageData(imgData, 0, 0);
   }
 
+  function stampRadialDab(ctx, x, y, radius, hardness, isPaint) {
+    const innerR = Math.max(0.0, radius * Math.min(0.99, hardness));
+    const grad = ctx.createRadialGradient(x, y, innerR, x, y, radius);
+    const rgb = isPaint ? "255, 255, 255" : "0, 0, 0";
+    grad.addColorStop(0.0, `rgba(${rgb}, 1.0)`);
+    grad.addColorStop(1.0, `rgba(${rgb}, 0.0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   function initInpaintCanvas() {
+    const container = el("inpaintStageContainer");
     const canvas = el("inpaintCanvas");
+    const cursorEl = el("inpaintBrushCursor");
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    function paintAt(ev) {
-      if (!state.isPainting) return;
+    function getCanvasCoords(ev) {
       const rect = canvas.getBoundingClientRect();
-      const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
-      const y = (ev.clientY - rect.top) * (canvas.height / rect.height);
-      const rad = parseInt(el("brushSizeInput").value, 10) || 40;
-      ctx.fillStyle = state.brushMode === "paint" ? "#ffffff" : "#000000";
-      ctx.beginPath();
-      ctx.arc(x, y, rad / 2, 0, Math.PI * 2);
-      ctx.fill();
+      return {
+        x: (ev.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)),
+        y: (ev.clientY - rect.top) * (canvas.height / Math.max(1, rect.height)),
+        localX: ev.clientX - rect.left,
+        localY: ev.clientY - rect.top,
+        scale: rect.width / Math.max(1, canvas.width)
+      };
     }
 
-    canvas.addEventListener("mousedown", (ev) => {
-      state.isPainting = true;
-      paintAt(ev);
+    function updateCursorRing(ev) {
+      if (!cursorEl) return;
+      const pt = getCanvasCoords(ev);
+      const brushDiam = parseInt(el("brushSizeInput").value, 10) || 56;
+      const dispDiam = Math.max(4, brushDiam * pt.scale);
+      cursorEl.style.width = `${dispDiam}px`;
+      cursorEl.style.height = `${dispDiam}px`;
+      cursorEl.style.left = `${pt.localX}px`;
+      cursorEl.style.top = `${pt.localY}px`;
+      cursorEl.hidden = false;
+    }
+
+    function paintSegment(ev) {
+      if (!state.isPainting) return;
+      const pt = getCanvasCoords(ev);
+      const diam = parseInt(el("brushSizeInput").value, 10) || 56;
+      const radius = Math.max(2, diam * 0.5);
+      const hardness = parseFloat(el("brushHardnessInput").value) || 0.8;
+      const isPaint = state.brushMode === "paint";
+
+      if (!state.lastPaintPt) {
+        stampRadialDab(ctx, pt.x, pt.y, radius, hardness, isPaint);
+        state.lastPaintPt = { x: pt.x, y: pt.y };
+        return;
+      }
+
+      const dx = pt.x - state.lastPaintPt.x;
+      const dy = pt.y - state.lastPaintPt.y;
+      const dist = Math.hypot(dx, dy);
+      const step = Math.max(1.5, radius * 0.22);
+      const steps = Math.max(1, Math.ceil(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        stampRadialDab(
+          ctx,
+          state.lastPaintPt.x + dx * t,
+          state.lastPaintPt.y + dy * t,
+          radius,
+          hardness,
+          isPaint
+        );
+      }
+      state.lastPaintPt = { x: pt.x, y: pt.y };
+    }
+
+    container.addEventListener("mouseenter", updateCursorRing);
+    container.addEventListener("mousemove", (ev) => {
+      updateCursorRing(ev);
+      paintSegment(ev);
     });
-    window.addEventListener("mousemove", paintAt);
+    container.addEventListener("mouseleave", () => {
+      if (cursorEl) cursorEl.hidden = true;
+    });
+
+    canvas.addEventListener("mousedown", (ev) => {
+      if (ev.button !== 0) return;
+      pushMaskHistorySnapshot();
+      state.isPainting = true;
+      state.lastPaintPt = null;
+      paintSegment(ev);
+    });
+
     window.addEventListener("mouseup", () => {
       state.isPainting = false;
+      state.lastPaintPt = null;
+    });
+
+    el("brushSizeInput").addEventListener("input", () => {
+      el("brushSizeVal").textContent = `${el("brushSizeInput").value}px`;
+    });
+    el("brushHardnessInput").addEventListener("input", () => {
+      el("brushHardnessVal").textContent = `${Math.round(parseFloat(el("brushHardnessInput").value) * 100)}%`;
     });
 
     el("brushModePaintBtn").addEventListener("click", () => {
@@ -1507,10 +1867,13 @@
       el("brushModePaintBtn").classList.remove("active");
     });
 
+    el("undoMaskBtn").addEventListener("click", undoMaskStroke);
+    el("redoMaskBtn").addEventListener("click", redoMaskStroke);
     el("projectBoxesToMaskBtn").addEventListener("click", projectBoxesToInpaintCanvas);
     el("invertMaskCanvasBtn").addEventListener("click", invertInpaintCanvasPixels);
 
     el("clearMaskCanvasBtn").addEventListener("click", () => {
+      pushMaskHistorySnapshot();
       ctx.fillStyle = "#000000";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     });
@@ -1626,6 +1989,7 @@
   }
 
   function updateViewportAndTelemetry(jobStatus) {
+    const frame = el("viewportStageFrame");
     const img = el("masterOutputImage");
     const dlPng = el("downloadPngBtn");
     const strip = el("batchThumbStrip");
@@ -1642,10 +2006,10 @@
       const allUrls = [jobStatus.image_url].concat(jobStatus.additional_image_urls || []);
       img.src = `${allUrls[0]}?t=${Date.now()}`;
       img.hidden = false;
+      if (frame) frame.hidden = false;
       el("emptyViewportState").hidden = true;
       dlPng.href = allUrls[0];
       dlPng.hidden = false;
-
       if (promoInitBtn) promoInitBtn.hidden = !state.activeImageId;
       if (promoRefBtn) promoRefBtn.hidden = !state.activeImageId;
 
@@ -1671,6 +2035,8 @@
           strip.hidden = true;
         }
       }
+      renderViewportBoxesHud();
+      syncUnderlayLayers();
     }
 
     const dlVizj = el("downloadVizjBtn");
@@ -1772,8 +2138,9 @@
 
     if (Array.isArray(draft.layout_items)) {
       state.layoutItems = JSON.parse(JSON.stringify(draft.layout_items));
+      ensureBoxZOrders();
+      state.selectedBoxIndex = 0;
     }
-
     state.bindings.init_image_path = draft.init_image_path || null;
     state.bindings.inpaint_mask_path = draft.inpaint_mask_path || null;
     state.bindings.control_image_path = draft.control_image_path || null;
@@ -1802,6 +2169,7 @@
       const solverTag = `${(t.early_solver || "heun").toUpperCase()}->${(t.late_solver || "ipndm").toUpperCase()}`;
       const batchCount = 1 + ((item.additional_image_urls && item.additional_image_urls.length) || 0);
       const batchBadge = batchCount > 1 ? ` (${batchCount}x)` : "";
+
       card.innerHTML = `
         <div class="gallery-thumb-wrap" data-view-id="${item.image_id}">
           <img src="${item.image_url}" alt="${item.title || "Master"}" loading="lazy" />
@@ -1810,10 +2178,10 @@
           <div class="gallery-title" title="${item.title || "Untitled Vision Master"}">${item.title || "Untitled Vision Master"}${batchBadge}</div>
           <div class="gallery-sub">${(item.model_variant || "sft").toUpperCase()} // ${item.width}x${item.height} // ${solverTag} // Seed ${item.seed}</div>
           <div class="gallery-actions">
-            <button class="btn btn-secondary compact-btn" data-restore-id="${item.image_id}">Restore</button>
-            <button class="btn btn-secondary compact-btn" data-promo-init="${item.image_id}" title="Promote image to Vault and bind as Init Image">-&gt; Init</button>
-            <button class="btn btn-secondary compact-btn" data-promo-ref="${item.image_id}" title="Promote image to Vault and bind as 4D Reference">-&gt; 4D Ref</button>
-            <button class="btn btn-secondary compact-btn" data-del-img="${item.image_id}">Delete</button>
+            <button type="button" class="btn btn-secondary compact-btn" data-restore-id="${item.image_id}">Restore</button>
+            <button type="button" class="btn btn-secondary compact-btn" data-promo-init="${item.image_id}" title="Promote image to Vault and bind as Init Image">-&gt; Init</button>
+            <button type="button" class="btn btn-secondary compact-btn" data-promo-ref="${item.image_id}" title="Promote image to Vault and bind as 4D Reference">-&gt; 4D Ref</button>
+            <button type="button" class="btn btn-secondary compact-btn" data-del-img="${item.image_id}">Delete</button>
           </div>
         </div>
       `;
@@ -1880,7 +2248,6 @@
         const status = JSON.parse(ev.data);
         fill.style.width = `${status.progress_pct || 0}%`;
         stageTxt.textContent = `[${status.progress_pct || 0}%] ${status.stage || status.status}`;
-
         if (status.status === "COMPLETED") {
           es.close();
           state.activeEventSource = null;
@@ -2050,6 +2417,58 @@
     }
   }
 
+  function handleStageKeydown(ev) {
+    const item = state.layoutItems[state.selectedBoxIndex];
+    if (!item || item.enabled === false || !Array.isArray(item.bbox)) return;
+    const step = ev.shiftKey ? 64 : 16;
+    const canvasW = parseInt(el("widthInput").value, 10) || 1024;
+    const canvasH = parseInt(el("heightInput").value, 10) || 1024;
+    const [y0, x0, y1, x1] = item.bbox;
+    const w = x1 - x0;
+    const h = y1 - y0;
+
+    if (ev.key === "ArrowLeft") {
+      ev.preventDefault();
+      const nx0 = Math.max(0, x0 - step);
+      item.bbox = [y0, nx0, y1, nx0 + w];
+      renderSpatialLayoutEditor();
+    } else if (ev.key === "ArrowRight") {
+      ev.preventDefault();
+      const nx0 = Math.min(canvasW - w, x0 + step);
+      item.bbox = [y0, nx0, y1, nx0 + w];
+      renderSpatialLayoutEditor();
+    } else if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      const ny0 = Math.max(0, y0 - step);
+      item.bbox = [ny0, x0, ny0 + h, x1];
+      renderSpatialLayoutEditor();
+    } else if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      const ny0 = Math.min(canvasH - h, y0 + step);
+      item.bbox = [ny0, x0, ny0 + h, x1];
+      renderSpatialLayoutEditor();
+    } else if (ev.key === "Tab") {
+      ev.preventDefault();
+      cycleOverlappingBoxes();
+    }
+  }
+
+  function bindResizeObservers() {
+    if (typeof ResizeObserver === "undefined") return;
+    let rafId = 0;
+    const observer = new ResizeObserver(() => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        syncStageAspectAndGuides();
+        renderSpatialLayoutEditor();
+      });
+    });
+    for (const id of ["spatialStageContainer", "inpaintStageWrap", "viewportCanvasWrap"]) {
+      const node = el(id);
+      if (node) observer.observe(node);
+    }
+  }
+
   function bindEventListeners() {
     el("authBtn").addEventListener("click", showLoginModal);
     el("loginSubmitBtn").addEventListener("click", () => {
@@ -2078,6 +2497,20 @@
       }
     });
 
+    el("toggleViewportHudBtn").addEventListener("click", () => {
+      state.showViewportHud = !state.showViewportHud;
+      el("toggleViewportHudBtn").classList.toggle("active", state.showViewportHud);
+      renderViewportBoxesHud();
+    });
+
+    el("toggleCompareSplitBtn").addEventListener("click", () => {
+      state.showCompareSplit = !state.showCompareSplit;
+      el("toggleCompareSplitBtn").classList.toggle("active", state.showCompareSplit);
+      syncUnderlayLayers();
+    });
+
+    el("viewportCompareSlider").addEventListener("input", syncUnderlayLayers);
+
     el("promoteViewportInitBtn").addEventListener("click", async () => {
       if (state.activeImageId) {
         await promoteGalleryImageToVault(state.activeImageId, "init", state.activeVariantIndex);
@@ -2098,6 +2531,7 @@
         const target = el(btn.getAttribute("data-tab"));
         if (target) target.classList.add("active");
         syncStageAspectAndGuides();
+        renderSpatialLayoutEditor();
         syncUnderlayLayers();
       });
     });
@@ -2123,7 +2557,6 @@
     });
 
     el("matchAssetAspectBtn").addEventListener("click", matchPrimaryAssetAspect);
-
     el("synthesizeBtn").addEventListener("click", triggerSynthesis);
     el("saveDefaultPresetBtn").addEventListener("click", saveActiveDeckAsEngineDefault);
     el("stageDefaultRefsBtn").addEventListener("click", stageDefaultTestSet);
@@ -2139,16 +2572,18 @@
     });
 
     el("addObjectBoxBtn").addEventListener("click", () => {
-      const geom = computeStageGeometry();
-      const y0 = Math.round(geom.canvasH * 0.25);
-      const x0 = Math.round(geom.canvasW * 0.25);
-      const y1 = Math.round(geom.canvasH * 0.75);
-      const x1 = Math.round(geom.canvasW * 0.75);
+      const geom = computeStageGeometry("spatialStageContainer");
+      const y0 = snapCoord(geom.canvasH * 0.25, geom.canvasH);
+      const x0 = snapCoord(geom.canvasW * 0.25, geom.canvasW);
+      const y1 = snapCoord(geom.canvasH * 0.75, geom.canvasH);
+      const x1 = snapCoord(geom.canvasW * 0.75, geom.canvasW);
+      const maxZ = state.layoutItems.reduce((m, b) => Math.max(m, b.z_order || 1), 0);
       state.layoutItems.push({
         category: "object",
         caption: "New spatial subject region",
         bbox: [y0, x0, y1, x1],
         enabled: true,
+        z_order: maxZ + 1,
         inpaint_box: false,
         paste_to_canvas: false,
         image_path: "",
@@ -2157,21 +2592,24 @@
         isolate_box_attn: null,
         denoise_strength: null
       });
+      state.selectedBoxIndex = state.layoutItems.length - 1;
       el("promptModeSelect").value = "layout_json";
       renderSpatialLayoutEditor();
     });
 
     el("addTextBoxBtn").addEventListener("click", () => {
-      const geom = computeStageGeometry();
-      const y0 = Math.round(geom.canvasH * 0.12);
-      const x0 = Math.round(geom.canvasW * 0.25);
-      const y1 = Math.round(geom.canvasH * 0.28);
-      const x1 = Math.round(geom.canvasW * 0.75);
+      const geom = computeStageGeometry("spatialStageContainer");
+      const y0 = snapCoord(geom.canvasH * 0.12, geom.canvasH);
+      const x0 = snapCoord(geom.canvasW * 0.25, geom.canvasW);
+      const y1 = snapCoord(geom.canvasH * 0.28, geom.canvasH);
+      const x1 = snapCoord(geom.canvasW * 0.75, geom.canvasW);
+      const maxZ = state.layoutItems.reduce((m, b) => Math.max(m, b.z_order || 1), 0);
       state.layoutItems.push({
         category: "text",
         text: "SOVEREIGN 2026",
         bbox: [y0, x0, y1, x1],
         enabled: true,
+        z_order: maxZ + 1,
         inpaint_box: false,
         paste_to_canvas: false,
         image_path: "",
@@ -2180,18 +2618,39 @@
         isolate_box_attn: null,
         denoise_strength: null
       });
+      state.selectedBoxIndex = state.layoutItems.length - 1;
       el("promptModeSelect").value = "layout_json";
       renderSpatialLayoutEditor();
     });
 
+    el("cycleOverlapBtn").addEventListener("click", () => cycleOverlappingBoxes());
+
     el("clearAllBoxesBtn").addEventListener("click", () => {
       state.layoutItems = [];
+      state.selectedBoxIndex = 0;
       renderSpatialLayoutEditor();
     });
 
     el("resetDefaultBoxesBtn").addEventListener("click", () => {
       state.layoutItems = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+      ensureBoxZOrders();
+      state.selectedBoxIndex = 0;
       renderSpatialLayoutEditor();
+    });
+
+    el("spatialStage").addEventListener("keydown", handleStageKeydown);
+
+    window.addEventListener("keydown", (ev) => {
+      const inpaintActive = el("inpaintTab") && el("inpaintTab").classList.contains("active");
+      if (!inpaintActive) return;
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
+        ev.preventDefault();
+        if (ev.shiftKey) redoMaskStroke();
+        else undoMaskStroke();
+      } else if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "y") {
+        ev.preventDefault();
+        redoMaskStroke();
+      }
     });
 
     el("promptInput").addEventListener("input", updateCompiledJsonPreview);
@@ -2205,7 +2664,6 @@
     el("preserveOutsideBoxesCheck").addEventListener("change", renderBindingsCard);
     el("maskBlendModeSelect").addEventListener("change", renderBindingsCard);
     el("invertMaskCheck").addEventListener("change", renderBindingsCard);
-
     el("layoutUnderlaySelect").addEventListener("change", syncUnderlayLayers);
     el("layoutUnderlayOpacity").addEventListener("input", syncUnderlayLayers);
     el("inpaintUnderlayOpacity").addEventListener("input", syncUnderlayLayers);
@@ -2237,8 +2695,10 @@
   }
 
   async function bootstrapStudio() {
+    ensureBoxZOrders();
     bindEventListeners();
     initInpaintCanvas();
+    bindResizeObservers();
     updateProjectBadge();
     await loadThemeRegistry();
     await pollHealthTelemetry(true);

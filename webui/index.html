@@ -10,7 +10,7 @@
   <header class="topbar">
     <div class="brand-cluster">
       <div class="brand-mark">VS</div>
-      <div>
+      <div class="brand-titles">
         <div class="brand-title">VISIONSTACK <span class="brand-sub">// SHADOWBOXER STUDIO</span></div>
         <div class="brand-meta" id="hwStatusLine">Probing Sovereign Compute Daemon...</div>
       </div>
@@ -18,9 +18,9 @@
 
     <div class="project-toolbar">
       <span class="project-status-badge" id="activeProjectBadge" title="Active Studio Project Package">Project: Unsaved Draft</span>
-      <button id="newProjectBtn" class="btn btn-secondary compact-btn" title="Reset workspace to a clean project draft">New</button>
-      <button id="saveProjectBtn" class="btn btn-secondary compact-btn" title="Save project state, layout boxes, mask canvas, and bound assets to your server vault">Save Project</button>
-      <button id="exportProjectBtn" class="btn btn-secondary compact-btn" title="Save and download a self-contained .vsproj archive to disk">Export .VSPROJ</button>
+      <button id="newProjectBtn" type="button" class="btn btn-secondary compact-btn" title="Reset workspace to a clean project draft">New</button>
+      <button id="saveProjectBtn" type="button" class="btn btn-secondary compact-btn" title="Save project state, layout boxes, mask canvas, and bound assets to your server vault">Save Project</button>
+      <button id="exportProjectBtn" type="button" class="btn btn-secondary compact-btn" title="Save and download a self-contained .vsproj archive to disk">Export .VSPROJ</button>
       <label class="btn btn-secondary compact-btn upload-label" title="Import a portable .vsproj project package from disk">
         Import .VSPROJ
         <input id="importProjectInput" type="file" accept=".vsproj,.zip" hidden />
@@ -29,6 +29,7 @@
 
     <div class="telemetry-pills">
       <div class="pill" id="vramPill" title="WDDM Dedicated VRAM, Contiguous Pool &amp; Shared Spill Telemetry">
+        <span class="pill-dot"></span>
         <span class="pill-label">VRAM</span>
         <span class="pill-val" id="vramPillText">-- / -- GB</span>
       </div>
@@ -46,7 +47,7 @@
         <option value="sky_peace">Sky Peace</option>
         <option value="crimson_forge">Crimson Forge</option>
       </select>
-      <button id="authBtn" class="btn btn-secondary compact-btn">Sign In</button>
+      <button id="authBtn" type="button" class="btn btn-secondary compact-btn">Sign In</button>
     </div>
   </header>
 
@@ -133,7 +134,7 @@
         <div class="section-divider">Canvas &amp; Bifurcated Flow Schedule (V03 Baseline)</div>
 
         <div class="aspect-preset-bar">
-          <span class="field-label">Aspect Presets:</span>
+          <span class="field-label">Aspect:</span>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1024x1024">1:1</button>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1280x832">3:2</button>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="832x1280">2:3</button>
@@ -205,15 +206,15 @@
 
         <div class="field-row three-col">
           <div class="field-group">
-            <label class="field-label" for="skipLayersInput">Neg Skip Layers</label>
+            <label class="field-label" for="skipLayersInput" title="Zero-based DiT blocks skipped in the negative branch">Neg Skip Layers</label>
             <input id="skipLayersInput" type="text" class="input-text" value="24" placeholder="24" />
           </div>
           <div class="field-group">
-            <label class="field-label" for="slgLayersInput">SLG Layers</label>
-            <input id="slgLayersInput" type="text" class="input-text" value="" placeholder="e.g. 24" />
+            <label class="field-label" for="slgLayersInput" title="Zero-based DiT blocks skipped in the positive SLG pass (auto-orthogonalized from Neg Skip when SLG Scale > 0)">SLG Layers</label>
+            <input id="slgLayersInput" type="text" class="input-text" value="24" placeholder="24" />
           </div>
           <div class="field-group">
-            <label class="field-label" for="slgScaleInput">SLG Scale</label>
+            <label class="field-label" for="slgScaleInput" title="Positive Skip-Layer Guidance scale (0.0 = 2 NFE/step; 0.50 = 3 NFE/step conditional acutance boost)">SLG Scale</label>
             <input id="slgScaleInput" type="number" class="input-text" value="0.0" min="0.0" max="10.0" step="0.05" />
           </div>
         </div>
@@ -280,7 +281,7 @@
 
         <div class="field-row three-col">
           <div class="field-group">
-            <label class="field-label" for="boxAttnIsolationInput" title="2D raised-cosine log-aperture attention isolation for box-anchored references">Box Attn Isolation</label>
+            <label class="field-label" for="boxAttnIsolationInput" title="2D raised-cosine log-aperture attention isolation for box-anchored references (collaborative in overlap zones)">Box Attn Isolation</label>
             <input id="boxAttnIsolationInput" type="number" class="input-text" value="0.0" min="0.0" max="1.0" step="0.05" />
           </div>
           <div class="field-group">
@@ -344,7 +345,7 @@
         <div class="active-bindings-card">
           <div class="bindings-header">
             <span>Staged Conditioning Bindings</span>
-            <button id="clearBindingsBtn" class="btn-link">Clear All</button>
+            <button id="clearBindingsBtn" type="button" class="btn-link">Clear All</button>
           </div>
           <div class="binding-item"><span>Init Canvas:</span> <strong id="boundInitLabel">&lt;None&gt;</strong></div>
           <div class="binding-item"><span>Inpaint Mask:</span> <strong id="boundMaskLabel">&lt;None&gt;</strong></div>
@@ -356,7 +357,7 @@
               <input type="checkbox" id="useV2GridCheck" checked />
               <span>V2 Grid</span>
             </label>
-            <label class="checkbox-inline" title="Composite box-bound reference latents onto the initial canvas">
+            <label class="checkbox-inline" title="Commutatively splat box-bound reference latents onto the initial canvas">
               <input type="checkbox" id="compositeBoxImagesCheck" />
               <span>Splat Box Refs</span>
             </label>
@@ -404,10 +405,10 @@
           <div class="progress-text" id="progressStageText">Queued...</div>
         </div>
         <div class="action-row">
-          <button id="saveDefaultPresetBtn" class="btn btn-secondary" title="Save active solver &amp; conditioning settings to ShadowBoxer/default.json" hidden>
+          <button id="saveDefaultPresetBtn" type="button" class="btn btn-secondary" title="Save active solver &amp; conditioning settings to ShadowBoxer/default.json" hidden>
             Lock Default
           </button>
-          <button id="synthesizeBtn" class="btn btn-primary btn-full">
+          <button id="synthesizeBtn" type="button" class="btn btn-primary btn-full">
             Synthesize Master Image
           </button>
         </div>
@@ -417,28 +418,38 @@
     <section class="panel stage-panel">
       <div class="panel-header stage-tabs-header">
         <div class="tab-group">
-          <button class="tab-btn active" data-tab="viewportTab">Master Viewport</button>
-          <button class="tab-btn" data-tab="layoutTab">Spatial Layout Editor (4D-RoPE)</button>
-          <button class="tab-btn" data-tab="inpaintTab">Inpaint Mask Painter</button>
+          <button type="button" class="tab-btn active" data-tab="viewportTab">Master Viewport</button>
+          <button type="button" class="tab-btn" data-tab="layoutTab">Spatial Layout Editor (4D-RoPE)</button>
+          <button type="button" class="tab-btn" data-tab="inpaintTab">Inpaint Mask Studio</button>
         </div>
         <div class="stage-actions">
           <span class="stage-aspect-badge" id="stageAspectBadge">1024x1024 (1:1)</span>
-          <button id="promoteViewportInitBtn" class="btn btn-secondary compact-btn" title="Stage current master output to Vault and bind as Init Image" hidden>Use as Init</button>
-          <button id="promoteViewportRefBtn" class="btn btn-secondary compact-btn" title="Stage current master output to Vault and bind as 4D Reference" hidden>Use as 4D Ref</button>
+          <button id="toggleViewportHudBtn" type="button" class="btn btn-secondary compact-btn" title="Toggle 4D-RoPE Bounding Box HUD Overlay on Master Viewport">Box HUD</button>
+          <button id="toggleCompareSplitBtn" type="button" class="btn btn-secondary compact-btn" title="Toggle A/B Split-Wipe Comparison against bound Init/Control/Ref asset" hidden>A/B Split</button>
+          <button id="promoteViewportInitBtn" type="button" class="btn btn-secondary compact-btn" title="Stage current master output to Vault and bind as Init Image" hidden>Use as Init</button>
+          <button id="promoteViewportRefBtn" type="button" class="btn btn-secondary compact-btn" title="Stage current master output to Vault and bind as 4D Reference" hidden>Use as 4D Ref</button>
           <a id="downloadPngBtn" class="btn btn-secondary compact-btn" download hidden>Download PNG</a>
           <a id="downloadVizjBtn" class="btn btn-secondary compact-btn" download hidden>Download .VIZJ</a>
         </div>
       </div>
 
       <div id="viewportTab" class="tab-pane active">
-        <div class="viewport-canvas-wrap">
+        <div class="viewport-canvas-wrap" id="viewportCanvasWrap">
           <div id="emptyViewportState" class="empty-state">
             <div class="empty-glyph">SB // V03</div>
-            <p>Configure your prompt, spatial layout boxes, or reference conditioning assets and click <strong>Synthesize Master Image</strong>.</p>
+            <p>Configure your prompt, collaborative spatial layout boxes, or reference conditioning assets and click <strong>Synthesize Master Image</strong>.</p>
           </div>
-          <img id="masterOutputImage" class="master-image" alt="Master Synthesis Output" hidden />
+
+          <div id="viewportStageFrame" class="viewport-stage-frame" hidden>
+            <img id="viewportUnderlayImage" class="viewport-underlay-image" alt="Underlay Reference" hidden />
+            <img id="masterOutputImage" class="master-image" alt="Master Synthesis Output" hidden />
+            <div id="viewportBoxesHud" class="viewport-boxes-hud" hidden></div>
+            <input id="viewportCompareSlider" type="range" class="viewport-compare-slider" min="0" max="100" value="50" title="Drag to wipe between Reference Underlay and Synthesized Master" hidden />
+          </div>
+
           <div id="batchThumbStrip" class="batch-thumb-strip" hidden></div>
         </div>
+
         <div class="telemetry-grid" id="telemetryGrid">
           <div class="telem-card">
             <span class="telem-label">SOLVER &amp; NFE</span>
@@ -473,10 +484,15 @@
 
       <div id="layoutTab" class="tab-pane">
         <div class="canvas-toolbar">
-          <button id="addObjectBoxBtn" class="btn btn-secondary compact-btn">+ Object Box</button>
-          <button id="addTextBoxBtn" class="btn btn-secondary compact-btn">+ Typography Box</button>
-          <button id="clearAllBoxesBtn" class="btn btn-secondary compact-btn">Clear Boxes</button>
-          <button id="resetDefaultBoxesBtn" class="btn btn-secondary compact-btn">Reset Defaults</button>
+          <button id="addObjectBoxBtn" type="button" class="btn btn-secondary compact-btn">+ Object Box</button>
+          <button id="addTextBoxBtn" type="button" class="btn btn-secondary compact-btn">+ Typography Box</button>
+          <button id="cycleOverlapBtn" type="button" class="btn btn-secondary compact-btn" title="Cycle active selection through stacked/overlapping boxes (or Alt+Click on stage)">Cycle Stacked</button>
+          <button id="clearAllBoxesBtn" type="button" class="btn btn-secondary compact-btn">Clear Boxes</button>
+          <button id="resetDefaultBoxesBtn" type="button" class="btn btn-secondary compact-btn">Reset Defaults</button>
+          <label class="checkbox-inline" title="Snap box position and dimensions to 16px Flux2-VAE latent grid cells (hold Alt while dragging for free sub-grid motion)">
+            <input type="checkbox" id="snapGridCheck" checked />
+            <span>16px Snap</span>
+          </label>
           <label class="toolbar-control">
             <span>Underlay:</span>
             <select id="layoutUnderlaySelect" class="input-select compact-select">
@@ -488,14 +504,17 @@
             <span>Opacity:</span>
             <input id="layoutUnderlayOpacity" type="range" min="0.1" max="1.0" step="0.05" value="0.45" />
           </label>
+          <span class="spatial-hud-readout" id="spatialHudReadout">Latent Grid: 64x64 (16px stride)</span>
         </div>
+
         <div class="layout-workspace">
-          <div class="spatial-stage-container">
-            <div id="spatialStage" class="spatial-stage">
+          <div class="spatial-stage-container" id="spatialStageContainer">
+            <div id="spatialStage" class="spatial-stage" tabindex="0">
               <img id="spatialUnderlayImg" class="stage-underlay-img" alt="" hidden />
               <div id="spatialBoxesLayer" class="spatial-boxes-layer"></div>
             </div>
           </div>
+
           <div class="box-inspector">
             <div class="field-group">
               <div class="label-row">
@@ -504,11 +523,16 @@
               </div>
               <input id="layoutSummaryInput" type="text" class="input-text" placeholder="Optional global scene summary for layout JSON..." />
             </div>
-            <h3>Spatial Box List &amp; Regional Conditioning</h3>
+
+            <div class="inspector-section-header">
+              <h3>Collaborative Box Stack &amp; 4D-RoPE Bindings</h3>
+              <span class="tiny-muted" title="UI Z-order controls pointer manipulation priority; compiler canonically orders boxes coarse-to-fine for permutation-invariant synthesis">Permutation-Invariant</span>
+            </div>
             <div id="boxListContainer" class="box-list"></div>
+
             <div class="compiled-json-preview">
               <div class="label-row">
-                <label class="field-label">Compiled Qwen3.5 Layout JSON Preview</label>
+                <label class="field-label">Canonical Qwen3.5 Layout JSON Preview</label>
                 <span class="badge" id="layoutActiveModeBadge">NATURAL MODE</span>
               </div>
               <pre id="compiledJsonPreview"></pre>
@@ -520,25 +544,35 @@
       <div id="inpaintTab" class="tab-pane">
         <div class="canvas-toolbar">
           <label class="toolbar-control">
-            <span>Brush:</span>
-            <input id="brushSizeInput" type="range" min="6" max="140" value="44" />
+            <span>Size:</span>
+            <input id="brushSizeInput" type="range" min="6" max="220" value="56" />
+            <span class="mono-readout" id="brushSizeVal">56px</span>
           </label>
-          <button id="brushModePaintBtn" class="btn btn-secondary compact-btn active">Paint (Inpaint White)</button>
-          <button id="brushModeEraseBtn" class="btn btn-secondary compact-btn">Erase (Preserve Black)</button>
-          <button id="projectBoxesToMaskBtn" class="btn btn-secondary compact-btn" title="Rasterize active layout boxes with raised-cosine feathering onto the mask canvas">Project Layout Boxes</button>
-          <button id="invertMaskCanvasBtn" class="btn btn-secondary compact-btn">Invert Canvas</button>
-          <button id="clearMaskCanvasBtn" class="btn btn-secondary compact-btn">Clear</button>
+          <label class="toolbar-control" title="Radial brush edge feathering">
+            <span>Hardness:</span>
+            <input id="brushHardnessInput" type="range" min="0.1" max="1.0" step="0.05" value="0.80" />
+            <span class="mono-readout" id="brushHardnessVal">80%</span>
+          </label>
+          <button id="brushModePaintBtn" type="button" class="btn btn-secondary compact-btn active">Paint (Inpaint)</button>
+          <button id="brushModeEraseBtn" type="button" class="btn btn-secondary compact-btn">Erase (Preserve)</button>
+          <button id="undoMaskBtn" type="button" class="btn btn-secondary compact-btn" title="Undo stroke (Ctrl+Z)" disabled>Undo</button>
+          <button id="redoMaskBtn" type="button" class="btn btn-secondary compact-btn" title="Redo stroke (Ctrl+Y)" disabled>Redo</button>
+          <button id="projectBoxesToMaskBtn" type="button" class="btn btn-secondary compact-btn" title="Rasterize active layout boxes with C2 raised-cosine feathering onto the native-resolution mask canvas">Project Boxes</button>
+          <button id="invertMaskCanvasBtn" type="button" class="btn btn-secondary compact-btn">Invert</button>
+          <button id="clearMaskCanvasBtn" type="button" class="btn btn-secondary compact-btn">Clear</button>
           <label class="toolbar-control">
             <span>Underlay:</span>
             <input id="inpaintUnderlayOpacity" type="range" min="0.0" max="0.95" step="0.05" value="0.55" />
           </label>
-          <button id="commitMaskToVaultBtn" class="btn btn-primary compact-btn">Stage Mask to Vault</button>
+          <button id="commitMaskToVaultBtn" type="button" class="btn btn-primary compact-btn">Stage Mask to Vault</button>
         </div>
-        <div class="inpaint-stage-wrap">
+
+        <div class="inpaint-stage-wrap" id="inpaintStageWrap">
           <div id="inpaintStageContainer" class="inpaint-stage-container">
             <img id="inpaintUnderlayImg" class="stage-underlay-img" alt="" hidden />
-            <canvas id="inpaintCanvas" width="512" height="512"></canvas>
+            <canvas id="inpaintCanvas" width="1024" height="1024"></canvas>
             <div id="inpaintBoxesOverlay" class="inpaint-boxes-overlay"></div>
+            <div id="inpaintBrushCursor" class="inpaint-brush-cursor" hidden></div>
           </div>
         </div>
       </div>
@@ -559,7 +593,7 @@
         <div class="vault-subheader">
           <h3>Reference Assets <span class="badge" id="assetCountBadge">0</span></h3>
           <div class="vault-actions-group">
-            <button id="stageDefaultRefsBtn" class="btn btn-secondary compact-btn" title="Stage deterministic test reference, init, mask &amp; control assets">Stage Test Set</button>
+            <button id="stageDefaultRefsBtn" type="button" class="btn btn-secondary compact-btn" title="Stage deterministic test reference, init, mask &amp; control assets">Stage Test Set</button>
             <label class="btn btn-secondary compact-btn upload-label">
               + Upload
               <input id="referenceFileInput" type="file" accept=".png,.jpg,.jpeg,.webp,.vizj" hidden />
@@ -575,7 +609,7 @@
         <div class="vault-subheader">
           <h3>Saved Projects (.VSPROJ) <span class="badge" id="projectCountBadge">0</span></h3>
           <div class="vault-actions-group">
-            <button id="vaultSaveProjectBtn" class="btn btn-secondary compact-btn" title="Save current studio state to project vault">+ Save Current</button>
+            <button id="vaultSaveProjectBtn" type="button" class="btn btn-secondary compact-btn" title="Save current studio state to project vault">+ Save Current</button>
           </div>
         </div>
         <div id="projectList" class="project-list">
@@ -605,7 +639,7 @@
       </div>
       <div id="loginErrorMsg" class="error-banner" hidden></div>
       <div class="modal-actions">
-        <button id="loginSubmitBtn" class="btn btn-primary btn-full">Authenticate Session</button>
+        <button id="loginSubmitBtn" type="button" class="btn btn-primary btn-full">Authenticate Session</button>
       </div>
     </div>
   </div>

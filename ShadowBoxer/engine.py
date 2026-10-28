@@ -97,7 +97,6 @@ def _configure_rocm_runtime_env() -> None:
 
 
 _configure_rocm_runtime_env()
-
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 import numpy as np
@@ -326,6 +325,7 @@ class WDDMMemoryGuard:
                 )
                 if hr < 0:
                     break
+
                 desc = _DXGI_ADAPTER_DESC1()
                 self._call_com(
                     adapter,
@@ -341,6 +341,7 @@ class WDDMMemoryGuard:
                         self.adapter_name = str(desc.Description)
                         self.dedicated_total_gb = desc.DedicatedVideoMemory / (1024**3)
                         self.shared_budget_gb = desc.SharedSystemMemory / (1024**3)
+
                         adapter3 = ctypes.c_void_p()
                         hr_qi = self._call_com(
                             adapter,
@@ -391,6 +392,7 @@ class WDDMMemoryGuard:
         )
         if hr_local >= 0:
             ded_gb = float(local_info.CurrentUsage) / (1024**3)
+
         hr_non_local = self._call_com(
             self._adapter3,
             14,
@@ -496,6 +498,7 @@ class WDDMMemoryGuard:
         snap = self.poll()
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return snap
+
         reserved_bytes = int(snap.pt_reserved_gb * (1024**3))
         split_bytes = int(snap.pt_inactive_split_gb * (1024**3))
         adaptive_trim_bytes = (
@@ -700,7 +703,11 @@ def compose_latent_inpaint_mask(
     if mode not in SUPPORTED_MASK_BLEND_MODES:
         mode = "auto"
 
-    ref_t = paint_mask if paint_mask is not None else (box_mask if box_mask is not None else alpha_mask)
+    ref_t = (
+        paint_mask
+        if paint_mask is not None
+        else (box_mask if box_mask is not None else alpha_mask)
+    )
     if ref_t is None:
         return None
 
@@ -785,7 +792,20 @@ def splat_box_latents_to_canvas(
             (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
         )
 
-    union_alpha = torch.zeros((1, 1, h_lat, w_lat), device=device, dtype=torch.float32)
+    if not splat_entries:
+        return canvas, torch.zeros(
+            (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
+        )
+
+    accum_lat = torch.zeros(
+        (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
+    )
+    accum_weight = torch.zeros(
+        (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
+    )
+    union_alpha = torch.zeros(
+        (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
+    )
     feather = max(0.25, float(feather_radius_lat))
 
     for box_lat_cpu, norm_bbox, box_mask_cpu, _ in splat_entries:
@@ -822,15 +842,25 @@ def splat_box_latents_to_canvas(
                 )
             local_alpha = local_alpha * b_mask.clamp(0.0, 1.0)
 
-        region = canvas[:, :, y0:y1, x0:x1]
-        canvas[:, :, y0:y1, x0:x1] = (
-            local_alpha * b_lat + (1.0 - local_alpha) * region
+        local_alpha = local_alpha.clamp(0.0, 1.0)
+        accum_lat[:, :, y0:y1, x0:x1] = (
+            accum_lat[:, :, y0:y1, x0:x1] + local_alpha * b_lat
+        )
+        accum_weight[:, :, y0:y1, x0:x1] = (
+            accum_weight[:, :, y0:y1, x0:x1] + local_alpha
         )
         union_alpha[:, :, y0:y1, x0:x1] = torch.maximum(
             union_alpha[:, :, y0:y1, x0:x1], local_alpha
         )
 
-    return canvas, union_alpha.clamp(0.0, 1.0)
+    union_alpha = union_alpha.clamp(0.0, 1.0)
+    norm_fg = torch.where(
+        accum_weight > 1e-6,
+        accum_lat / accum_weight.clamp(min=1e-6),
+        canvas,
+    )
+    canvas = union_alpha * norm_fg + (1.0 - union_alpha) * canvas
+    return canvas, union_alpha
 
 
 def splitmix64(seed: int) -> int:
@@ -949,6 +979,7 @@ class MOSSImageScheduler:
             training_shift=self.training_shift,
             num_train_timesteps=self.num_train_timesteps,
         ).to(device=target_device)
+
         self.timesteps = snapped * float(self.num_train_timesteps)
         self.sigmas = torch.cat(
             [snapped, torch.zeros(1, device=target_device, dtype=torch.float32)]
@@ -1006,6 +1037,7 @@ class BifurcatedFlowMatchScheduler:
         self._step_configs: List[Dict[str, Any]] = []
         self._step_index: Optional[int] = None
         self._k_star: int = 0
+
         self._sample_anchor: Optional[torch.Tensor] = None
         self._v0: Optional[torch.Tensor] = None
         self._h: Optional[float] = None
@@ -1082,6 +1114,7 @@ class BifurcatedFlowMatchScheduler:
     ) -> Tuple[float, float, float, float]:
         if order <= 1 or abs(h_n) < 1e-12 or abs(h_n_1) < 1e-12:
             return (h_n, 0.0, 0.0, 0.0)
+
         max_m = min(int(order), 4)
         if max_m >= 2 and abs(h_n_1) < 1e-12:
             max_m = 1
@@ -1095,6 +1128,7 @@ class BifurcatedFlowMatchScheduler:
         x2 = -(h_n_1 + h_n_2)
         x3 = -(h_n_1 + h_n_2 + h_n_3)
         nodes = (x0, x1, x2, x3)
+
         abs_h = abs(h_n)
         for m in range(max_m, 1, -1):
             cand = cls._lagrange_ab_weights_for_order(h_n, nodes, m)
@@ -1263,6 +1297,7 @@ class BifurcatedFlowMatchScheduler:
         progress = self.current_progress
         if progress >= self.handoff_threshold or s_next <= 0.0:
             return torch.zeros_like(ref_tensor)
+
         envelope = max(
             0.0,
             min(1.0, (self.handoff_threshold - progress) / self.handoff_threshold),
@@ -1275,6 +1310,7 @@ class BifurcatedFlowMatchScheduler:
         )
         if renoise <= 0.0:
             return torch.zeros_like(ref_tensor)
+
         gen_dev = generator.device.type if generator is not None else None
         if generator is not None and gen_dev == ref_tensor.device.type:
             noise = torch.randn(
@@ -1287,6 +1323,7 @@ class BifurcatedFlowMatchScheduler:
             noise = torch.randn(
                 ref_tensor.shape, device=ref_tensor.device, dtype=torch.float32
             )
+
         eps_hat = ref_tensor + (1.0 - s_curr) * v_tot
         attenuation = (
             math.sqrt(max(0.0, s_next * s_next - renoise * renoise)) - s_next
@@ -1338,6 +1375,7 @@ class BifurcatedFlowMatchScheduler:
                 dx = (h_dt / 2.0) * (v0 + v)
             else:
                 dx = h_dt * v0
+
             if is_early and self.eta > 0.0 and s_next > 0.0:
                 v_tot = 0.5 * (v0 + v)
                 disp = self._calc_sde_dispersion(
@@ -1346,6 +1384,7 @@ class BifurcatedFlowMatchScheduler:
                 prev_sample = sample_0 + dx + disp
             else:
                 prev_sample = sample_0 + dx
+
             self._sample_anchor = None
             self._v0 = None
             self._h = None
@@ -1724,6 +1763,7 @@ def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
             )
             if snapshots:
                 return snapshots[0].resolve()
+
     raise FileNotFoundError(
         f"Cached snapshot not found for '{repo_or_path}' in {CACHE_DIR / 'hub'}. Run download_model.py first."
     )
@@ -1780,7 +1820,6 @@ def stream_safetensors_inplace(
                         target_t = buf_map.get(clean_key)
                     if target_t is None:
                         continue
-
                     v = f.get_tensor(k)
                     t_dtype = _resolve_target_tensor_dtype(clean_key, v, dtype)
                     if (
@@ -1853,7 +1892,6 @@ def load_sharded_safetensors_into(
             if not _same_device(param.device, target_dev):
                 t_dtype = _resolve_target_tensor_dtype(name, param, dtype)
                 param.data = param.data.to(device=target_dev, dtype=t_dtype)
-
         for name, buf in target_module.named_buffers():
             if buf.is_floating_point():
                 if (
@@ -1928,11 +1966,13 @@ def pack_vision_patches_32px(
     w_vis = max(32, (int(round(w_in * scale)) // 32) * 32)
     if (w_in, h_in) != (w_vis, h_vis):
         img = img.resize((w_vis, h_vis), resample=Image.Resampling.BICUBIC)
+
     arr = np.asarray(img, dtype=np.float32) / 255.0
     mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
     std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
     normed = (arr - mean) / std
     chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
+
     grid_h = h_vis // 16
     grid_w = w_vis // 16
     merge = 2
@@ -1976,7 +2016,6 @@ class MOSSImageEngine:
         self.embed_cache = PromptEmbedCache(max_entries=32)
         self.ref_cache = ReferenceVisionCache(max_entries=32)
         self.memory_guard = WDDMMemoryGuard(self.device)
-
         self.vizinjector: Optional[Any] = None
         if HAS_VIZINJECTOR and VizInjectorClient is not None:
             try:
@@ -2059,14 +2098,12 @@ class MOSSImageEngine:
                 self.memory_guard.close()
             except Exception:
                 pass
-
             if self.vizinjector is not None:
                 try:
                     self.vizinjector.close()
                 except Exception:
                     pass
                 self.vizinjector = None
-
             if self.tokenizer is not None:
                 close_fn = getattr(self.tokenizer, "close", None)
                 if callable(close_fn):
@@ -2087,15 +2124,14 @@ class MOSSImageEngine:
                 except Exception:
                     pass
                 self.transformer = None
-
             if self.text_encoder is not None:
                 try:
                     self.text_encoder.clear_caches()
                 except Exception:
                     pass
                 self.text_encoder = None
-
             self.vae = None
+
             self._loaded_repo_id = None
             self._current_offload_state = None
             self._warmed_up = False
@@ -2150,6 +2186,7 @@ class MOSSImageEngine:
                 )
 
             target_device = torch.device("cpu") if cpu_offload else self.device
+
             if (
                 self.transformer is not None
                 and self.text_encoder is not None
@@ -2202,7 +2239,6 @@ class MOSSImageEngine:
                         device=target_device,
                         dtype=self.dtype,
                     )
-
                 if not streamed_inplace:
                     del self.transformer
                     self.transformer = None
@@ -2358,6 +2394,7 @@ class MOSSImageEngine:
             lora_sd: Dict[str, torch.Tensor] = {}
             for sf in sf_files:
                 lora_sd.update(load_safetensors(str(sf), device="cpu"))
+
             fused = self.transformer.fuse_lora_state_dict(
                 lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
             )
@@ -2402,7 +2439,6 @@ class MOSSImageEngine:
             mtf_boost=request.mtf_boost,
             mask_feather_radius=request.mask_feather_radius,
         )
-
         cached_vae_tuple: Optional[
             Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Any]]
         ] = None
@@ -2469,7 +2505,6 @@ class MOSSImageEngine:
                 latent_clamp_sigma=request.latent_clamp_sigma,
             )
             bundle = self.vizinjector.condition_image(image_path, viz_req)
-
             if have_cached_vae:
                 packed_lat = cached_vae_tuple[0]
                 latent_mask = cached_vae_tuple[1]
@@ -2560,6 +2595,7 @@ class MOSSImageEngine:
                 del img_splits
                 self.text_encoder.visual.clear_caches()
                 self._trim_reserved_vram(force=False, required_headroom_gb=1.25)
+
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
                 vit_embeds=vit_embeds,
@@ -2754,8 +2790,8 @@ class MOSSImageEngine:
 
         input_ids = torch.tensor([tok_list], dtype=torch.long, device=te_device)
         attention_mask = torch.ones_like(input_ids, device=te_device)
-        inputs_embeds: Optional[torch.Tensor] = None
 
+        inputs_embeds: Optional[torch.Tensor] = None
         if pre_vit_embeds is not None and image_grid_thw is not None:
             base_embeds = self.text_encoder.get_input_embeddings()(input_ids)
             image_mask = (
@@ -2937,6 +2973,7 @@ class MOSSImageEngine:
         box_mask_cpu: Optional[torch.Tensor] = None
         alpha_mask_cpu: Optional[torch.Tensor] = None
         inpaint_mask_cpu: Optional[torch.Tensor] = None
+
         ref_latents_cpu_list: List[torch.Tensor] = []
         ref_bboxes_list: List[Optional[Tuple[float, float, float, float]]] = []
         ref_box_iso_list: List[float] = []
@@ -3006,7 +3043,9 @@ class MOSSImageEngine:
                     m_img = Image.open(mask_p).convert("L")
                     m_img = m_img.resize(
                         (request.width // 16, request.height // 16),
-                        resample=Image.Resampling.BILINEAR,
+                        resample=Image.Resampling.BILUBIC
+                        if hasattr(Image.Resampling, "BILUBIC")
+                        else Image.Resampling.BILINEAR,
                     )
                     m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
                     paint_mask_cpu = (
@@ -3053,7 +3092,6 @@ class MOSSImageEngine:
                         and (is_box_ref or request.edit_format != "moss_image_edit"),
                     )
                 )
-
                 if px_box is not None:
                     ymin, xmin, ymax, xmax = px_box
                     ref_w = max(64, ((xmax - xmin + 8) // 16) * 16)
@@ -3065,7 +3103,6 @@ class MOSSImageEngine:
                         request.height,
                         request.edit_format,
                     )
-
                 r_rec, hit = self._condition_single_reference(
                     r_path,
                     request,
@@ -3092,7 +3129,6 @@ class MOSSImageEngine:
                         )
                 if r_rec.llm_tokens > 0 and emits_vit:
                     ref_records_for_prompt.append(r_rec)
-
                 if (
                     request.export_vizj_path
                     and self.vizinjector is not None
@@ -3170,6 +3206,7 @@ class MOSSImageEngine:
 
         effective_prompt = request.compile_effective_prompt()
         pos_hits_before = self.embed_cache.pos_hits
+
         early_cfg = float(request.early_cfg)
         late_cfg = float(request.late_cfg)
         any_cfg = (abs(early_cfg - 1.0) > 1e-5) or (abs(late_cfg - 1.0) > 1e-5)
@@ -3177,6 +3214,7 @@ class MOSSImageEngine:
 
         if cpu_offload:
             self.text_encoder.to(self.device)
+
         if reporter is not None:
             reporter.start_stage("context", ctx_total)
 
@@ -3434,6 +3472,7 @@ class MOSSImageEngine:
         uncond_ref_latents = active_ref_latents if uncond_uses_refs else None
         uncond_ref_bboxes = active_ref_bboxes if uncond_uses_refs else None
         uncond_ref_box_iso = active_ref_box_iso if uncond_uses_refs else None
+
         ref_zero_t = request.effective_reference_zero_timestep
         ref_iso_kv = request.effective_reference_isolated_kv
         box_feather_lat = float(request.mask_feather_radius or 1.25)
@@ -3461,6 +3500,9 @@ class MOSSImageEngine:
             do_step_cfg = abs(current_cfg - 1.0) > 1e-5
             skip_active = request.slg_start <= step_frac < request.slg_stop
             do_slg = bool(slg_skip_set and request.slg_scale > 0.0 and skip_active)
+            eff_uncond_skip = (
+                (uncond_skip_set - slg_skip_set) if do_slg else uncond_skip_set
+            )
 
             prediction = self.transformer(
                 latents,
@@ -3479,8 +3521,8 @@ class MOSSImageEngine:
 
             if do_step_cfg and negative is not None:
                 skip_kwargs = (
-                    {"skip_layers": uncond_skip_set}
-                    if (uncond_skip_set and skip_active)
+                    {"skip_layers": eff_uncond_skip}
+                    if (eff_uncond_skip and skip_active)
                     else {}
                 )
                 uncond = self.transformer(
@@ -3560,6 +3602,7 @@ class MOSSImageEngine:
                 effective_cb("dit", pass_index + 1, num_passes)
 
         dit_elapsed = time.perf_counter() - dit_t0
+
         if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
             early_steps = active_scheduler._early_steps
             late_steps = active_scheduler._late_steps
@@ -3684,13 +3727,16 @@ class MOSSImageEngine:
             early_cfg_used=early_cfg,
             late_cfg_used=late_cfg,
             uncond_skip_layers_used=list(request.uncond_skip_layers or []),
-            slg_layers_used=list(request.slg_layers or []),
-            slg_scale_used=request.slg_scale,
+            slg_layers_used=(
+                list(request.slg_layers or [])
+                if (request.slg_scale is not None and request.slg_scale > 0.0)
+                else []
+            ),
+            slg_scale_used=float(request.slg_scale or 0.0),
             eta_used=request.eta,
             s_noise_used=request.s_noise,
             enable_thinking_used=request.enable_thinking,
             viztoken_active=True,
-            tiktalkin_active=True,
             vizinjector_active=self.vizinjector_active,
             vizinjector_backend=self.vizinjector_backend_name,
             prompt_cache_hit=cache_hit,
