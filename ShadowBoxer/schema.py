@@ -21,6 +21,8 @@ SUPPORTED_MODELS = {
 
 SUPPORTED_PROMPT_MODES = ["natural", "layout", "layout_json"]
 
+SUPPORTED_BOX_LABELS = ["object", "character", "text"]
+
 SUPPORTED_FRAMING_MODES = [
     "inscribed",
     "cover_crop",
@@ -50,21 +52,22 @@ SUPPORTED_MASK_BLEND_MODES = [
 
 DEFAULT_LAYOUT_ITEMS: List[Dict[str, Any]] = [
     {
-        "category": "refrigerator",
+        "label": "object",
         "caption": "A sleek brushed-steel refrigerator door with a small yellow sticky note",
         "bbox": [32, 48, 992, 592],
         "enabled": True,
         "z_order": 1,
     },
     {
-        "category": "text",
+        "label": "text",
+        "caption": "Handwritten black marker text on a small yellow sticky note",
         "text": "Remember to test SFT & Base permutations @ 1024x1024",
         "bbox": [288, 144, 544, 480],
         "enabled": True,
         "z_order": 3,
     },
     {
-        "category": "bowl",
+        "label": "object",
         "caption": "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
         "bbox": [592, 608, 976, 976],
         "enabled": True,
@@ -147,9 +150,38 @@ _INTERNAL_BOX_KEYS = {
     "paste_to_canvas",
     "z_order",
     "id",
-    "label",
+    "category",
     "enabled",
 }
+
+_CHARACTER_SYNONYMS = {
+    "character",
+    "person",
+    "people",
+    "human",
+    "portrait",
+    "face",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "child",
+    "subject",
+    "figure",
+    "actor",
+    "model",
+}
+
+
+def normalize_box_label(raw_label: Any, has_text: bool = False) -> str:
+    if has_text:
+        return "text"
+    s = str(raw_label or "").strip().lower()
+    if s in ("text", "typography", "caption", "title", "sign", "label", "lettering"):
+        return "text"
+    if s in _CHARACTER_SYNONYMS:
+        return "character"
+    return "object"
 
 
 def pixel_bbox_to_abs_centralized(
@@ -160,13 +192,19 @@ def pixel_bbox_to_abs_centralized(
     height: int,
     width: int,
 ) -> List[int]:
-    cy = (height - 1) / 2.0
-    cx = (width - 1) / 2.0
+    h_int = int(height)
+    w_int = int(width)
+    cy = h_int // 2
+    cx = w_int // 2
+    max_y = h_int - cy
+    max_x = w_int - cx
+    eff_ymax = float(h_int) if int(round(ymax)) == h_int - 1 else float(ymax)
+    eff_xmax = float(w_int) if int(round(xmax)) == w_int - 1 else float(xmax)
     return [
-        int(round(ymin - cy)),
-        int(round(xmin - cx)),
-        int(round(ymax - cy)),
-        int(round(xmax - cx)),
+        max(-cy, min(max_y, int(round(ymin - cy)))),
+        max(-cx, min(max_x, int(round(xmin - cx)))),
+        max(-cy, min(max_y, int(round(eff_ymax - cy)))),
+        max(-cx, min(max_x, int(round(eff_xmax - cx)))),
     ]
 
 
@@ -189,8 +227,8 @@ def bbox_to_pixel_rect(
         py1 = y1 * height
         px1 = x1 * width
     elif not coords_are_pixels or min(y0, x0, y1, x1) < 0.0:
-        cy = (height - 1) / 2.0
-        cx = (width - 1) / 2.0
+        cy = float(int(height) // 2)
+        cx = float(int(width) // 2)
         py0 = y0 + cy
         px0 = x0 + cx
         py1 = y1 + cy
@@ -229,7 +267,7 @@ def canonical_box_sort_key(
     height: int = 1024,
     width: int = 1024,
     coords_are_pixels: bool = True,
-) -> Tuple[float, float, float, float, float, str, str, str]:
+) -> Tuple[float, float, float, float, float, str, str, str, str]:
     bbox = item.get("bbox")
     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
         uy0, ux0, uy1, ux1 = bbox_to_normalized(
@@ -240,12 +278,27 @@ def canonical_box_sort_key(
     area = round((uy1 - uy0) * (ux1 - ux0), 6)
     uyc = round(0.5 * (uy0 + uy1), 6)
     uxc = round(0.5 * (ux0 + ux1), 6)
-    cat = str(item.get("category") or ("text" if "text" in item else "region")).strip()
-    body = str(item.get("text") if "text" in item else (item.get("caption") or "")).strip()
+    raw_txt = item.get("text")
+    has_txt = isinstance(raw_txt, str) and bool(raw_txt.strip())
+    lbl = normalize_box_label(
+        item.get("label") or item.get("category"), has_text=has_txt
+    )
+    txt_str = str(raw_txt).strip() if has_txt else ""
+    cap_str = str(item.get("caption") or item.get("description") or "").strip()
     img_p = str(
         item.get("image_path") or item.get("image") or item.get("vizj_path") or ""
     ).strip()
-    return (-area, uyc, uxc, round(uy0, 6), round(ux0, 6), cat, body, img_p)
+    return (
+        -area,
+        uyc,
+        uxc,
+        round(uy0, 6),
+        round(ux0, 6),
+        lbl,
+        txt_str,
+        cap_str,
+        img_p,
+    )
 
 
 def get_canonical_box_order(
@@ -280,11 +333,9 @@ def reconcile_layout_summary_quotes(
     clean_cap = caption.strip()
     if not clean_cap or not active_texts:
         return clean_cap
-
     matches = list(re.finditer(r'"([^"\r\n]+)"', clean_cap))
     if not matches:
         return clean_cap
-
     if len(matches) == len(active_texts):
         parts: List[str] = []
         last_idx = 0
@@ -294,11 +345,9 @@ def reconcile_layout_summary_quotes(
             last_idx = m.end()
         parts.append(clean_cap[last_idx:])
         return "".join(parts)
-
     default_quote = '"Remember to test SFT & Base permutations @ 1024x1024"'
     if default_quote in clean_cap:
         return clean_cap.replace(default_quote, f'"{active_texts[0]}"', 1)
-
     return clean_cap
 
 
@@ -315,32 +364,33 @@ def compile_layout_prompt(
     canonical_indices = get_canonical_box_order(
         items, height=height, width=width, coords_are_pixels=coords_are_pixels
     )
-
     for idx in canonical_indices:
         item = items[idx]
         raw_entry = dict(item)
         bbox = raw_entry.get("bbox")
-        clean_entry: Dict[str, Any] = {}
-        for k, v in raw_entry.items():
-            if k in _INTERNAL_BOX_KEYS or v is None:
-                continue
-            if isinstance(v, str) and not v.strip():
-                continue
-            clean_entry[k] = v
-        if "category" not in clean_entry:
-            clean_entry["category"] = "text" if "text" in clean_entry else "region"
-        if clean_entry.get("category") == "text" and isinstance(
-            clean_entry.get("text"), str
-        ):
-            txt_val = clean_entry["text"].strip()
+        raw_txt = raw_entry.get("text")
+        txt_val = str(raw_txt).strip() if isinstance(raw_txt, str) else ""
+        label_val = normalize_box_label(
+            raw_entry.get("label") or raw_entry.get("category"),
+            has_text=bool(txt_val),
+        )
+
+        raw_cap = raw_entry.get("caption") or raw_entry.get("description")
+        cap_val = str(raw_cap).strip() if isinstance(raw_cap, str) else ""
+        if label_val == "text":
             if txt_val:
                 active_texts.append(txt_val)
-        if (
-            box_picture_map
-            and idx in box_picture_map
-            and "reference" not in clean_entry
-        ):
-            clean_entry["reference"] = f"Picture {box_picture_map[idx]}"
+            elif cap_val:
+                txt_val = cap_val
+                active_texts.append(txt_val)
+            if not cap_val and txt_val:
+                cap_val = f'Crisp legible text reading "{txt_val}"'
+        elif not cap_val:
+            cap_val = (
+                "Character subject" if label_val == "character" else "Scene object"
+            )
+
+        centralized_bbox: Optional[List[int]] = None
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
             v0, v1, v2, v3 = (
                 float(bbox[0]),
@@ -353,16 +403,16 @@ def compile_layout_prompt(
                 and -1e-5 <= min(v0, v1, v2, v3)
                 and max(v0, v1, v2, v3) <= 1.0 + 1e-5
             ):
-                clean_entry["bbox"] = pixel_bbox_to_abs_centralized(
-                    v0 * (height - 1),
-                    v1 * (width - 1),
-                    v2 * (height - 1),
-                    v3 * (width - 1),
+                centralized_bbox = pixel_bbox_to_abs_centralized(
+                    v0 * height,
+                    v1 * width,
+                    v2 * height,
+                    v3 * width,
                     height=height,
                     width=width,
                 )
             elif coords_are_pixels and min(v0, v1, v2, v3) >= 0.0:
-                clean_entry["bbox"] = pixel_bbox_to_abs_centralized(
+                centralized_bbox = pixel_bbox_to_abs_centralized(
                     v0,
                     v1,
                     v2,
@@ -371,15 +421,43 @@ def compile_layout_prompt(
                     width=width,
                 )
             else:
-                clean_entry["bbox"] = [int(round(v)) for v in (v0, v1, v2, v3)]
+                centralized_bbox = [int(round(v)) for v in (v0, v1, v2, v3)]
+
+        ref_val: Optional[str] = None
+        if isinstance(raw_entry.get("reference"), str) and raw_entry["reference"].strip():
+            ref_val = raw_entry["reference"].strip()
+        elif box_picture_map and idx in box_picture_map:
+            ref_val = f"Picture {box_picture_map[idx]}"
+
+        clean_entry: Dict[str, Any] = {"label": label_val}
+        if centralized_bbox is not None:
+            clean_entry["bbox"] = centralized_bbox
+        if ref_val is not None:
+            clean_entry["reference"] = ref_val
+        if cap_val:
+            clean_entry["caption"] = cap_val
+        if label_val == "text" and txt_val:
+            clean_entry["text"] = txt_val
+
+        for k, v in raw_entry.items():
+            if (
+                k in _INTERNAL_BOX_KEYS
+                or k in ("label", "bbox", "reference", "caption", "description", "text")
+                or v is None
+            ):
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            clean_entry[k] = v
+
         normalized_items.append(clean_entry)
 
     reconciled_caption = reconcile_layout_summary_quotes(caption, active_texts)
     layout_payload = {
-        "bbox_format": "yxyx",
-        "bbox_coord_space": "abs_centralized",
         "summary": {"caption": reconciled_caption},
         "items": normalized_items,
+        "bbox_coord_space": "abs_centralized",
+        "bbox_format": "yxyx",
     }
     return json.dumps(layout_payload, ensure_ascii=False)
 
@@ -413,34 +491,28 @@ def parse_layer_list(
 def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "engine_defaults" in data and isinstance(data["engine_defaults"], dict):
         data = data["engine_defaults"]
-
     harvested: Dict[str, Any] = {}
     if "model_variant" in data and isinstance(data["model_variant"], str):
         mv = data["model_variant"].strip().lower()
         if mv in SUPPORTED_MODELS:
             harvested["model_variant"] = mv
-
     if "prompt_mode" in data and isinstance(data["prompt_mode"], str):
         pm = data["prompt_mode"].strip().lower()
         if pm in SUPPORTED_PROMPT_MODES:
             harvested["prompt_mode"] = pm
-
     if "negative_prompt" in data and isinstance(data["negative_prompt"], str):
         harvested["negative_prompt"] = data["negative_prompt"]
-
     for str_opt_key in ("system_prompt", "thinking_trace"):
         if str_opt_key in data:
             val = data[str_opt_key]
             harvested[str_opt_key] = (
                 str(val) if (isinstance(val, str) and val.strip()) else None
             )
-
     if (
         "layout_coords_are_pixels" in data
         and data["layout_coords_are_pixels"] is not None
     ):
         harvested["layout_coords_are_pixels"] = bool(data["layout_coords_are_pixels"])
-
     for dim_key in ("height", "width"):
         if dim_key in data and data[dim_key] is not None:
             try:
@@ -448,7 +520,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 harvested[dim_key] = (v // 16) * 16
             except (ValueError, TypeError):
                 pass
-
     if "num_inference_steps" in data and data["num_inference_steps"] is not None:
         try:
             harvested["num_inference_steps"] = max(
@@ -456,22 +527,18 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     if "shift" in data and data["shift"] is not None:
         try:
             harvested["shift"] = max(0.1, min(20.0, float(data["shift"])))
         except (ValueError, TypeError):
             pass
-
     if "use_v2_grid" in data and data["use_v2_grid"] is not None:
         harvested["use_v2_grid"] = bool(data["use_v2_grid"])
-
     for s_key in ("early_solver", "late_solver"):
         if s_key in data and isinstance(data[s_key], str):
             slv = data[s_key].strip().lower()
             if slv in SUPPORTED_SOLVERS:
                 harvested[s_key] = slv
-
     if "handoff_threshold" in data and data["handoff_threshold"] is not None:
         try:
             harvested["handoff_threshold"] = max(
@@ -479,43 +546,36 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     for cfg_key in ("guidance_scale", "early_cfg", "late_cfg"):
         if cfg_key in data and data[cfg_key] is not None:
             try:
                 harvested[cfg_key] = max(0.0, min(30.0, float(data[cfg_key])))
             except (ValueError, TypeError):
                 pass
-
     if "guidance_scale" in harvested and "early_cfg" not in harvested:
         harvested["early_cfg"] = harvested["guidance_scale"]
     if "early_cfg" in harvested and "guidance_scale" not in harvested:
         harvested["guidance_scale"] = harvested["early_cfg"]
-
     if "uncond_skip_layers" in data:
         harvested["uncond_skip_layers"] = parse_layer_list(data["uncond_skip_layers"])
     if "slg_layers" in data:
         harvested["slg_layers"] = parse_layer_list(data["slg_layers"])
-
     if "slg_scale" in data and data["slg_scale"] is not None:
         try:
             harvested["slg_scale"] = max(0.0, min(20.0, float(data["slg_scale"])))
         except (ValueError, TypeError):
             pass
-
     for b_key in ("slg_start", "slg_stop", "eta", "box_attn_isolation"):
         if b_key in data and data[b_key] is not None:
             try:
                 harvested[b_key] = max(0.0, min(1.0, float(data[b_key])))
             except (ValueError, TypeError):
                 pass
-
     if "s_noise" in data and data["s_noise"] is not None:
         try:
             harvested["s_noise"] = max(0.0, min(5.0, float(data["s_noise"])))
         except (ValueError, TypeError):
             pass
-
     if "denoise_strength" in data and data["denoise_strength"] is not None:
         try:
             harvested["denoise_strength"] = max(
@@ -523,7 +583,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     if "max_sequence_length" in data and data["max_sequence_length"] is not None:
         try:
             harvested["max_sequence_length"] = max(
@@ -531,27 +590,22 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     if "framing_mode" in data and isinstance(data["framing_mode"], str):
         fm = data["framing_mode"].strip().lower()
         if fm in SUPPORTED_FRAMING_MODES:
             harvested["framing_mode"] = fm
-
     if "input_role" in data and isinstance(data["input_role"], str):
         ir = data["input_role"].strip().lower()
         if ir in SUPPORTED_INPUT_ROLES:
             harvested["input_role"] = ir
-
     if "edit_format" in data and isinstance(data["edit_format"], str):
         ef = data["edit_format"].strip().lower()
         if ef in SUPPORTED_EDIT_FORMATS:
             harvested["edit_format"] = ef
-
     if "mask_blend_mode" in data and isinstance(data["mask_blend_mode"], str):
         mb = data["mask_blend_mode"].strip().lower()
         if mb in SUPPORTED_MASK_BLEND_MODES:
             harvested["mask_blend_mode"] = mb
-
     if "max_vit_patches" in data and data["max_vit_patches"] is not None:
         try:
             harvested["max_vit_patches"] = max(
@@ -559,7 +613,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     for flt_key, lo, hi in (
         ("mtf_boost", 0.0, 0.5),
         ("soft_knee_tau", 0.001, 0.25),
@@ -572,17 +625,14 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 harvested[flt_key] = max(lo, min(hi, float(data[flt_key])))
             except (ValueError, TypeError):
                 pass
-
     if "edit_lora_path" in data:
         val = data["edit_lora_path"]
         harvested["edit_lora_path"] = (
             str(val).strip() if (isinstance(val, str) and val.strip()) else None
         )
-
     if "uncond_uses_references" in data:
         val = data["uncond_uses_references"]
         harvested["uncond_uses_references"] = None if val is None else bool(val)
-
     for flag_key in (
         "enable_thinking",
         "add_vision_id",
@@ -598,7 +648,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     ):
         if flag_key in data and data[flag_key] is not None:
             harvested[flag_key] = bool(data[flag_key])
-
     return harvested
 
 
@@ -609,10 +658,9 @@ def locate_default_preset_file() -> Optional[Path]:
         SHADOWBOXER_ROOT.parent / "config" / DEFAULT_PRESET_FILENAME,
         SHADOWBOXER_ROOT.parent / "webui" / "config" / DEFAULT_PRESET_FILENAME,
     ]
-    for env_key in ("SHADOWBOXER_DEFAULT_JSON", "VISIONSTACK_DEFAULT_JSON"):
-        env_preset = os.environ.get(env_key)
-        if env_preset:
-            candidates.insert(0, Path(env_preset).resolve())
+    env_preset = os.environ.get("SHADOWBOXER_DEFAULT_JSON")
+    if env_preset:
+        candidates.insert(0, Path(env_preset).resolve())
     for c in candidates:
         if c.exists() and c.is_file():
             return c
@@ -629,18 +677,15 @@ def get_active_engine_defaults() -> Dict[str, Any]:
             _PRESET_CACHE["path"] = None
             _PRESET_CACHE["defaults"] = dict(BASELINE_ENGINE_DEFAULTS)
         return dict(_PRESET_CACHE["defaults"])
-
     try:
         current_mtime = preset_file.stat().st_mtime
     except OSError:
         return dict(_PRESET_CACHE["defaults"])
-
     if (
         _PRESET_CACHE["path"] == preset_file
         and _PRESET_CACHE["mtime"] == current_mtime
     ):
         return dict(_PRESET_CACHE["defaults"])
-
     try:
         with open(preset_file, "r", encoding="utf-8") as f:
             raw_payload = json.load(f)
@@ -678,33 +723,26 @@ class GenerationRequest(BaseModel):
     preserve_canvas_outside_boxes: Optional[bool] = Field(default=None)
     box_attn_isolation: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     composite_box_images_to_init: Optional[bool] = Field(default=None)
-
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1024, ge=256, le=2048)
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     shift: Optional[float] = Field(default=None, ge=0.1, le=20.0)
     use_v2_grid: Optional[bool] = Field(default=None)
-
     early_solver: Optional[str] = Field(default=None)
     late_solver: Optional[str] = Field(default=None)
     handoff_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     early_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     late_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
-
     uncond_skip_layers: Optional[List[int]] = Field(default=None)
     slg_layers: Optional[List[int]] = Field(default=None)
     slg_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     slg_start: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     slg_stop: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
     eta: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     s_noise: Optional[float] = Field(default=None, ge=0.0, le=5.0)
-
     max_sequence_length: Optional[int] = Field(default=None, ge=64, le=4096)
     enable_thinking: Optional[bool] = Field(default=None)
-
     init_image_path: Optional[str] = Field(default=None)
     denoise_strength: float = Field(default=1.0, ge=0.01, le=1.0)
     inpaint_mask_path: Optional[str] = Field(default=None)
@@ -712,7 +750,6 @@ class GenerationRequest(BaseModel):
     invert_inpaint_mask: Optional[bool] = Field(default=None)
     control_image_path: Optional[str] = Field(default=None)
     reference_image_paths: List[str] = Field(default_factory=list)
-
     framing_mode: Optional[str] = Field(default=None)
     input_role: Optional[str] = Field(default=None)
     edit_format: Optional[str] = Field(default=None)
@@ -725,7 +762,6 @@ class GenerationRequest(BaseModel):
     latent_clamp_sigma: Optional[float] = Field(default=None, ge=2.0, le=12.0)
     apply_bayer_dither: Optional[bool] = Field(default=None)
     use_reference_cache: Optional[bool] = Field(default=None)
-
     reference_zero_timestep: Optional[bool] = Field(default=None)
     reference_isolated_kv: Optional[bool] = Field(default=None)
     uncond_uses_references: Optional[bool] = Field(default=None)
@@ -733,7 +769,6 @@ class GenerationRequest(BaseModel):
     edit_lora_scale: float = Field(default=1.0, ge=0.0, le=4.0)
     export_vizj_path: Optional[str] = Field(default=None)
     export_vizj_tier: int = Field(default=2, ge=0, le=2)
-
     num_images_per_prompt: int = Field(default=1, ge=1, le=8)
     seed: Optional[int] = Field(default=42)
     output_path: str = Field(default="output_moss_master.png")
@@ -767,7 +802,6 @@ class GenerationRequest(BaseModel):
             use_custom and self.add_vision_id == BASELINE_ENGINE_DEFAULTS["add_vision_id"]
         ):
             self.add_vision_id = bool(active.get("add_vision_id", True))
-
         if self.num_inference_steps is None or (
             use_custom
             and self.num_inference_steps
@@ -782,7 +816,6 @@ class GenerationRequest(BaseModel):
             use_custom and self.use_v2_grid == BASELINE_ENGINE_DEFAULTS["use_v2_grid"]
         ):
             self.use_v2_grid = bool(active["use_v2_grid"])
-
         if self.early_solver is None or (
             use_custom
             and self.early_solver == BASELINE_ENGINE_DEFAULTS["early_solver"]
@@ -841,7 +874,6 @@ class GenerationRequest(BaseModel):
             use_custom and self.slg_stop == BASELINE_ENGINE_DEFAULTS["slg_stop"]
         ):
             self.slg_stop = float(active["slg_stop"])
-
         if self.eta is None or (
             use_custom and self.eta == BASELINE_ENGINE_DEFAULTS["eta"]
         ):
@@ -850,7 +882,6 @@ class GenerationRequest(BaseModel):
             use_custom and self.s_noise == BASELINE_ENGINE_DEFAULTS["s_noise"]
         ):
             self.s_noise = float(active["s_noise"])
-
         if self.max_sequence_length is None or (
             use_custom
             and self.max_sequence_length
@@ -862,7 +893,6 @@ class GenerationRequest(BaseModel):
             and self.enable_thinking == BASELINE_ENGINE_DEFAULTS["enable_thinking"]
         ):
             self.enable_thinking = bool(active["enable_thinking"])
-
         if self.framing_mode is None or (
             use_custom
             and self.framing_mode == BASELINE_ENGINE_DEFAULTS["framing_mode"]
@@ -936,7 +966,6 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["use_reference_cache"]
         ):
             self.use_reference_cache = bool(active["use_reference_cache"])
-
         if self.preserve_canvas_outside_boxes is None or (
             use_custom
             and self.preserve_canvas_outside_boxes
@@ -964,7 +993,6 @@ class GenerationRequest(BaseModel):
             and active.get("uncond_uses_references") is not None
         ):
             self.uncond_uses_references = bool(active["uncond_uses_references"])
-
         if self.cpu_offload is None or (
             use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]
         ):
@@ -1002,7 +1030,6 @@ class GenerationRequest(BaseModel):
         box_pic_map: Dict[int, int] = {}
         dit_ref_counter = 0
         vit_pic_counter = 0
-
         global_role = str(self.input_role or "photo_ref").lower()
         if global_role not in SUPPORTED_INPUT_ROLES:
             global_role = "photo_ref"
@@ -1034,6 +1061,7 @@ class GenerationRequest(BaseModel):
                         "isolate_box_attn": 0.0,
                         "paste_to_canvas": False,
                         "denoise_strength": None,
+                        "z_order": 0.0,
                     }
                 )
 
@@ -1043,7 +1071,6 @@ class GenerationRequest(BaseModel):
             width=self.width,
             coords_are_pixels=self.layout_coords_are_pixels,
         )
-
         for idx in canonical_indices:
             item = self.layout_items[idx]
             img_p = (
@@ -1070,7 +1097,6 @@ class GenerationRequest(BaseModel):
                     width=self.width,
                     coords_are_pixels=self.layout_coords_are_pixels,
                 )
-
             raw_box_fm = item.get("framing_mode")
             if (
                 isinstance(raw_box_fm, str)
@@ -1116,6 +1142,8 @@ class GenerationRequest(BaseModel):
             box_dn = (
                 max(0.01, min(1.0, float(raw_dn))) if raw_dn is not None else None
             )
+            raw_z = item.get("z_order")
+            box_z = float(raw_z) if raw_z is not None else 0.0
 
             specs.append(
                 {
@@ -1131,6 +1159,7 @@ class GenerationRequest(BaseModel):
                     "isolate_box_attn": box_iso,
                     "paste_to_canvas": paste_flag,
                     "denoise_strength": box_dn,
+                    "z_order": box_z,
                 }
             )
         return specs, box_pic_map

@@ -108,7 +108,6 @@ class _AttentionBlock2D(nn.Module):
         k = self.to_k(normed).unsqueeze(1)
         v = self.to_v(normed).unsqueeze(1)
         del normed
-
         if seq_len <= _SDPA_QUERY_CHUNK_SIZE * 2:
             out = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=0.0, is_causal=False
@@ -120,7 +119,6 @@ class _AttentionBlock2D(nn.Module):
                 out[:, start:end, :] = F.scaled_dot_product_attention(
                     q[:, :, start:end, :], k, v, dropout_p=0.0, is_causal=False
                 ).squeeze(1)
-
         del q, k, v
         out = self.to_out[0](out).transpose(1, 2).reshape(b, c, h, w)
         return out.add_(x)
@@ -177,7 +175,8 @@ class _DownEncoderBlock2D(nn.Module):
                 x = resnet.conv_shortcut(x)
             h = resnet.norm2(h)
             h = F.silu(h, inplace=True)
-            x = resnet.conv2(h).add_(x)
+            h = resnet.conv2(h)
+            x = h.add_(x)
             del h
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
@@ -217,7 +216,8 @@ class _UpDecoderBlock2D(nn.Module):
                 x = resnet.conv_shortcut(x)
             h = resnet.norm2(h)
             h = F.silu(h, inplace=True)
-            x = resnet.conv2(h).add_(x)
+            h = resnet.conv2(h)
+            x = h.add_(x)
             del h
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -302,7 +302,8 @@ class _Flux2Encoder(nn.Module):
                     x = resnet.conv_shortcut(x)
                 h = resnet.norm2(h)
                 h = F.silu(h, inplace=True)
-                x = resnet.conv2(h).add_(x)
+                h = resnet.conv2(h)
+                x = h.add_(x)
                 del h
             if block.downsamplers is not None:
                 for downsampler in block.downsamplers:
@@ -371,7 +372,8 @@ class _Flux2Decoder(nn.Module):
                     z = resnet.conv_shortcut(z)
                 h = resnet.norm2(h)
                 h = F.silu(h, inplace=True)
-                z = resnet.conv2(h).add_(z)
+                h = resnet.conv2(h)
+                z = h.add_(z)
                 del h
             if block.upsamplers is not None:
                 for upsampler in block.upsamplers:
@@ -502,10 +504,12 @@ class Flux2AutoencoderKL(nn.Module):
                 else:
                     state_dict[k] = v.to(device=target_dev)
             del raw
+
         if "bn.num_batches_tracked" not in state_dict:
             state_dict["bn.num_batches_tracked"] = torch.tensor(
                 0, dtype=torch.long, device=target_dev
             )
+
         model = cls.from_config_dir(path)
         if "decoder.conv_out.weight" in state_dict:
             actual_dec_ch0 = int(state_dict["decoder.conv_out.weight"].shape[1])
@@ -513,6 +517,7 @@ class Flux2AutoencoderKL(nn.Module):
             if actual_dec_ch0 != expected_dec_ch0 and actual_dec_ch0 == 96:
                 model.config.decoder_block_out_channels = (96, 192, 384, 384)
                 model = cls(config=model.config)
+
         model.load_state_dict(state_dict, strict=True, assign=True)
         model.to(device=target_dev, dtype=dtype)
         model.eval().requires_grad_(False)

@@ -305,6 +305,7 @@ def render_telemetry_report(
         else "FALLBACK TOKENIZER"
     )
     mask_tag = f"{resp.mask_blend_mode_used}{'(Inv)' if resp.invert_inpaint_mask_used else ''}"
+
     print("\n" + "=" * 92)
     print("                          SHADOWBOXER: OPENMOSS TELEMETRY REPORT")
     print("=" * 92)
@@ -383,8 +384,33 @@ def print_telemetry_report(
     render_telemetry_report(resp, engine=engine)
 
 
-def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
+def stage_test_input_files(
+    dest_dir: Path = TEST_INPUTS_DIR, force: bool = False
+) -> Dict[str, Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
+    p_ref_a = dest_dir / "ref_subject_a.png"
+    p_ref_b = dest_dir / "ref_style_b.png"
+    p_init = dest_dir / "init_canvas.png"
+    p_mask = dest_dir / "inpaint_mask.png"
+    p_ctrl = dest_dir / "control_map.png"
+    out_map = {
+        "ref_a": p_ref_a,
+        "ref_b": p_ref_b,
+        "init": p_init,
+        "mask": p_mask,
+        "control": p_ctrl,
+        "ref_subject_a": p_ref_a,
+        "ref_subject_b": p_ref_b,
+        "init_canvas": p_init,
+        "inpaint_mask": p_mask,
+        "control_color_map": p_ctrl,
+    }
+    if not force and all(
+        p.is_file() and p.stat().st_size > 0
+        for p in (p_ref_a, p_ref_b, p_init, p_mask, p_ctrl)
+    ):
+        return out_map
+
     h, w = 512, 512
     yy, xx = np.meshgrid(
         np.linspace(-1.0, 1.0, h, dtype=np.float32),
@@ -432,7 +458,6 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
         ],
         axis=-1,
     ).astype(np.uint8)
-    p_ref_a = dest_dir / "ref_subject_a.png"
     Image.fromarray(ref_a, mode="RGB").save(p_ref_a)
 
     bowl_r = np.sqrt((xx - 0.28) ** 2 + (yy - 0.26) ** 2)
@@ -472,7 +497,6 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
         ],
         axis=-1,
     ).astype(np.uint8)
-    p_ref_b = dest_dir / "ref_style_b.png"
     Image.fromarray(ref_b, mode="RGB").save(p_ref_b)
 
     init_img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -485,12 +509,10 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
     init_img[..., 2] = np.clip((0.56 + 0.15 * (xx * yy)) * 255.0, 0, 255).astype(
         np.uint8
     )
-    p_init = dest_dir / "init_canvas.png"
     Image.fromarray(init_img, mode="RGB").save(p_init)
 
     mask = np.clip((0.55 - rad) * 4.0, 0.0, 1.0)
     mask_u8 = (mask * 255.0).round().astype(np.uint8)
-    p_mask = dest_dir / "inpaint_mask.png"
     Image.fromarray(mask_u8, mode="L").save(p_mask)
 
     ctrl = np.zeros((h, w, 3), dtype=np.uint8)
@@ -498,22 +520,10 @@ def stage_test_input_files(dest_dir: Path = TEST_INPUTS_DIR) -> Dict[str, Path]:
     ctrl[..., 0] = ctrl_val
     ctrl[..., 1] = np.clip((0.5 + 0.5 * xx) * 255.0, 0, 255).astype(np.uint8)
     ctrl[..., 2] = np.clip((0.5 + 0.5 * yy) * 255.0, 0, 255).astype(np.uint8)
-    p_ctrl = dest_dir / "control_map.png"
     Image.fromarray(ctrl, mode="RGB").save(p_ctrl)
 
     print(f"[+] Staged 5 deterministic test input artifacts in: {dest_dir}")
-    return {
-        "ref_a": p_ref_a,
-        "ref_b": p_ref_b,
-        "init": p_init,
-        "mask": p_mask,
-        "control": p_ctrl,
-        "ref_subject_a": p_ref_a,
-        "ref_subject_b": p_ref_b,
-        "init_canvas": p_init,
-        "inpaint_mask": p_mask,
-        "control_color_map": p_ctrl,
-    }
+    return out_map
 
 
 stage_deterministic_test_inputs = stage_test_input_files
@@ -545,7 +555,7 @@ def run_permutation_suite(
     height_override: Optional[int] = None,
     steps: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    staged = stage_test_input_files()
+    staged = stage_test_input_files(force=False)
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     active_base = base_req if base_req is not None else build_default_request()
     w = width_override or active_base.width
@@ -847,7 +857,7 @@ def interactive_loop(
                 )
                 engine.warmup(height=req.height, width=req.width)
             elif cmd == "ti":
-                stage_test_input_files()
+                stage_test_input_files(force=True)
             elif cmd == "tp":
                 run_permutation_suite(engine, req)
             elif cmd == "x":
@@ -1296,7 +1306,7 @@ def main() -> None:
         return
 
     if args.stage_inputs and not (args.generate or args.test_permutations):
-        stage_test_input_files()
+        stage_test_input_files(force=True)
         return
 
     exec_dev = "cuda" if torch.cuda.is_available() else "cpu"

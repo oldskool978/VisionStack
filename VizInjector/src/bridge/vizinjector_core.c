@@ -43,6 +43,21 @@ static float *acquire_tls_f32(float **slot, size_t *cap, size_t needed_floats) {
     return next_buf;
 }
 
+static int is_high_bit_depth_or_hdr_memory(const uint8_t *file_bytes, size_t file_len) {
+    static const uint8_t png_sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (file_len >= 29u &&
+        memcmp(file_bytes, png_sig, 8u) == 0 &&
+        memcmp(file_bytes + 12u, "IHDR", 4u) == 0 &&
+        file_bytes[24] == 16u) {
+        return 1;
+    }
+    if ((file_len >= 10u && memcmp(file_bytes, "#?RADIANCE", 10u) == 0) ||
+        (file_len >= 6u && memcmp(file_bytes, "#?RGBE", 6u) == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
 void vizinjector_core_default_config(VizInjectorConfig *cfg) {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
@@ -76,7 +91,6 @@ static void enforce_depth_monotonic_planar(
     float *r_p = out_planar_vae;
     float *g_p = out_planar_vae + plane;
     float *b_p = out_planar_vae + plane * 2u;
-
     for (size_t i = 0; i < plane; ++i) {
         float r_s = resampled_lin_rgba[i * 4u + 0u];
         float g_s = resampled_lin_rgba[i * 4u + 1u];
@@ -102,7 +116,6 @@ static int build_wire_vizj_from_branches(
         free(rgba8);
         return -2;
     }
-
     viz_postprocess_vae_f32_to_rgb8(out->vae_planar_f32, out->vae_width, out->vae_height, 0, rgb8);
     for (size_t i = 0; i < px_count; ++i) {
         rgba8[i * 4u + 0u] = rgb8[i * 3u + 0u];
@@ -257,7 +270,6 @@ int32_t vizinjector_core_process_linear_f32(
         uint32_t grid_w = vit_w / 16u;
         uint32_t num_patches = grid_h * grid_w;
         size_t vit_floats = (size_t)num_patches * 3u * 2u * 256u;
-
         out->vit_patches_f32 = acquire_tls_f32(&g_tls_out_vit, &g_tls_out_vit_cap, vit_floats);
         if (!out->vit_patches_f32) {
             vizinjector_core_free_output(out);
@@ -319,7 +331,6 @@ int32_t vizinjector_core_process_rgba8(
         &vit_w,
         &vit_h
     );
-
     out->vae_width = vae_w;
     out->vae_height = vae_h;
     out->vit_width = vit_w;
@@ -333,7 +344,6 @@ int32_t vizinjector_core_process_rgba8(
         if (!out->vae_planar_f32) return -2;
         out->vae_Floats = (uint32_t)vae_floats;
         viz_resample_majority_color_map_rgba8(src_rgba8, src_w, src_h, vae_w, vae_h, (VizFramingMode)cfg.framing_mode, out->vae_planar_f32);
-
         VizPerceptualTelemetry telem;
         viz_compute_perceptual_telemetry(out->vae_planar_f32, vae_w, vae_h, &telem);
         out->mean_luminance = telem.mean_luminance;
@@ -409,13 +419,11 @@ int32_t vizinjector_core_process_rgba8(
 
     float *src_lin = acquire_tls_f32(&g_tls_src_lin, &g_tls_src_lin_cap, (size_t)src_w * (size_t)src_h * 4u);
     if (!src_lin) return -3;
-
     if (cfg.input_role == VIZ_ROLE_INPAINT_MASK || cfg.input_role == VIZ_ROLE_DEPTH_MAP) {
         viz_ingest_scalar_rgba8_to_f32(src_rgba8, src_w, src_h, src_lin);
     } else {
         viz_ingest_rgba8_to_linear_f32(src_rgba8, src_w, src_h, cfg.deband_8bit, cfg.seed, src_lin);
     }
-
     return vizinjector_core_process_linear_f32(src_lin, src_w, src_h, &cfg, out);
 }
 
@@ -426,7 +434,6 @@ int32_t vizinjector_core_process_memory(
     VizInjectorOutput *out
 ) {
     if (!file_bytes || file_len < 8 || !out) return -1;
-
     VizInjectorConfig cfg;
     if (cfg_in) cfg = *cfg_in;
     else vizinjector_core_default_config(&cfg);
@@ -470,7 +477,8 @@ int32_t vizinjector_core_process_memory(
         }
     }
 
-    if (cfg.input_role != VIZ_ROLE_PHOTO_REF || (cfg.prefer_vulkan && viz_vk_is_available())) {
+    if (cfg.input_role != VIZ_ROLE_PHOTO_REF ||
+        (cfg.prefer_vulkan && viz_vk_is_available() && !is_high_bit_depth_or_hdr_memory(file_bytes, file_len))) {
         uint8_t *rgba8 = NULL;
         uint32_t w = 0, h = 0;
         if (viz_decode_image_memory_to_rgba8(file_bytes, file_len, &rgba8, &w, &h) == 0 && rgba8) {
@@ -484,7 +492,6 @@ int32_t vizinjector_core_process_memory(
     uint32_t w = 0, h = 0;
     int dec_rc = viz_decode_image_memory_to_linear_f32(file_bytes, file_len, cfg.deband_8bit, cfg.seed, &lin_rgba, &w, &h);
     if (dec_rc != 0 || !lin_rgba) return dec_rc;
-
     int32_t rc = vizinjector_core_process_linear_f32(lin_rgba, w, h, &cfg, out);
     free(lin_rgba);
     return rc;
