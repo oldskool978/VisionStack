@@ -90,11 +90,7 @@ MSVC_REQUIRED_ANCHORS = [
     "oldnames.lib",
 ]
 
-VOCAB_ENDPOINTS = [
-    f"{HTTPS}huggingface.co/m-a-p/YuE2-3B/resolve/main/qwen.tiktoken",
-    f"{HTTPS}huggingface.co/Qwen/Qwen-7B/resolve/main/qwen.tiktoken",
-]
-EXPECTED_VOCAB_LINES = 151643
+EXPECTED_QWEN35_VOCAB_LINES = 248000
 
 QWEN35_TOKENIZER_JSON_ENDPOINTS = [
     f"{HTTPS}huggingface.co/OpenMOSS-Team/MOSS-Image-SFT/resolve/main/tokenizer/tokenizer.json",
@@ -105,6 +101,7 @@ SEMVER_TAG_REGEX = re.compile(
     r"^(?:v|pcre2-|release-|rel-)?(\d+(?:\.\d+)+)$", re.IGNORECASE
 )
 URL_EXTRACTOR_REGEX = re.compile(r"(https?://[^\]\s)>\"']+)", re.IGNORECASE)
+
 _VERIFIED_ARCHIVE_SIGNATURES: set[tuple[str, int, int]] = set()
 
 
@@ -213,8 +210,8 @@ def build_isolated_env() -> dict[str, str]:
         ROAMING_APPDATA_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True)
-
     tempfile.tempdir = str(TMP_DIR)
+
     env: dict[str, str] = {}
     for k in (
         "SYSTEMROOT",
@@ -459,9 +456,9 @@ def unpack_archive(
 
 
 def verify_tiktoken_file(
-    target_file: Path, min_lines: int = EXPECTED_VOCAB_LINES
+    target_file: Path, min_lines: int = EXPECTED_QWEN35_VOCAB_LINES
 ) -> bool:
-    if not target_file.exists() or target_file.stat().st_size < 1_500_000:
+    if not target_file.exists() or target_file.stat().st_size < 2_500_000:
         return False
     try:
         with open(target_file, "rb") as f:
@@ -501,7 +498,7 @@ def _convert_tokenizer_json_to_tiktoken(
 ) -> int:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     vocab = payload.get("model", {}).get("vocab", {})
-    if len(vocab) < 240000:
+    if len(vocab) < EXPECTED_QWEN35_VOCAB_LINES:
         return 0
     byte_dec = _gpt2_byte_decoder()
     sorted_vocab = sorted(vocab.items(), key=lambda kv: int(kv[1]))
@@ -516,40 +513,13 @@ def _convert_tokenizer_json_to_tiktoken(
 
 
 def hydrate_vocabulary(force: bool = False) -> None:
-    target_vocab = ROOT_DIR / "qwen.tiktoken"
-    if not force and verify_tiktoken_file(target_vocab, EXPECTED_VOCAB_LINES):
-        log_info(f"Authoritative base vocabulary converged: {target_vocab.name}")
-    else:
-        log_stage("Hydrating Authoritative Base Vocabulary (qwen.tiktoken)")
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        temp_target = TMP_DIR / f"qwen.tiktoken.{os.getpid()}.tmp"
-        temp_target.unlink(missing_ok=True)
-        downloaded = False
-        for url in VOCAB_ENDPOINTS:
-            try:
-                log_info(f"Streaming vocabulary from: {url}")
-                fetch_payload(url, temp_target, timeout=120)
-                if verify_tiktoken_file(temp_target, EXPECTED_VOCAB_LINES):
-                    downloaded = True
-                    break
-                log_warn(f"Integrity check failed for {url}")
-                temp_target.unlink(missing_ok=True)
-            except Exception as exc:
-                log_warn(f"Mirror fetch failed for {url}: {exc}")
-                temp_target.unlink(missing_ok=True)
-        if not downloaded:
-            raise RuntimeError(
-                "Authoritative vocabulary hydration failed across all mirror endpoints."
-            )
-        if target_vocab.exists():
-            remove_readonly(None, str(target_vocab), None)
-        os.replace(str(temp_target), str(target_vocab))
-        log_info(
-            f"Staged {target_vocab.name} ({target_vocab.stat().st_size:,} bytes, {EXPECTED_VOCAB_LINES:,} tokens)."
-        )
+    stale_qwen = ROOT_DIR / "qwen.tiktoken"
+    if stale_qwen.exists():
+        remove_readonly(None, str(stale_qwen), None)
+        stale_qwen.unlink(missing_ok=True)
 
     target_qwen35 = ROOT_DIR / "qwen35.tiktoken"
-    if not force and verify_tiktoken_file(target_qwen35, 240000):
+    if not force and verify_tiktoken_file(target_qwen35, EXPECTED_QWEN35_VOCAB_LINES):
         log_info(f"Authoritative Qwen3.5 vocabulary converged: {target_qwen35.name}")
         return
 
@@ -566,7 +536,9 @@ def hydrate_vocabulary(force: bool = False) -> None:
             try:
                 resolved_json = local_tok_json.resolve(strict=True)
                 count = _convert_tokenizer_json_to_tiktoken(resolved_json, tmp_tik)
-                if count >= 240000 and verify_tiktoken_file(tmp_tik, 240000):
+                if count >= EXPECTED_QWEN35_VOCAB_LINES and verify_tiktoken_file(
+                    tmp_tik, EXPECTED_QWEN35_VOCAB_LINES
+                ):
                     if target_qwen35.exists():
                         remove_readonly(None, str(target_qwen35), None)
                     os.replace(str(tmp_tik), str(target_qwen35))
@@ -577,23 +549,32 @@ def hydrate_vocabulary(force: bool = False) -> None:
             except Exception:
                 tmp_tik.unlink(missing_ok=True)
 
+    hydrated = False
     for url in QWEN35_TOKENIZER_JSON_ENDPOINTS:
         try:
             fetch_payload(url, tmp_json, timeout=180)
             count = _convert_tokenizer_json_to_tiktoken(tmp_json, tmp_tik)
-            if count >= 240000 and verify_tiktoken_file(tmp_tik, 240000):
+            if count >= EXPECTED_QWEN35_VOCAB_LINES and verify_tiktoken_file(
+                tmp_tik, EXPECTED_QWEN35_VOCAB_LINES
+            ):
                 if target_qwen35.exists():
                     remove_readonly(None, str(target_qwen35), None)
                 os.replace(str(tmp_tik), str(target_qwen35))
                 log_info(
                     f"Staged {target_qwen35.name} ({target_qwen35.stat().st_size:,} bytes, {count:,} tokens)."
                 )
+                hydrated = True
                 break
         except Exception as exc:
-            log_warn(f"Optional Qwen3.5 vocabulary fetch skipped ({url}): {exc}")
+            log_warn(f"Qwen3.5 vocabulary fetch failed ({url}): {exc}")
         finally:
             tmp_json.unlink(missing_ok=True)
             tmp_tik.unlink(missing_ok=True)
+
+    if not hydrated:
+        raise RuntimeError(
+            "Authoritative Qwen3.5 vocabulary hydration failed across all mirror endpoints."
+        )
 
 
 def verify_archive_integrity(archive_path: Path) -> bool:
@@ -759,6 +740,7 @@ def resolve_python_runtime(requested_version: str | None = None) -> tuple[str, s
                 best_ver, best_url = matching_assets[0]
                 if best_url and probe_url(best_url):
                     return best_ver, best_url
+
     cached = read_version_marker(PYTHON_DIR)
     if HERMETIC_PYTHON_EXE.exists():
         if not cached:
@@ -807,6 +789,7 @@ def bootstrap_hermetic_python(
             safe_rmtree(temp_ext)
             archive_path.unlink(missing_ok=True)
             os.chmod(HERMETIC_PYTHON_EXE, 0o755)
+
         pip_bootstrapper = TMP_DIR / "get-pip.py"
         fetch_payload(f"{HTTPS}bootstrap.pypa.io/get-pip.py", pip_bootstrapper)
         subprocess.run(
@@ -1219,12 +1202,14 @@ def hydrate_winsdk(force: bool = False) -> None:
     raw_sdk_version = nuget_specs[0][1]
     clean_sdk_version = normalize_numeric_version(raw_sdk_version)
     sdk_composite_tag = "|".join(f"{p}:{v}" for p, v, _ in nuget_specs)
+
     vs_channel_ver, vs_manifest_url = discover_latest_vs_channel()
 
     sdk_valid = audit_sdk_fakeroot()
     msvc_valid = audit_msvc_fakeroot()
     current_sdk_tag = read_version_marker(WINSDK_DIR, ".sdk_version")
     current_msvc_tag = read_version_marker(WINSDK_DIR, ".msvc_version")
+
     sdk_needs_update = force or not sdk_valid or (current_sdk_tag != sdk_composite_tag)
     msvc_needs_update = force or not msvc_valid or (current_msvc_tag != vs_channel_ver)
 
@@ -1247,6 +1232,7 @@ def hydrate_winsdk(force: bool = False) -> None:
         os.makedirs(to_unc_path(sdk_inc_target), exist_ok=True)
         os.makedirs(to_unc_path(sdk_lib_target), exist_ok=True)
         header_buckets = ["ucrt", "um", "shared", "winrt", "cppwinrt"]
+
         for pkg_id, pkg_ver, url in nuget_specs:
             nupkg_path = TMP_DIR / f"{pkg_id}.{pkg_ver}.nupkg"
             ext_dir = TMP_DIR / f"ext_{pkg_id}"
@@ -1306,6 +1292,7 @@ def hydrate_winsdk(force: bool = False) -> None:
             finally:
                 safe_rmtree(ext_dir)
                 nupkg_path.unlink(missing_ok=True)
+
         _decontaminate_sdk_um_libs()
         write_version_marker(WINSDK_DIR, sdk_composite_tag, ".sdk_version")
 
@@ -1331,6 +1318,7 @@ def hydrate_winsdk(force: bool = False) -> None:
             raise RuntimeError(
                 "No Microsoft.VC CRT header packages found in upstream Visual Studio catalog."
             )
+
         all_crt_headers.sort(
             key=lambda p: (
                 _extract_vc_toolset_ver(p.get("id", "")),
@@ -1348,6 +1336,7 @@ def hydrate_winsdk(force: bool = False) -> None:
             else best_header_pkg.get("version", vs_channel_ver)
         )
         target_prefix = f"microsoft.vc.{msvc_version.lower()}.crt."
+
         crt_headers_pkgs = [
             p
             for p in all_crt_headers
@@ -1376,10 +1365,12 @@ def hydrate_winsdk(force: bool = False) -> None:
         )
         os.makedirs(to_unc_path(msvc_inc_target), exist_ok=True)
         os.makedirs(to_unc_path(msvc_lib_target), exist_ok=True)
+
         for pkg in crt_headers_pkgs:
             extract_and_stage_vs_payload(pkg, "crt_headers", msvc_inc_target)
         for pkg in crt_libs_pkgs:
             extract_and_stage_vs_payload(pkg, "crt_libs", msvc_lib_target)
+
         if not audit_msvc_fakeroot():
             raise RuntimeError(
                 "MSVC CRT hydration incomplete: mandatory CRT headers or libraries missing."
@@ -1433,7 +1424,6 @@ def orchestrate_hermetic_sitecustomize() -> None:
         site_packages_dirs = list((PYTHON_DIR / "lib").glob("python*/site-packages"))
 
     sitecustomize_code = f"""from __future__ import annotations
-
 import os
 from pathlib import Path
 import sys
@@ -1444,12 +1434,10 @@ _TC = _ROOT / "toolchain"
 _PY = _TC / "python"
 _CACHE = _ROOT / ".forge_cache"
 
-
 def _env_default(key: str, val: str) -> None:
     cur = os.environ.get(key)
     if cur is None or not cur.strip():
         os.environ[key] = val
-
 
 _env_default("PYTHONNOUSERSITE", "1")
 _env_default("PYTHONUTF8", "1")
@@ -1518,6 +1506,7 @@ def main() -> None:
         help="Purge all hydrated toolchains, libraries, and caches",
     )
     args, _ = parser.parse_known_args()
+
     if args.clean:
         clean_hydration()
         return

@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #if defined(_WIN32)
-  #if defined(VIZTOKEN_BUILD_DLL) || defined(TTKN_BUILD_DLL)
+  #if defined(VIZTOKEN_BUILD_DLL)
     #define VIZTOKEN_API __declspec(dllexport)
   #else
     #define VIZTOKEN_API __declspec(dllimport)
@@ -14,14 +14,11 @@
   #define VIZTOKEN_API __attribute__((visibility("default")))
 #endif
 
-#define TTKN_API VIZTOKEN_API
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct viztoken_ctx_t viztoken_ctx_t;
-typedef struct viztoken_ctx_t tiktalkin_ctx_t;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -30,8 +27,6 @@ typedef struct {
     char     literal[58];
 } viztoken_special_disk_t;
 #pragma pack(pop)
-
-typedef viztoken_special_disk_t ttkn_special_disk_t;
 
 typedef struct {
     uint32_t total_tokens;
@@ -45,8 +40,6 @@ typedef struct {
     double   psl_variance;
     double   compile_seconds;
 } viztoken_telemetry_t;
-
-typedef viztoken_telemetry_t ttkn_telemetry_t;
 
 VIZTOKEN_API viztoken_ctx_t *viztoken_init(const char *ranks_bin_path);
 
@@ -93,17 +86,6 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_with_telemetry(
     viztoken_telemetry_t *out_telemetry
 );
 
-VIZTOKEN_API int32_t viztoken_compile_vocab_v4(
-    const char *in_tiktoken_path,
-    const char *out_bin_path,
-    const char *regex_pattern,
-    const viztoken_special_disk_t *specials,
-    uint32_t specials_count,
-    uint32_t eot_token_id,
-    const char *out_telemetry_json,
-    viztoken_telemetry_t *out_telemetry
-);
-
 VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
     const char *in_tiktoken_path,
     const char *out_bin_path,
@@ -116,57 +98,6 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
 );
 
 VIZTOKEN_API void viztoken_destroy(viztoken_ctx_t *ctx);
-
-/* Legacy C-ABI Symbol Exports */
-VIZTOKEN_API tiktalkin_ctx_t *tiktalkin_init(const char *ranks_bin_path);
-VIZTOKEN_API int32_t tiktalkin_encode(
-    tiktalkin_ctx_t *ctx,
-    const char *text,
-    uint32_t text_bytes,
-    int32_t *out_token_ids,
-    uint32_t max_tokens
-);
-VIZTOKEN_API int32_t tiktalkin_encode_ordinary(
-    tiktalkin_ctx_t *ctx,
-    const char *text,
-    uint32_t text_bytes,
-    int32_t *out_token_ids,
-    uint32_t max_tokens
-);
-VIZTOKEN_API int32_t tiktalkin_decode(
-    tiktalkin_ctx_t *ctx,
-    const int32_t *token_ids,
-    uint32_t id_count,
-    char *out_text,
-    uint32_t max_bytes
-);
-VIZTOKEN_API uint32_t tiktalkin_find_common_prefix(
-    const int32_t *tokens_a,
-    uint32_t len_a,
-    const int32_t *tokens_b,
-    uint32_t len_b
-);
-VIZTOKEN_API int32_t tiktalkin_compile_vocab(
-    const char *in_tiktoken_path,
-    const char *out_bin_path
-);
-VIZTOKEN_API int32_t tiktalkin_compile_vocab_with_telemetry(
-    const char *in_tiktoken_path,
-    const char *out_bin_path,
-    const char *out_telemetry_json,
-    ttkn_telemetry_t *out_telemetry
-);
-VIZTOKEN_API int32_t tiktalkin_compile_vocab_v4(
-    const char *in_tiktoken_path,
-    const char *out_bin_path,
-    const char *regex_pattern,
-    const ttkn_special_disk_t *specials,
-    uint32_t specials_count,
-    uint32_t eot_token_id,
-    const char *out_telemetry_json,
-    ttkn_telemetry_t *out_telemetry
-);
-VIZTOKEN_API void tiktalkin_destroy(tiktalkin_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

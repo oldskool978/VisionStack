@@ -19,6 +19,7 @@ WINSDK_DIR = TOOLCHAIN_DIR / "winsdk"
 
 IS_WIN = sys.platform == "win32"
 HERMETIC_PYTHON = TOOLCHAIN_DIR / "python" / ("python.exe" if IS_WIN else "bin/python")
+
 if (
     HERMETIC_PYTHON.exists()
     and Path(sys.executable).resolve() != HERMETIC_PYTHON.resolve()
@@ -80,13 +81,11 @@ def remove_readonly_flag(path: Path) -> None:
 def purge_non_runtime_artifacts(dist_bin: Path) -> None:
     if not dist_bin.is_dir():
         return
+    stale_names = {"qwen.ranks.bin", "tiktalkin.dll", "libtiktalkin.so", "tiktalkin.py"}
     for item in list(dist_bin.iterdir()):
-        if item.is_file() and item.suffix.lower() in (
-            ".lib",
-            ".exp",
-            ".pdb",
-            ".json",
-            ".html",
+        if item.is_file() and (
+            item.suffix.lower() in (".lib", ".exp", ".pdb", ".json", ".html")
+            or item.name in stale_names
         ):
             remove_readonly_flag(item)
             item.unlink(missing_ok=True)
@@ -126,27 +125,28 @@ def main() -> None:
     out_dll = DIST_BIN_DIR / ("viztoken.dll" if IS_WIN else "libviztoken.so")
     out_implib = dag_dir / "viztoken.lib"
     out_cli = DIST_BIN_DIR / ("viztoken-cli.exe" if IS_WIN else "viztoken-cli")
-    out_bin = DIST_BIN_DIR / "qwen.ranks.bin"
-    out_telem = dag_dir / "telemetry.json"
+    out_bin_35 = DIST_BIN_DIR / "qwen35.ranks.bin"
+    out_telem_35 = dag_dir / "telemetry_qwen35.json"
 
-    for target in [out_dll, out_implib, out_cli, out_bin, out_telem]:
+    for target in [out_dll, out_implib, out_cli, out_bin_35, out_telem_35]:
         remove_readonly_flag(target)
 
     inc_sysroot = NATIVE_SYSROOT / "include"
     lib_sysroot = NATIVE_SYSROOT / "lib"
     pcre2_lib = lib_sysroot / ("pcre2-8.lib" if IS_WIN else "libpcre2-8.a")
+
     if not pcre2_lib.exists():
         build_native_script = ROOT_DIR / "tools" / "build_native.py"
         subprocess.run([sys.executable, "-I", str(build_native_script)], check=True)
 
-    qwen_tiktoken_candidate = ROOT_DIR / "qwen.tiktoken"
-
     ninja_file = dag_dir / "build.ninja"
+
     with open(ninja_file, "w", encoding="utf-8") as f:
         f.write(f"clang = {to_posix(clang_exe)}\n")
         if IS_WIN:
             f.write(f"clang_cl = {to_posix(clang_cl_exe)}\n")
             f.write(f"lld_link = {to_posix(lld_link_exe)}\n")
+
             winsysroot_arg = sanitize_path(WINSDK_DIR)
             imsvc_flags = resolve_winsdk_imsvc_flags()
             cflags = (
@@ -164,6 +164,7 @@ def main() -> None:
                 raise FileNotFoundError(
                     "Sysroot fakeroot libraries missing in toolchain/winsdk. Run tools/hydrate.py first."
                 )
+
             msvc_lib = msvc_libs[-1]
             sdk_lib_um = sdk_libs_um[-1]
             sdk_lib_ucrt = sdk_libs_ucrt[-1]
@@ -184,12 +185,15 @@ def main() -> None:
             )
             f.write(f"link_flags_dll = {link_flags_dll}\n")
             f.write(f"link_flags_cli = {link_flags_cli}\n\n")
+
             f.write("rule cc\n")
             f.write('  command = "$clang_cl" $cflags /c "$in" /Fo:"$out"\n')
             f.write("  description = CC $out\n\n")
+
             f.write("rule link_dll\n")
             f.write('  command = "$lld_link" $in $link_flags_dll\n')
             f.write("  description = LINK_DLL $out\n\n")
+
             f.write("rule link_cli\n")
             f.write('  command = "$lld_link" $in $link_flags_cli\n')
             f.write("  description = LINK_CLI $out\n\n")
@@ -199,23 +203,22 @@ def main() -> None:
                 "-DVIZTOKEN_BUILD_DLL -DPCRE2_STATIC -DPCRE2_CODE_UNIT_WIDTH=8"
             )
             f.write(f"cflags = {cflags}\n\n")
+
             f.write("rule cc\n")
             f.write('  command = "$clang" $cflags -c "$in" -o "$out"\n')
             f.write("  description = CC $out\n\n")
+
             f.write("rule link_dll\n")
             f.write(
                 f'  command = "$clang" -shared -flto -o "$out" $in "{to_posix(pcre2_lib)}" -lpthread\n'
             )
             f.write("  description = LINK_DLL $out\n\n")
+
             f.write("rule link_cli\n")
             f.write(
                 f'  command = "$clang" -flto -o "$out" $in "{to_posix(out_dll)}" "{to_posix(pcre2_lib)}" -lpthread\n'
             )
             f.write("  description = LINK_CLI $out\n\n")
-
-        f.write("rule compile_vocab\n")
-        f.write('  command = "$in_cli" compile "$in_vocab" "$out_bin" "$out_telem"\n')
-        f.write("  description = COMPILE_VOCAB $out_bin\n\n")
 
         f.write(f"build {out_obj}: cc {to_posix(c_source)}\n")
         if IS_WIN:
@@ -224,24 +227,12 @@ def main() -> None:
             )
         else:
             f.write(f"build {to_posix(out_dll)}: link_dll {out_obj}\n")
+
         f.write(f"build {main_obj}: cc {to_posix(main_source)}\n")
         f.write(
             f"build {to_posix(out_cli)}: link_cli {main_obj} | {to_posix(out_dll)}\n"
         )
-
-        if qwen_tiktoken_candidate.exists():
-            f.write(
-                f"build {to_posix(out_bin)} {to_posix(out_telem)}: compile_vocab | {to_posix(out_cli)}\n"
-            )
-            f.write(f"  in_cli = {to_posix(out_cli)}\n")
-            f.write(f"  in_vocab = {to_posix(qwen_tiktoken_candidate)}\n")
-            f.write(f"  out_bin = {to_posix(out_bin)}\n")
-            f.write(f"  out_telem = {to_posix(out_telem)}\n")
-            f.write(
-                f"default {to_posix(out_dll)} {to_posix(out_cli)} {to_posix(out_bin)}\n"
-            )
-        else:
-            f.write(f"default {to_posix(out_dll)} {to_posix(out_cli)}\n")
+        f.write(f"default {to_posix(out_dll)} {to_posix(out_cli)}\n")
 
     print("  -> Compiling deliverables via Ninja...")
     subprocess.run([str(ninja_exe)], cwd=str(dag_dir.resolve()), check=True)
@@ -258,38 +249,29 @@ def main() -> None:
             shutil.copy2(src_py, dst_py)
 
     print(f"[+] Build successful: {out_dll} and {out_cli}")
-    if out_bin.exists():
-        print(
-            f"[+] Compiled SWISS5 vocabulary binary verified: {out_bin} ({out_bin.stat().st_size:,} bytes)"
-        )
 
     qwen35_tiktoken = ROOT_DIR / "qwen35.tiktoken"
-    if qwen35_tiktoken.is_file():
-        if str(ROOT_DIR) not in sys.path:
-            sys.path.insert(0, str(ROOT_DIR))
-        import viztoken
-
-        out_bin_35 = DIST_BIN_DIR / "qwen35.ranks.bin"
-        out_telem_35 = dag_dir / "telemetry_qwen35.json"
-        remove_readonly_flag(out_bin_35)
-        remove_readonly_flag(out_telem_35)
-        qwen35_pat = (
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
-            r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        )
-        telem35 = viztoken.compile_vocab(
-            in_tiktoken_path=qwen35_tiktoken,
-            out_bin_path=out_bin_35,
-            out_telemetry_json=out_telem_35,
-            regex_pattern=qwen35_pat,
-            specials_list=viztoken.build_default_qwen35_specials(),
-            eot_token_id=248044,
-        )
-        print(
-            f"[+] Compiled Qwen3.5 SWISS5 binary verified: {out_bin_35} "
-            f"({out_bin_35.stat().st_size:,} bytes, {telem35.total_tokens:,} tokens)"
+    if not qwen35_tiktoken.is_file():
+        raise FileNotFoundError(
+            f"Missing {qwen35_tiktoken}. Run tools/hydrate.py first."
         )
 
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
+    import viztoken
+
+    telem35 = viztoken.compile_vocab(
+        in_tiktoken_path=qwen35_tiktoken,
+        out_bin_path=out_bin_35,
+        out_telemetry_json=out_telem_35,
+        regex_pattern=viztoken.QWEN35_PRETOKENIZE_REGEX,
+        specials_list=viztoken.build_default_qwen35_specials(),
+        eot_token_id=viztoken.QWEN35_EOT_TOKEN_ID,
+    )
+    print(
+        f"[+] Compiled Qwen3.5 SWISS5 binary verified: {out_bin_35} "
+        f"({out_bin_35.stat().st_size:,} bytes, {telem35.total_tokens:,} tokens)"
+    )
     purge_non_runtime_artifacts(DIST_BIN_DIR)
 
 

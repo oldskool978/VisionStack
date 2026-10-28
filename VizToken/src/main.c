@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
             pattern,
             NULL,
             0,
-            151643,
+            248044U,
             out_telem,
             &telem
         );
@@ -188,6 +188,7 @@ int main(int argc, char **argv) {
             exit_code = 1;
             goto cleanup;
         }
+
         const char *test_prompt = argv[3];
         uint32_t in_len = (uint32_t)strlen(test_prompt);
         uint32_t max_toks = in_len + 64U;
@@ -201,6 +202,7 @@ int main(int argc, char **argv) {
         clock_t t0 = clock();
         int32_t count = viztoken_encode(ctx, test_prompt, in_len, tokens, max_toks);
         clock_t t1 = clock();
+
         double ms = ((double)(t1 - t0) / CLOCKS_PER_SEC) * 1000.0;
         double denom_s = (ms > 0.0) ? (ms / 1000.0) : 1e-6;
         printf(
@@ -231,6 +233,7 @@ int main(int argc, char **argv) {
                 free(decoded);
             }
         }
+
         free(tokens);
         viztoken_destroy(ctx);
         goto cleanup;
