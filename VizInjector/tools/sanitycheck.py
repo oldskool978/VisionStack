@@ -16,6 +16,7 @@ BIN_DIR = ROOT_DIR / "bin"
 DIST_DIR = ROOT_DIR / "dist"
 DIST_BIN = DIST_DIR / "bin"
 CACHE_DIR = ROOT_DIR / ".forge_cache"
+
 IS_WIN = sys.platform == "win32"
 HERMETIC_PYTHON_EXE = BIN_DIR / "python" / ("python.exe" if IS_WIN else "bin/python")
 
@@ -305,8 +306,54 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
     assert (
         len(unique_colors) == 2
     ), f"Color map resampler hallucinated intermediate colors: {unique_colors}"
+
+    h_cm, w_cm = 600, 900
+    yy_cm, xx_cm = np.ogrid[:h_cm, :w_cm]
+    cy_cm, cx_cm = (h_cm - 1) / 2.0, (w_cm - 1) / 2.0
+    r2_cm = (xx_cm - cx_cm) ** 2 + (yy_cm - cy_cm) ** 2
+    cmap_iso = np.zeros((h_cm, w_cm, 4), dtype=np.uint8)
+    cmap_iso[..., :3] = [0, 0, 255]
+    cmap_iso[..., 3] = 255
+    cmap_iso[r2_cm <= (180.0**2), :3] = [255, 0, 0]
+    b_cmap_iso = client.condition_rgba8(
+        cmap_iso,
+        VizInjectorRequest(
+            target_width=512,
+            target_height=512,
+            framing_mode="inscribed",
+            input_role="color_map",
+        ),
+    )
+    cmap_iso_rgb = np.round(
+        (b_cmap_iso.vae_tensor[0].permute(1, 2, 0).numpy() * 0.5 + 0.5) * 255.0
+    ).astype(np.int32)
+    unique_iso_colors = np.unique(cmap_iso_rgb.reshape(-1, 3), axis=0)
+    assert (
+        len(unique_iso_colors) == 2
+    ), f"Isotropic color map hallucinated colors: {unique_iso_colors}"
+    red_mask = (cmap_iso_rgb[..., 0] > 200).astype(np.float64)
+    c_ys, c_xs = np.nonzero(red_mask)
+    c_std_x = float(np.std(c_xs))
+    c_std_y = float(np.std(c_ys))
+    cmap_anisotropy = abs(c_std_x - c_std_y) / max(c_std_x, c_std_y, 1e-9)
+    assert (
+        cmap_anisotropy < 0.01
+    ), f"Color map resampler suffered anisotropic aspect shear: {cmap_anisotropy:.5f}"
+
+    b_cmap_contain = client.condition_rgba8(
+        cmap_iso,
+        VizInjectorRequest(
+            target_width=512,
+            target_height=512,
+            framing_mode="contain",
+            input_role="color_map",
+        ),
+    )
+    assert float(b_cmap_contain.vae_tensor[0, 2, 0, 256].item()) == -1.0, (
+        "Color map contain letterbox border must pad with exact -1.0"
+    )
     print(
-        f"  [+] Region Color-Map Role    : {len(unique_colors)} Pure Discrete IDs Preserved (Zero Anti-Alias Bleed)"
+        f"  [+] Region Color-Map Role    : {len(unique_colors)} Pure IDs Preserved | 900x600->512x512 Anisotropy = {cmap_anisotropy:.5f} (<0.01)"
     )
 
     stroke_mask = np.zeros((1024, 1024, 4), dtype=np.uint8)
@@ -397,6 +444,7 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     test_png = tmp_dir / "test_input_\u591c\u7a7a.png"
     test_vizj = tmp_dir / "test_wire_\u591c\u7a7a.vizj"
+
     grad = np.zeros((512, 512, 3), dtype=np.uint8)
     for y in range(512):
         grad[y, :, 0] = y // 2
@@ -419,6 +467,7 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
         raise RuntimeError(
             f"CLI invocation failed with code {proc.returncode}:\n{proc.stderr}"
         )
+
     assert (
         test_vizj.exists() and test_vizj.stat().st_size > 144
     ), ".vizj wire container was not created"
@@ -437,6 +486,7 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
     reloaded.meta.vit_size = (0, 0)
     t1_bytes = client.save_vizj(reloaded, tier=VIZJ_TIER_VAE_LATENT, use_bf16=True)
     t2_bytes = client.save_vizj(reloaded, tier=VIZJ_TIER_DUAL_LATENT, use_bf16=True)
+
     b_t1 = client.load_vizj_bytes(t1_bytes)
     b_t2 = client.load_vizj_bytes(t2_bytes)
     assert b_t1.packed_latents.shape == (1, 128, 32, 32)
@@ -563,6 +613,7 @@ def main() -> None:
     )
     print("=" * 88)
     t0 = time.perf_counter()
+
     client = audit_gate_1_binaries_and_sysroot()
     try:
         audit_gate_2_radiometric_math_and_isotropy(client)
@@ -571,8 +622,9 @@ def main() -> None:
         audit_gate_5_gpu_acceleration_and_latentization(client)
     finally:
         client.close()
+
     elapsed = time.perf_counter() - t0
-    print("\n" + "-" * 88)
+    print("\n" + "=" * 88)
     print(
         f"[+] STATUS: SECURE, ROBUST & CONVERGED IN {elapsed:.2f}s. ZERO DRIFT ACROSS ALL 5 GATES."
     )

@@ -1,5 +1,4 @@
 #include "kaiser_resampler_2d.h"
-
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,6 +207,7 @@ int viz_build_polyphase_schedule_1d(
     for (uint32_t d = 0; d < out_dim; ++d) {
         float d_center = (float)d + 0.5f;
         float *w_row = weights + (size_t)d * max_taps;
+
         if (d_center < out_offset || d_center > (out_offset + active_out_span)) {
             start_idx[d] = 0;
             src_center[d] = -1.0f;
@@ -505,13 +505,11 @@ int viz_resample_2d_linear_rgba(
                     for (uint32_t k = 0; k < taps_x; k += 4u) {
                         __m256 p01 = _mm256_loadu_ps(s_ptr + (size_t)k * 4u);
                         __m256 p23 = _mm256_loadu_ps(s_ptr + (size_t)(k + 2u) * 4u);
-
                         __m256 wk01 = _mm256_set_m128(_mm_set1_ps(w[k + 1u]), _mm_set1_ps(w[k]));
                         __m256 wk23 = _mm256_set_m128(_mm_set1_ps(w[k + 3u]), _mm_set1_ps(w[k + 2u]));
 
                         __m256 a01 = _mm256_permute_ps(p01, _MM_SHUFFLE(3, 3, 3, 3));
                         __m256 a23 = _mm256_permute_ps(p23, _MM_SHUFFLE(3, 3, 3, 3));
-
                         __m256 wa01 = _mm256_mul_ps(wk01, a01);
                         __m256 wa23 = _mm256_mul_ps(wk23, a23);
 
@@ -523,7 +521,6 @@ int viz_resample_2d_linear_rgba(
                         raw0 = _mm256_fmadd_ps(p01, wk01, raw0);
                         raw1 = _mm256_fmadd_ps(p23, wk23, raw1);
                     }
-
                     acc0 = _mm256_add_ps(acc0, acc1);
                     raw0 = _mm256_add_ps(raw0, raw1);
                     v_acc = _mm_add_ps(_mm256_castps256_ps128(acc0), _mm256_extractf128_ps(acc0, 1));
@@ -577,7 +574,6 @@ int viz_resample_2d_linear_rgba(
             memset(dst_row, 0, (size_t)dst_w * 4u * sizeof(float));
             continue;
         }
-
         if (active_dx_start > 0u) {
             memset(dst_row, 0, (size_t)active_dx_start * 4u * sizeof(float));
         }
@@ -607,7 +603,6 @@ int viz_resample_2d_linear_rgba(
         for (; dx + 4u <= active_dx_end; dx += 4u) {
             size_t off0 = (size_t)dx * 4u;
             size_t off1 = off0 + 8u;
-
             __m256 acc0 = _mm256_setzero_ps();
             __m256 acc1 = _mm256_setzero_ps();
             __m256 raw0 = _mm256_setzero_ps();
@@ -616,16 +611,12 @@ int viz_resample_2d_linear_rgba(
             for (uint32_t k = 0; k < taps_y; ++k) {
                 const float *r_ptr = tap_rows[k];
                 __m256 wk = _mm256_set1_ps(w[k]);
-
                 __m256 p0 = _mm256_loadu_ps(r_ptr + off0);
                 __m256 p1 = _mm256_loadu_ps(r_ptr + off1);
-
                 __m256 a0 = _mm256_permute_ps(p0, _MM_SHUFFLE(3, 3, 3, 3));
                 __m256 a1 = _mm256_permute_ps(p1, _MM_SHUFFLE(3, 3, 3, 3));
-
                 __m256 wa0 = _mm256_mul_ps(wk, a0);
                 __m256 wa1 = _mm256_mul_ps(wk, a1);
-
                 __m256 u0 = _mm256_blend_ps(p0, v_one256, 0x88);
                 __m256 u1 = _mm256_blend_ps(p1, v_one256, 0x88);
 
@@ -684,7 +675,10 @@ void viz_resample_majority_color_map_rgba8(
     VizFramingMode framing,
     float *out_planar_vae_rgb
 ) {
-    (void)framing;
+    if (!src_rgba8 || !out_planar_vae_rgb || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) {
+        return;
+    }
+
     size_t plane = (size_t)dst_w * (size_t)dst_h;
     float *r_p = out_planar_vae_rgb;
     float *g_p = out_planar_vae_rgb + plane;
@@ -692,18 +686,68 @@ void viz_resample_majority_color_map_rgba8(
 
     float scale_x = (float)src_w / (float)dst_w;
     float scale_y = (float)src_h / (float)dst_h;
+    float in_off_x = 0.0f;
+    float in_off_y = 0.0f;
+    float out_off_x = 0.0f;
+    float out_off_y = 0.0f;
+    float span_x = (float)dst_w;
+    float span_y = (float)dst_h;
+
+    if (framing == VIZ_FRAMING_INSCRIBED || framing == VIZ_FRAMING_NEVER_CROP) {
+        float fill_scale = fmaxf((float)dst_w / (float)src_w, (float)dst_h / (float)src_h);
+        scale_x = 1.0f / fill_scale;
+        scale_y = 1.0f / fill_scale;
+        float vis_w = (float)dst_w * scale_x;
+        float vis_h = (float)dst_h * scale_y;
+        in_off_x = 0.5f * ((float)src_w - vis_w);
+        in_off_y = 0.5f * ((float)src_h - vis_h);
+    } else if (framing == VIZ_FRAMING_CONTAIN) {
+        float fit_scale = fminf((float)dst_w / (float)src_w, (float)dst_h / (float)src_h);
+        scale_x = 1.0f / fit_scale;
+        scale_y = 1.0f / fit_scale;
+        span_x = (float)src_w * fit_scale;
+        span_y = (float)src_h * fit_scale;
+        out_off_x = 0.5f * ((float)dst_w - span_x);
+        out_off_y = 0.5f * ((float)dst_h - span_y);
+    }
 
     for (uint32_t dy = 0; dy < dst_h; ++dy) {
-        int y0 = (int)floorf((float)dy * scale_y);
-        int y1 = (int)ceilf((float)(dy + 1u) * scale_y);
+        float dy_center = (float)dy + 0.5f;
+        if (dy_center < out_off_y || dy_center > (out_off_y + span_y)) {
+            size_t row_base = (size_t)dy * dst_w;
+            for (uint32_t dx = 0; dx < dst_w; ++dx) {
+                r_p[row_base + dx] = -1.0f;
+                g_p[row_base + dx] = -1.0f;
+                b_p[row_base + dx] = -1.0f;
+            }
+            continue;
+        }
+
+        float sy_lo = in_off_y + ((float)dy - out_off_y) * scale_y;
+        float sy_hi = in_off_y + ((float)(dy + 1u) - out_off_y) * scale_y;
+        int y0 = (int)floorf(sy_lo);
+        int y1 = (int)ceilf(sy_hi);
         if (y0 < 0) y0 = 0;
+        if (y0 >= (int)src_h) y0 = (int)src_h - 1;
         if (y1 <= y0) y1 = y0 + 1;
         if (y1 > (int)src_h) y1 = (int)src_h;
 
         for (uint32_t dx = 0; dx < dst_w; ++dx) {
-            int x0 = (int)floorf((float)dx * scale_x);
-            int x1 = (int)ceilf((float)(dx + 1u) * scale_x);
+            size_t idx = (size_t)dy * dst_w + dx;
+            float dx_center = (float)dx + 0.5f;
+            if (dx_center < out_off_x || dx_center > (out_off_x + span_x)) {
+                r_p[idx] = -1.0f;
+                g_p[idx] = -1.0f;
+                b_p[idx] = -1.0f;
+                continue;
+            }
+
+            float sx_lo = in_off_x + ((float)dx - out_off_x) * scale_x;
+            float sx_hi = in_off_x + ((float)(dx + 1u) - out_off_x) * scale_x;
+            int x0 = (int)floorf(sx_lo);
+            int x1 = (int)ceilf(sx_hi);
             if (x0 < 0) x0 = 0;
+            if (x0 >= (int)src_w) x0 = (int)src_w - 1;
             if (x1 <= x0) x1 = x0 + 1;
             if (x1 > (int)src_w) x1 = (int)src_w;
 
@@ -741,11 +785,9 @@ void viz_resample_majority_color_map_rgba8(
                 }
             }
 
-            size_t idx = (size_t)dy * dst_w + dx;
             float r = (float)((best_packed >> 16) & 0xFFu) * (1.0f / 255.0f);
             float g = (float)((best_packed >> 8) & 0xFFu) * (1.0f / 255.0f);
             float b = (float)(best_packed & 0xFFu) * (1.0f / 255.0f);
-
             r_p[idx] = r * 2.0f - 1.0f;
             g_p[idx] = g * 2.0f - 1.0f;
             b_p[idx] = b * 2.0f - 1.0f;

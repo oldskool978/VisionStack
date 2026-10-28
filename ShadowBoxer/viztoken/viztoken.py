@@ -26,17 +26,16 @@ import unicodedata
 
 ROOT_DIR = Path(__file__).resolve().parent
 IS_WIN = sys.platform == "win32"
-_DLL_NAMES = (
-    ("viztoken.dll", "tiktalkin.dll")
-    if IS_WIN
-    else ("libviztoken.so", "libtiktalkin.so")
-)
-_SWISS_MAGICS = (b"TIKTALKIN_SWISS4", b"VIZTOK_SWISS5___")
+_DLL_NAME = "viztoken.dll" if IS_WIN else "libviztoken.so"
+
+_SWISS5_MAGIC = b"VIZTOK_SWISS5___"
+_SWISS5_FAST_MAGIC = 0x565A5435
 _SWISS_HEADER_FMT = "<16sIIIIIIQQQQQIIQIIQQQ"
 _SWISS_HEADER_SIZE = struct.calcsize(_SWISS_HEADER_FMT)
 _SPECIAL_DISK_FMT = "<iH58s"
 _SPECIAL_DISK_SIZE = struct.calcsize(_SPECIAL_DISK_FMT)
 
+QWEN35_EOT_TOKEN_ID = 248044
 QWEN35_PRETOKENIZE_REGEX = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
     r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
@@ -72,29 +71,13 @@ class _VizTokenBinding:
         self.dll_path = dll_path
         self.lib = ctypes.CDLL(str(dll_path))
 
-        init_fn = getattr(self.lib, "viztoken_init", None) or getattr(
-            self.lib, "tiktalkin_init"
-        )
-        encode_fn = getattr(self.lib, "viztoken_encode", None) or getattr(
-            self.lib, "tiktalkin_encode"
-        )
-        encode_ord_fn = getattr(
-            self.lib, "viztoken_encode_ordinary", None
-        ) or getattr(self.lib, "tiktalkin_encode_ordinary")
-        decode_fn = getattr(self.lib, "viztoken_decode", None) or getattr(
-            self.lib, "tiktalkin_decode"
-        )
-        prefix_fn = getattr(
-            self.lib, "viztoken_find_common_prefix", None
-        ) or getattr(self.lib, "tiktalkin_find_common_prefix")
-        destroy_fn = getattr(self.lib, "viztoken_destroy", None) or getattr(
-            self.lib, "tiktalkin_destroy"
-        )
-        compile_v5_fn = (
-            getattr(self.lib, "viztoken_compile_vocab_v5", None)
-            or getattr(self.lib, "viztoken_compile_vocab_v4", None)
-            or getattr(self.lib, "tiktalkin_compile_vocab_v4")
-        )
+        init_fn = self.lib.viztoken_init
+        encode_fn = self.lib.viztoken_encode
+        encode_ord_fn = self.lib.viztoken_encode_ordinary
+        decode_fn = self.lib.viztoken_decode
+        prefix_fn = self.lib.viztoken_find_common_prefix
+        destroy_fn = self.lib.viztoken_destroy
+        compile_v5_fn = self.lib.viztoken_compile_vocab_v5
 
         init_fn.argtypes = [ctypes.c_char_p]
         init_fn.restype = ctypes.c_void_p
@@ -159,23 +142,21 @@ class _VizTokenBinding:
 
 def _locate_native_library() -> Path:
     candidates: List[Path] = []
-    for env_key in ("VIZTOKEN_DLL_PATH", "TIKTALKIN_DLL_PATH"):
-        env_override = os.environ.get(env_key)
-        if env_override:
-            candidates.append(Path(env_override).resolve())
-    for dll_name in _DLL_NAMES:
-        candidates.extend(
-            [
-                ROOT_DIR / dll_name,
-                ROOT_DIR / "dist" / "bin" / dll_name,
-                ROOT_DIR / "build" / dll_name,
-            ]
-        )
+    env_override = os.environ.get("VIZTOKEN_DLL_PATH")
+    if env_override:
+        candidates.append(Path(env_override).resolve())
+    candidates.extend(
+        [
+            ROOT_DIR / _DLL_NAME,
+            ROOT_DIR / "dist" / "bin" / _DLL_NAME,
+            ROOT_DIR / "build" / _DLL_NAME,
+        ]
+    )
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
     raise FileNotFoundError(
-        f"Unable to locate {_DLL_NAMES[0]} in {ROOT_DIR}. Run tools/forge_dag.py first."
+        f"Unable to locate {_DLL_NAME} in {ROOT_DIR}. Run tools/forge_dag.py first."
     )
 
 
@@ -187,31 +168,6 @@ def get_binding() -> _VizTokenBinding:
     if _BINDING is None:
         _BINDING = _VizTokenBinding(_locate_native_library())
     return _BINDING
-
-
-def build_default_yue2_specials() -> List[Tuple[str, int]]:
-    specials: List[Tuple[str, int]] = [
-        ("<|endoftext|>", 151643),
-        ("<|im_start|>", 151644),
-        ("<|im_end|>", 151645),
-        ("<R>", 151646),
-        ("<S>", 151647),
-        ("<X>", 151648),
-        ("<mask >", 151649),
-        ("<sep>", 151650),
-    ]
-    for i in range(196):
-        specials.append((f"<extra_{i}>", 151651 + i))
-    specials.append(("<abc>", 151847))
-    specials.append(("</abc>", 151848))
-    specials.append(("<extra_198>", 151849))
-    specials.append(("<extra_199>", 151850))
-    specials.append(("<music_start>", 151851))
-    specials.append(("<music_end>", 151852))
-    specials.append(("<latent_start>", 184621))
-    specials.append(("<latent_end>", 184622))
-    specials.append(("<latent_pad>", 184623))
-    return specials
 
 
 def build_default_qwen35_specials() -> List[Tuple[str, int]]:
@@ -239,7 +195,7 @@ def _inspect_swiss_container(
                 return None
             unpacked = struct.unpack(_SWISS_HEADER_FMT, hdr_bytes)
             magic = unpacked[0]
-            if magic not in _SWISS_MAGICS:
+            if magic != _SWISS5_MAGIC:
                 return None
             vocab_size = int(unpacked[2])
             total_vocab_size = int(unpacked[3])
@@ -247,7 +203,7 @@ def _inspect_swiss_container(
             specials_offset = int(unpacked[14])
             eot_token_id = int(unpacked[15])
             fast_magic = int(unpacked[16])
-            has_fast_tables = fast_magic == 0x565A5435
+            has_fast_tables = fast_magic == _SWISS5_FAST_MAGIC
             specials: List[Tuple[str, int]] = []
             if specials_offset > 0 and specials_count > 0:
                 f.seek(specials_offset)
@@ -279,7 +235,7 @@ def compile_vocab(
     out_telemetry_json: Optional[Union[str, Path]] = None,
     regex_pattern: Optional[str] = None,
     specials_list: Optional[Sequence[Tuple[str, int]]] = None,
-    eot_token_id: int = 0,
+    eot_token_id: int = QWEN35_EOT_TOKEN_ID,
 ) -> Telemetry:
     binding = get_binding()
     in_path = Path(in_tiktoken_path).resolve()
@@ -329,8 +285,6 @@ def compile_qwen_ranks_binary(
     src = Path(source_dir_or_file).resolve()
     if src.is_dir():
         vocab_path = src / "qwen35.tiktoken"
-        if not vocab_path.exists():
-            vocab_path = src / "qwen.tiktoken"
         if not vocab_path.exists():
             matches = sorted(src.rglob("*.tiktoken"))
             if not matches:
@@ -394,8 +348,8 @@ class Encoding:
     ):
         self._name = name
         self._binding = get_binding()
-        resolved_ranks: Optional[Path] = None
 
+        resolved_ranks: Optional[Path] = None
         if ranks_path is not None:
             p = Path(ranks_path).resolve()
             if p.is_file() and p.suffix == ".bin":
@@ -406,35 +360,25 @@ class Encoding:
                     compile_vocab(p, bin_candidate)
                 resolved_ranks = bin_candidate
             elif p.is_dir():
-                for b_name in ("qwen35.ranks.bin", "qwen.ranks.bin"):
-                    bin_candidate = p / b_name
-                    if bin_candidate.exists():
-                        resolved_ranks = bin_candidate
-                        break
-                if resolved_ranks is None:
-                    for t_name, b_out in (
-                        ("qwen35.tiktoken", "qwen35.ranks.bin"),
-                        ("qwen.tiktoken", "qwen.ranks.bin"),
-                    ):
-                        tik_candidate = p / t_name
-                        if tik_candidate.exists():
-                            resolved_ranks = compile_qwen_ranks_binary(
-                                tik_candidate, p / b_out
-                            )
-                            break
+                bin_candidate = p / "qwen35.ranks.bin"
+                if bin_candidate.exists():
+                    resolved_ranks = bin_candidate
+                else:
+                    tik_candidate = p / "qwen35.tiktoken"
+                    if tik_candidate.exists():
+                        resolved_ranks = compile_qwen_ranks_binary(
+                            tik_candidate, bin_candidate
+                        )
 
         if resolved_ranks is None or not resolved_ranks.exists():
             search_candidates: List[Path] = []
-            for env_key in ("VIZTOKEN_RANKS_PATH", "TIKTALKIN_RANKS_PATH"):
-                env_ranks = os.environ.get(env_key)
-                if env_ranks:
-                    search_candidates.append(Path(env_ranks).resolve())
+            env_ranks = os.environ.get("VIZTOKEN_RANKS_PATH")
+            if env_ranks:
+                search_candidates.append(Path(env_ranks).resolve())
             search_candidates.extend(
                 [
                     ROOT_DIR / "qwen35.ranks.bin",
-                    ROOT_DIR / "qwen.ranks.bin",
                     ROOT_DIR / "dist" / "bin" / "qwen35.ranks.bin",
-                    ROOT_DIR / "dist" / "bin" / "qwen.ranks.bin",
                 ]
             )
             for cand in search_candidates:
@@ -444,35 +388,29 @@ class Encoding:
 
         if resolved_ranks is None or not resolved_ranks.exists():
             raise FileNotFoundError(
-                f"Could not resolve ranks container in {ROOT_DIR}."
+                f"Could not resolve Qwen3.5 SWISS5 ranks container in {ROOT_DIR}."
             )
 
         self._ranks_path = resolved_ranks
         self._ctx = self._binding.init(str(self._ranks_path).encode("utf-8"))
         if not self._ctx:
             raise RuntimeError(
-                f"Failed to initialize VizToken context from {self._ranks_path}"
+                f"Failed to initialize VizToken SWISS5 context from {self._ranks_path}"
             )
 
         inspected = _inspect_swiss_container(self._ranks_path)
-        if inspected is not None:
-            base_v, total_v, eot_id, has_fast, spec_list = inspected
-            self._base_vocab_size = base_v
-            self._n_vocab = max(base_v, total_v)
-            self._eot_token = eot_id
-            self._has_fast_tables = has_fast
-            fallback_specs = (
-                build_default_qwen35_specials()
-                if base_v >= 240000
-                else build_default_yue2_specials()
+        if inspected is None:
+            self.close()
+            raise RuntimeError(
+                f"Invalid or corrupted SWISS5 header in {self._ranks_path}"
             )
-            defaults = spec_list if spec_list else fallback_specs
-        else:
-            self._base_vocab_size = 151643
-            self._n_vocab = 184704
-            self._eot_token = 151643
-            self._has_fast_tables = False
-            defaults = build_default_yue2_specials()
+
+        base_v, total_v, eot_id, has_fast, spec_list = inspected
+        self._base_vocab_size = base_v
+        self._n_vocab = max(base_v, total_v)
+        self._eot_token = eot_id
+        self._has_fast_tables = has_fast
+        defaults = spec_list if spec_list else build_default_qwen35_specials()
 
         self._special_token_to_id: Dict[str, int] = {
             literal: s_id for literal, s_id in defaults
@@ -630,12 +568,10 @@ class Encoding:
             norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
             if norm_sys:
                 sys_prefix = f"<|im_start|>system\n{norm_sys}<|im_end|>\n"
-
         if thinking_trace is not None:
             norm_trace = unicodedata.normalize("NFC", thinking_trace).strip()
         else:
             norm_trace = ""
-
         if norm_trace:
             think_suffix = f"<think>\n{norm_trace}\n</think>\n\n"
         else:
