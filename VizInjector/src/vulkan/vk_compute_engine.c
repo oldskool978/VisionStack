@@ -46,6 +46,7 @@ typedef struct {
     VkDeviceMemory memory;
     void *mapped;
     VkDeviceSize size;
+    VkMemoryPropertyFlags mem_flags;
 } VizVkBuffer;
 
 typedef struct {
@@ -78,6 +79,7 @@ typedef struct {
     VkDescriptorSet ds_vit_y;
     VkDescriptorSet ds_pack_vae;
     VkDescriptorSet ds_pack_vit;
+    VkDescriptorSet ds_pack_vit_shared;
     VkDescriptorSet ds_pack_mask;
 
     VkCommandPool cmd_pool;
@@ -89,11 +91,9 @@ typedef struct {
     VizVkBuffer buf_tmp_lin;
     VizVkBuffer buf_vae_lin;
     VizVkBuffer buf_vit_lin;
-
     VizVkBuffer buf_sched_idx;
     VizVkBuffer buf_sched_weights;
     VizVkBuffer buf_sched_center;
-
     VizVkBuffer buf_vae_out;
     VizVkBuffer buf_vit_out;
     VizVkBuffer buf_mask_out;
@@ -132,7 +132,8 @@ static int find_memory_type(
     VkPhysicalDevice phys_dev,
     uint32_t type_filter,
     VkMemoryPropertyFlags props,
-    uint32_t *out_idx
+    uint32_t *out_idx,
+    VkMemoryPropertyFlags *out_flags
 ) {
     VkPhysicalDeviceMemoryProperties mem_props;
     vkGetPhysicalDeviceMemoryProperties(phys_dev, &mem_props);
@@ -140,6 +141,9 @@ static int find_memory_type(
         if ((type_filter & (1u << i)) &&
             (mem_props.memoryTypes[i].propertyFlags & props) == props) {
             *out_idx = i;
+            if (out_flags) {
+                *out_flags = mem_props.memoryTypes[i].propertyFlags;
+            }
             return 0;
         }
     }
@@ -168,8 +172,9 @@ static int create_vk_buffer(
     vkGetBufferMemoryRequirements(g_vk.device, out_buf->buffer, &mem_req);
 
     uint32_t mem_idx = 0;
-    if (find_memory_type(g_vk.phys_dev, mem_req.memoryTypeBits, preferred_props, &mem_idx) != 0) {
-        if (find_memory_type(g_vk.phys_dev, mem_req.memoryTypeBits, fallback_props, &mem_idx) != 0) {
+    VkMemoryPropertyFlags chosen_flags = 0;
+    if (find_memory_type(g_vk.phys_dev, mem_req.memoryTypeBits, preferred_props, &mem_idx, &chosen_flags) != 0) {
+        if (find_memory_type(g_vk.phys_dev, mem_req.memoryTypeBits, fallback_props, &mem_idx, &chosen_flags) != 0) {
             vkDestroyBuffer(g_vk.device, out_buf->buffer, NULL);
             out_buf->buffer = VK_NULL_HANDLE;
             return -1;
@@ -201,6 +206,7 @@ static int create_vk_buffer(
         }
     }
     out_buf->size = size;
+    out_buf->mem_flags = chosen_flags;
     return 0;
 }
 
@@ -283,6 +289,7 @@ static int create_shader_and_pipeline(
     if (vkCreateShaderModule(g_vk.device, &sinfo, NULL, out_sm) != VK_SUCCESS) {
         return -1;
     }
+
     VkPushConstantRange pcr = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0u,
@@ -298,6 +305,7 @@ static int create_shader_and_pipeline(
     if (vkCreatePipelineLayout(g_vk.device, &pl_info, NULL, out_pl) != VK_SUCCESS) {
         return -1;
     }
+
     VkComputePipelineCreateInfo cp_info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {
@@ -340,7 +348,6 @@ int viz_vk_init(void) {
         viz_vk_shutdown();
         return -2;
     }
-
     VkPhysicalDevice *devs = (VkPhysicalDevice *)calloc(dev_count, sizeof(VkPhysicalDevice));
     vkEnumeratePhysicalDevices(g_vk.instance, &dev_count, devs);
     g_vk.phys_dev = devs[0];
@@ -448,11 +455,11 @@ int viz_vk_init(void) {
 
     VkDescriptorPoolSize pool_size = {
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 32u
+        .descriptorCount = 36u
     };
     VkDescriptorPoolCreateInfo dp_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 8u,
+        .maxSets = 9u,
         .poolSizeCount = 1u,
         .pPoolSizes = &pool_size
     };
@@ -461,21 +468,22 @@ int viz_vk_init(void) {
         return -8;
     }
 
-    VkDescriptorSetLayout layouts[8] = {
+    VkDescriptorSetLayout layouts[9] = {
         g_vk.dsl_two,
         g_vk.dsl_five,
         g_vk.dsl_five,
         g_vk.dsl_five,
         g_vk.dsl_five,
+        g_vk.dsl_two,
         g_vk.dsl_two,
         g_vk.dsl_two,
         g_vk.dsl_two
     };
-    VkDescriptorSet dsets[8] = {VK_NULL_HANDLE};
+    VkDescriptorSet dsets[9] = {VK_NULL_HANDLE};
     VkDescriptorSetAllocateInfo ds_alloc = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = g_vk.dpool,
-        .descriptorSetCount = 8u,
+        .descriptorSetCount = 9u,
         .pSetLayouts = layouts
     };
     if (vkAllocateDescriptorSets(g_vk.device, &ds_alloc, dsets) != VK_SUCCESS) {
@@ -489,7 +497,8 @@ int viz_vk_init(void) {
     g_vk.ds_vit_y = dsets[4];
     g_vk.ds_pack_vae = dsets[5];
     g_vk.ds_pack_vit = dsets[6];
-    g_vk.ds_pack_mask = dsets[7];
+    g_vk.ds_pack_vit_shared = dsets[7];
+    g_vk.ds_pack_mask = dsets[8];
 
     VkMemoryPropertyFlags wc_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     VkMemoryPropertyFlags cached_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -520,6 +529,7 @@ int viz_vk_init(void) {
     bind_dset_five(g_vk.ds_vit_y, &g_vk.buf_tmp_lin, &g_vk.buf_vit_lin, &g_vk.buf_sched_idx, &g_vk.buf_sched_weights, &g_vk.buf_sched_center);
     bind_dset_two(g_vk.ds_pack_vae, &g_vk.buf_vae_lin, &g_vk.buf_vae_out);
     bind_dset_two(g_vk.ds_pack_vit, &g_vk.buf_vit_lin, &g_vk.buf_vit_out);
+    bind_dset_two(g_vk.ds_pack_vit_shared, &g_vk.buf_vae_lin, &g_vk.buf_vit_out);
     bind_dset_two(g_vk.ds_pack_mask, &g_vk.buf_vae_lin, &g_vk.buf_mask_out);
 
     VkCommandPoolCreateInfo cp_create = {
@@ -608,6 +618,7 @@ void viz_vk_shutdown(void) {
 
     if (g_vk.device != VK_NULL_HANDLE) vkDestroyDevice(g_vk.device, NULL);
     if (g_vk.instance != VK_NULL_HANDLE) vkDestroyInstance(g_vk.instance, NULL);
+
     memset(&g_vk, 0, sizeof(g_vk));
 }
 
@@ -703,12 +714,29 @@ static void insert_compute_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
     };
     vkCmdPipelineBarrier(
         cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1u, &mb,
+        0u, NULL,
+        0u, NULL
+    );
+}
+
+static void insert_readback_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT
+    };
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
         0,
         1u, &mb,
         0u, NULL,
@@ -729,6 +757,17 @@ static void feather_mask_grid_2d(
     }
     int rad = (int)ceilf(feather_radius_cells);
     if (rad > 6) rad = 6;
+    const int k_span = 2 * rad + 1;
+    float kernel[169];
+    for (int ky = -rad; ky <= rad; ++ky) {
+        for (int kx = -rad; kx <= rad; ++kx) {
+            float dist = sqrtf((float)(kx * kx + ky * ky));
+            kernel[(ky + rad) * k_span + (kx + rad)] =
+                (dist <= feather_radius_cells)
+                ? (0.5f * (1.0f + cosf((float)M_PI * dist / feather_radius_cells)))
+                : 0.0f;
+        }
+    }
     for (uint32_t ly = 0; ly < lat_h; ++ly) {
         for (uint32_t lx = 0; lx < lat_w; ++lx) {
             float acc = 0.0f;
@@ -737,14 +776,15 @@ static void feather_mask_grid_2d(
                 int ny = (int)ly + ky;
                 if (ny < 0) ny = 0;
                 if (ny >= (int)lat_h) ny = (int)lat_h - 1;
+                const float *k_row = kernel + (ky + rad) * k_span;
+                const float *m_row = raw_mask + (size_t)ny * lat_w;
                 for (int kx = -rad; kx <= rad; ++kx) {
-                    int nx = (int)lx + kx;
-                    if (nx < 0) nx = 0;
-                    if (nx >= (int)lat_w) nx = (int)lat_w - 1;
-                    float dist = sqrtf((float)(kx * kx + ky * ky));
-                    if (dist <= feather_radius_cells) {
-                        float w = 0.5f * (1.0f + cosf((float)M_PI * dist / feather_radius_cells));
-                        acc += raw_mask[(size_t)ny * lat_w + (size_t)nx] * w;
+                    float w = k_row[kx + rad];
+                    if (w > 0.0f) {
+                        int nx = (int)lx + kx;
+                        if (nx < 0) nx = 0;
+                        if (nx >= (int)lat_w) nx = (int)lat_w - 1;
+                        acc += m_row[nx] * w;
                         w_sum += w;
                     }
                 }
@@ -807,8 +847,11 @@ int viz_vk_condition_image_rgba8(
     insert_compute_barrier(g_vk.cmd_buf);
 
     int need_vae_lin = ((out_vae_planar_f32 != NULL || out_latent_mask_f32 != NULL) && vae_w > 0u && vae_h > 0u);
+    int need_vit = (out_vit_patches_f32 != NULL && vit_w > 0u && vit_h > 0u);
+
     if (need_vae_lin) {
         vkCmdBindPipeline(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pipe_resample);
+
         vkCmdBindDescriptorSets(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pl_resample, 0u, 1u, &g_vk.ds_vae_x, 0u, NULL);
         VizPushResample pc_vx = {
             .in_w = src_w,
@@ -866,29 +909,18 @@ int viz_vk_condition_image_rgba8(
             vkCmdPushConstants(g_vk.cmd_buf, g_vk.pl_pack, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(pc_pm), &pc_pm);
             vkCmdDispatch(g_vk.cmd_buf, (lat_w + 15u) / 16u, (lat_h + 15u) / 16u, 1u);
         }
-        insert_compute_barrier(g_vk.cmd_buf);
     }
 
-    if (out_vit_patches_f32 && vit_w > 0u && vit_h > 0u) {
+    if (need_vit) {
+        VkDescriptorSet pack_vit_ds = g_vk.ds_pack_vit;
         if (need_vae_lin && vit_w == vae_w && vit_h == vae_h) {
-            VkDescriptorBufferInfo binfos[2] = {
-                {g_vk.buf_vae_lin.buffer, 0, VK_WHOLE_SIZE},
-                {g_vk.buf_vit_out.buffer, 0, VK_WHOLE_SIZE}
-            };
-            VkWriteDescriptorSet writes[2];
-            memset(writes, 0, sizeof(writes));
-            for (uint32_t i = 0; i < 2u; ++i) {
-                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[i].dstSet = g_vk.ds_pack_vit;
-                writes[i].dstBinding = i;
-                writes[i].descriptorCount = 1u;
-                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                writes[i].pBufferInfo = &binfos[i];
-            }
-            vkUpdateDescriptorSets(g_vk.device, 2u, writes, 0u, NULL);
+            pack_vit_ds = g_vk.ds_pack_vit_shared;
         } else {
-            bind_dset_two(g_vk.ds_pack_vit, &g_vk.buf_vit_lin, &g_vk.buf_vit_out);
+            if (need_vae_lin) {
+                insert_compute_barrier(g_vk.cmd_buf);
+            }
             vkCmdBindPipeline(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pipe_resample);
+
             vkCmdBindDescriptorSets(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pl_resample, 0u, 1u, &g_vk.ds_vit_x, 0u, NULL);
             VizPushResample pc_wx = {
                 .in_w = src_w,
@@ -925,7 +957,7 @@ int viz_vk_condition_image_rgba8(
         }
 
         vkCmdBindPipeline(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pipe_pack);
-        vkCmdBindDescriptorSets(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pl_pack, 0u, 1u, &g_vk.ds_pack_vit, 0u, NULL);
+        vkCmdBindDescriptorSets(g_vk.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.pl_pack, 0u, 1u, &pack_vit_ds, 0u, NULL);
         VizPushPack pc_pw = {
             .width = vit_w,
             .height = vit_h,
@@ -933,12 +965,12 @@ int viz_vk_condition_image_rgba8(
         };
         vkCmdPushConstants(g_vk.cmd_buf, g_vk.pl_pack, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(pc_pw), &pc_pw);
         vkCmdDispatch(g_vk.cmd_buf, (vit_w + 15u) / 16u, (vit_h + 15u) / 16u, 1u);
-        insert_compute_barrier(g_vk.cmd_buf);
     }
 
+    insert_readback_barrier(g_vk.cmd_buf);
     vkEndCommandBuffer(g_vk.cmd_buf);
-    vkResetFences(g_vk.device, 1u, &g_vk.fence);
 
+    vkResetFences(g_vk.device, 1u, &g_vk.fence);
     VkSubmitInfo sinfo = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1u,
@@ -973,6 +1005,5 @@ int viz_vk_condition_image_rgba8(
         uint32_t lat_h = vae_h / 16u;
         feather_mask_grid_2d((const float *)g_vk.buf_mask_out.mapped, lat_w, lat_h, mask_feather_radius, out_latent_mask_f32);
     }
-
     return 0;
 }

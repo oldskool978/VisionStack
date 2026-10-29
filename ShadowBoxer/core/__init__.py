@@ -26,6 +26,7 @@ from .env import (
 )
 from .caches import (
     CachedReferenceRecord,
+    PinnedPrefixState,
     PromptEmbedCache,
     ReferenceVisionCache,
 )
@@ -33,11 +34,13 @@ from .conditioning import (
     _AI_TOOLKIT_MAX_REF_DIM,
     _normalize_vizinjector_framing,
     _probe_image_dimensions,
+    _resolve_boxed_reference_dims,
     _resolve_unboxed_reference_dims,
     build_box_aperture_mask,
     compose_latent_inpaint_mask,
     load_image_tensor_16px,
     pack_vision_patches_32px,
+    resample_packed_latents,
     splat_box_latents_to_canvas,
 )
 from .loader import (
@@ -48,7 +51,7 @@ from .loader import (
     stream_safetensors_inplace,
 )
 from .memory import (
-     WDDMMemoryGuard,
+    WDDMMemoryGuard,
     WDDMMemorySnapshot,
     _DXGI_ADAPTER_DESC1,
     _DXGI_QUERY_VIDEO_MEMORY_INFO,
@@ -139,12 +142,15 @@ __all__ = [
     "_AI_TOOLKIT_MAX_REF_DIM",
     "_probe_image_dimensions",
     "_resolve_unboxed_reference_dims",
+    "_resolve_boxed_reference_dims",
     "_normalize_vizinjector_framing",
+    "resample_packed_latents",
     "build_box_aperture_mask",
     "compose_latent_inpaint_mask",
     "splat_box_latents_to_canvas",
     "load_image_tensor_16px",
     "pack_vision_patches_32px",
+    "PinnedPrefixState",
     "PromptEmbedCache",
     "CachedReferenceRecord",
     "ReferenceVisionCache",

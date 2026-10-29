@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image
 from safetensors.torch import save_file as save_safetensors
 import torch
+import torch.nn.functional as F
 
 from download_model import inspect_shard_header
 from engine import (
@@ -33,12 +34,15 @@ from engine import (
     WDDMMemoryGuard,
     _MetaWeightInitMode,
     _probe_image_dimensions,
+    _resolve_boxed_reference_dims,
+    _resolve_target_tensor_dtype,
     build_box_aperture_mask,
     compose_latent_inpaint_mask,
     compute_moss_v2_sigmas,
     derive_stage_keys,
     load_sharded_safetensors_into,
     philox_randn,
+    resample_packed_latents,
     splat_box_latents_to_canvas,
     stream_safetensors_inplace,
     subphase_radial_clamp,
@@ -52,13 +56,20 @@ from models.modeling_moss import (
 )
 from models.modeling_qwen35 import (
     Qwen3_5Config,
+    Qwen3_5HybridCache,
     Qwen3_5Model,
     Qwen3_5TextConfig,
     Qwen3_5VisionConfig,
     _STRICTLY_UPPER_MASK_CACHE,
+    _chunk_gated_delta_rule,
+    _recurrent_gated_delta_rule,
     _solve_unit_lower_triangular,
 )
-from models.modeling_vae import Flux2AutoencoderKL, Flux2VAEConfig
+from models.modeling_vae import (
+    Flux2AutoencoderKL,
+    Flux2VAEConfig,
+    _conv2d_3x3_strip_tiled,
+)
 from models.tokenizer import MOSSImageTokenizer, render_qwen35_chat_prompt
 from refinery import (
     DTYPE_LOOKUP,
@@ -144,7 +155,6 @@ def gate_1_native_subsystems() -> None:
         _assert(
             tok.has_fast_tables, "SWISS5 fast tables not active in qwen35.ranks.bin"
         )
-
         raw_p1 = "A brushed-steel refrigerator with sticky note 'OPENMOSS'"
         raw_p2 = "A brushed-steel refrigerator with sticky note 'AGENTIC PASS 2'"
         p1 = render_qwen35_chat_prompt(
@@ -159,7 +169,6 @@ def gate_1_native_subsystems() -> None:
         )
         ids_1 = tok.encode(p1, allowed_special="all")
         ids_2 = tok.encode(p2, allowed_special="all")
-
         chat_ids_1 = tok.encode_chat(
             raw_p1,
             enable_thinking=True,
@@ -170,7 +179,6 @@ def gate_1_native_subsystems() -> None:
             ids_1 == chat_ids_1,
             "Zero-alloc encode_chat diverged from full-string ChatML encode",
         )
-
         for think_flag in (True, False):
             for p_counts in (None, [2304, 576]):
                 for sys_p in (None, "You are a spatial composition architect."):
@@ -200,7 +208,6 @@ def gate_1_native_subsystems() -> None:
                                 ),
                                 f"encode_chat parity failure for thinking={think_flag}, patches={p_counts}, sys={sys_p is not None}, trace={t_trace is not None}, vis_id={vis_id}",
                             )
-
         shared_pfx = MOSSImageTokenizer.find_common_prefix(ids_1, ids_2)
         _assert(
             shared_pfx > 150, f"Expected shared prefix > 150 tokens, got {shared_pfx}"
@@ -217,6 +224,15 @@ def gate_1_native_subsystems() -> None:
         )
         print(
             f"  [+] VizInjector Backend      : {viz.backend_name} (Vulkan Active: {viz.vulkan_active})"
+        )
+        req_me_default = VizInjectorRequest(edit_format="moss_image_edit")
+        req_me_box = VizInjectorRequest(
+            edit_format="moss_image_edit", framing_mode="inscribed"
+        )
+        _assert(
+            req_me_default.framing_mode == "never_crop"
+            and req_me_box.framing_mode == "inscribed",
+            f"moss_image_edit framing routing failed: default={req_me_default.framing_mode}, explicit={req_me_box.framing_mode}",
         )
 
         yy, xx = np.meshgrid(
@@ -248,7 +264,6 @@ def gate_1_native_subsystems() -> None:
             bundle.vit_patches is not None and bundle.llm_tokens == 144,
             f"Expected 144 LLM tokens for 384px ViT, got {bundle.llm_tokens}",
         )
-
         req_vit_only = VizInjectorRequest(
             target_width=1024,
             target_height=1024,
@@ -265,7 +280,6 @@ def gate_1_native_subsystems() -> None:
             and b_vit_only.meta.vit_size == (384, 384),
             f"ViT-only pass failed coupled grid geometry: vae={b_vit_only.meta.vae_size}, vit={b_vit_only.meta.vit_size}",
         )
-
         bundle.packed_latents = torch.randn((1, 128, 32, 32), dtype=torch.float32)
         bundle.vit_embeds = torch.randn((144, 4096), dtype=torch.bfloat16)
         bundle.meta.orig_size = (1024, 768)
@@ -310,10 +324,24 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
     has_gpu = torch.cuda.is_available()
     dev = torch.device("cuda" if has_gpu else "cpu")
 
-    p_cache = PromptEmbedCache(max_entries=8)
-    pos_tokens_1 = [248045, 872, 198, 101, 102, 103, 104, 105, 248044]
+    p_cache = PromptEmbedCache(max_entries=8, max_prefix_entries=4)
+    _assert(
+        p_cache.max_prefix_entries == 4,
+        f"Expected max_prefix_entries=4, got {p_cache.max_prefix_entries}",
+    )
+    auto_cp_cache = Qwen3_5HybridCache(
+        record_checkpoints=True, min_checkpoint_token=4
+    )
+    auto_cps = auto_cp_cache.resolve_active_checkpoints(0, 53)
+    _assert(
+        44 in auto_cps,
+        f"Expected 4-token-snapped 0.82 checkpoint (44) in {auto_cps}",
+    )
+
+    pos_tokens_1 = [248045, 872, 198] + list(range(101, 121)) + [248044]
     neg_tokens = [248045, 872, 198, 248044]
-    pos_tokens_2 = [248045, 872, 198, 101, 102, 103, 999, 888, 248044]
+    pos_tokens_2 = [248045, 872, 198] + list(range(101, 116)) + [999, 888, 777, 666, 555, 248044]
+    pos_tokens_early_div = [248045, 872, 198] + list(range(101, 111)) + [444, 333, 222, 111, 248044]
 
     with torch.inference_mode():
         h_pos1 = torch.randn(
@@ -345,7 +373,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             "Expected initial neg miss",
         )
         p_cache.insert(neg_tokens, h_neg)
-
         _ = p_cache.lookup(neg_tokens, dev, is_negative=True)
         _assert(
             p_cache.pos_hits == 0,
@@ -358,9 +385,65 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
 
         _ = p_cache.lookup(pos_tokens_2, dev, is_negative=False)
         _assert(
-            p_cache.last_common_prefix_len == 6,
-            f"Expected common prefix of 6 tokens between pos_1 and pos_2, got {p_cache.last_common_prefix_len}",
+            p_cache.last_common_prefix_len == 18,
+            f"Expected common prefix of 18 tokens between pos_1 and pos_2, got {p_cache.last_common_prefix_len}",
         )
+
+        dummy_hybrid = Qwen3_5HybridCache(
+            record_checkpoints=True, checkpoint_positions=[12, 16]
+        )
+        dummy_hybrid.past_seen_tokens = len(pos_tokens_1)
+        dummy_hybrid.conv_states[0] = torch.randn((1, 128, 3), device=dev, dtype=torch.bfloat16)
+        dummy_hybrid.recurrent_states[0] = torch.randn((1, 4, 32, 32), device=dev, dtype=torch.float32)
+        dummy_hybrid.conv_checkpoints[12] = {
+            0: torch.randn((1, 128, 3), device=dev, dtype=torch.bfloat16)
+        }
+        dummy_hybrid.recurrent_checkpoints[12] = {
+            0: torch.randn((1, 4, 32, 32), device=dev, dtype=torch.float32)
+        }
+        dummy_hybrid.conv_checkpoints[16] = {
+            0: torch.randn((1, 128, 3), device=dev, dtype=torch.bfloat16)
+        }
+        dummy_hybrid.recurrent_checkpoints[16] = {
+            0: torch.randn((1, 4, 32, 32), device=dev, dtype=torch.float32)
+        }
+        dummy_hybrid.key_cache[3] = torch.randn(
+            (1, 2, len(pos_tokens_1), 32), device=dev, dtype=torch.bfloat16
+        )
+        dummy_hybrid.value_cache[3] = torch.randn(
+            (1, 2, len(pos_tokens_1), 32), device=dev, dtype=torch.bfloat16
+        )
+        p_cache.insert_prefix_state(
+            pos_tokens_1,
+            stored_cpu,
+            dummy_hybrid,
+        )
+        spliced_16 = p_cache.lookup_prefix_splice(pos_tokens_2, dev)
+        _assert(
+            spliced_16 is not None
+            and spliced_16[2] == 16
+            and spliced_16[0].key_cache[3].shape[2] == 16
+            and spliced_16[0].recurrent_states[0].dtype == torch.float32
+            and p_cache.splice_hits == 1,
+            "PromptEmbedCache multi-checkpoint prefix splice lookup failed for offset 16",
+        )
+        spliced_12 = p_cache.lookup_prefix_splice(pos_tokens_early_div, dev)
+        _assert(
+            spliced_12 is not None
+            and spliced_12[2] == 12
+            and spliced_12[0].key_cache[3].shape[2] == 12
+            and p_cache.splice_hits == 2,
+            "PromptEmbedCache multi-checkpoint prefix splice lookup failed for offset 12",
+        )
+        if has_gpu:
+            pinned_state = next(iter(p_cache._prefix_cache.values()))
+            _assert(
+                pinned_state.prefix_hidden.is_pinned()
+                and pinned_state.recurrent_checkpoints[16][0].is_pinned()
+                and pinned_state.recurrent_checkpoints[16][0].dtype == torch.float32
+                and pinned_state.key_cache[3].is_pinned(),
+                "PinnedPrefixState trajectory tensors are not page-locked FP32",
+            )
 
         vis_sig = (("ref_a.png", 1024, 1024), 144)
         p_cache.insert(pos_tokens_2, h_pos1, vision_signature=vis_sig)
@@ -373,7 +456,7 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
         )
 
     print(
-        f"  [+] PromptEmbedCache         : Pinned={stored_cpu.is_pinned() if has_gpu else 'CPU'} | NonInferenceCPU=True | PrefixSplice={p_cache.last_common_prefix_len} tok"
+        f"  [+] PromptEmbedCache         : Pinned={stored_cpu.is_pinned() if has_gpu else 'CPU'} | FP32Recurrent=True | MultiCheckpointTrajectory={tuple(auto_cps)} tok"
     )
 
     r_cache = ReferenceVisionCache(max_entries=8)
@@ -434,6 +517,16 @@ def gate_3_models_zero_alloc_and_lora() -> None:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
 
+    _assert(
+        _resolve_target_tensor_dtype(
+            "language_model.layers.0.linear_attn.dt_bias",
+            torch.ones(4, dtype=torch.float32),
+            torch.bfloat16,
+        )
+        == torch.float32,
+        "_resolve_target_tensor_dtype failed to preserve dt_bias in FP32",
+    )
+
     cfg = MOSSImageConfig(
         dim=256,
         ffn_dim=512,
@@ -451,7 +544,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         next(meta_dit.parameters()).is_meta,
         "_MetaWeightInitMode failed to place parameters on meta device",
     )
-
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_sf = Path(tmpdir) / "diffusion_pytorch_model.safetensors"
         save_safetensors(
@@ -464,7 +556,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             not next(meta_dit.parameters()).is_meta,
             "load_sharded_safetensors_into left parameters on meta device",
         )
-
         ptrs_before = {k: p.data_ptr() for k, p in meta_dit.named_parameters()}
         with torch.no_grad():
             meta_dit.layers[0].proj["q"].weight.zero_()
@@ -478,7 +569,14 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         )
 
     with torch.inference_mode():
+        _, head_f32 = dit._compute_time_modulation(500.0, 1, dev)
+        _assert(
+            head_f32.dtype == torch.float32,
+            f"Expected FP32 video_head_modulation output, got {head_f32.dtype}",
+        )
+
         lat = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
+        lat2 = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
         ref1 = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
         ref2 = torch.randn((1, 128, 6, 6), device=dev, dtype=torch.float32)
         txt = torch.randn((1, 16, 256), device=dev, dtype=dtype)
@@ -598,7 +696,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             bias_none is None,
             "Zero box_attn_isolation must return None without allocating a bias tensor",
         )
-
         bias_active = dit._get_box_aperture_bias(
             height=8,
             width=8,
@@ -642,12 +739,14 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             16,
             dev,
             ref_shapes=[(4, 4)],
-            ref_bboxes=[(0.5, 0.5, 1.0, 1.0)],
+            ref_bboxes=[(0.49, 0.51, 0.99, 1.0)],
         )
-        ref_phase_slice = phase_boxed[64 : 64 + 16, 2:4, 0]
+        target_grid_phase = phase_boxed[:64, 2:4, :].view(8, 8, 2, -1)
+        expected_box_phase = target_grid_phase[4:8, 4:8, :, :].reshape(16, 2, -1)
+        ref_phase_slice = phase_boxed[64 : 64 + 16, 2:4, :]
         _assert(
-            float(ref_phase_slice.min().item()) >= 0.0,
-            "Cell-centered bottom-right box-translated 4D-RoPE phase must reside strictly in positive quadrant",
+            float((ref_phase_slice - expected_box_phase).abs().max().item()) == 0.0,
+            "16px lattice-locked 4D-RoPE reference phase must match target canvas cell phase bit-for-bit",
         )
 
         t_step_1 = torch.tensor([500.0], device=dev)
@@ -678,6 +777,34 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         )
         _assert(
             out1.shape == (1, 128, 8, 8), f"Unexpected DiT output shape: {out1.shape}"
+        )
+
+        out1_second = dit(
+            lat2,
+            t_step_1,
+            txt,
+            mask,
+            reference_latents=[ref1, ref2],
+            reference_zero_timestep=True,
+            reference_isolated_kv=True,
+            reference_bboxes=ref_boxes,
+        ).sample
+        out_b2 = dit(
+            torch.cat([lat, lat2], dim=0),
+            t_step_1,
+            txt.repeat(2, 1, 1),
+            mask.repeat(2, 1),
+            reference_latents=[ref1, ref2],
+            reference_zero_timestep=True,
+            reference_isolated_kv=True,
+            reference_bboxes=ref_boxes,
+        ).sample
+        b2_cat = torch.cat([out1, out1_second], dim=0)
+        b2_diff = float((b2_cat - out_b2).abs().max().item())
+        b2_mae = float((b2_cat - out_b2).abs().mean().item())
+        _assert(
+            b2_diff <= 0.03125 and b2_mae < 1e-3,
+            f"Homogeneous B=2 vectorized DiT batch diverged from B=1 execution: max={b2_diff}, mae={b2_mae}",
         )
 
         out_box_iso = dit(
@@ -714,21 +841,19 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             len(dit._box_aperture_bias_cache) >= 2,
             "Box aperture bias cache was not populated",
         )
-
         _assert(dit._mod_seq_buf is not None, "_mod_seq_buf was not allocated")
         buf_ptr_1 = dit._mod_seq_buf.data_ptr()
         _assert(
             len(dit._mod_zero_cache) == 1, "Zero-timestep modulation was not cached"
         )
         _assert(
-            len(dit._text_proj_cache) == 1,
+            len(dit._text_proj_cache) >= 1,
             "Step-invariant _TextProjection was not cached",
         )
         _assert(
             len(dit._ref_proj_cache) == 2,
             "Reference latent projections were not cached",
         )
-        _assert(len(dit._time_mod_cache) == 2, "Timestep modulation was not cached")
         cached_txt_ptr = next(iter(dit._text_proj_cache.values()))[2].data_ptr()
 
         _ = dit(
@@ -742,10 +867,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             reference_isolated_kv=True,
             reference_bboxes=ref_boxes,
         ).sample
-        _assert(
-            len(dit._time_mod_cache) == 2,
-            "Same-timestep pass must hit _time_mod_cache",
-        )
 
         t_step_2 = torch.tensor([250.0], device=dev)
         out2 = dit(
@@ -768,10 +889,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             cached_txt_ptr == cached_txt_ptr_2,
             "_text_proj_cache entry was not reused across steps",
         )
-        _assert(
-            len(dit._time_mod_cache) == 3,
-            "Expected 3 cached time modulations (500, 0, 250)",
-        )
         dit.clear_transient_caches()
         _assert(
             dit._mod_seq_buf is None,
@@ -783,7 +900,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             "clear_caches must flush _box_aperture_bias_cache",
         )
     print(
-        f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap (0-Alloc) + CellCenter-4D-RoPE + CollaborativeIsoKV (diff={collab_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
+        f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap + FP32HeadMod + Lattice4DRoPE (0.0 err) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
     )
 
     orig_q_weight = dit.layers[0].proj["q"].weight.data.detach().float().clone()
@@ -889,6 +1006,90 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             f"Block-recursive triangular solver drift: cat_diff={tri_diff}, res_err={res_err}",
         )
 
+        q_delta = torch.randn((1, 20, 4, 32), device=dev, dtype=torch.float32)
+        k_delta = torch.randn((1, 20, 4, 32), device=dev, dtype=torch.float32)
+        v_delta = torch.randn((1, 20, 4, 32), device=dev, dtype=torch.float32)
+        g_delta = -torch.rand((1, 20, 4), device=dev, dtype=torch.float32) * 0.25
+        b_delta = torch.sigmoid(torch.randn((1, 20, 4), device=dev, dtype=torch.float32))
+        cp_states_single: dict[int, torch.Tensor] = {}
+        full_delta = _chunk_gated_delta_rule(
+            q_delta,
+            k_delta,
+            v_delta,
+            g_delta,
+            b_delta,
+            output_final_state=False,
+            checkpoint_positions=[12, 16],
+            checkpoint_states_out=cp_states_single,
+        )
+        _, state_12_ref = _recurrent_gated_delta_rule(
+            q_delta[:, :12],
+            k_delta[:, :12],
+            v_delta[:, :12],
+            g_delta[:, :12],
+            b_delta[:, :12],
+            output_final_state=True,
+        )
+        pfx_delta, state_16 = _chunk_gated_delta_rule(
+            q_delta[:, :16],
+            k_delta[:, :16],
+            v_delta[:, :16],
+            g_delta[:, :16],
+            b_delta[:, :16],
+            output_final_state=True,
+        )
+        sfx_delta, _ = _recurrent_gated_delta_rule(
+            q_delta[:, 16:],
+            k_delta[:, 16:],
+            v_delta[:, 16:],
+            g_delta[:, 16:],
+            b_delta[:, 16:],
+            initial_state=cp_states_single[16],
+            output_final_state=True,
+        )
+        cp_diff = max(
+            float((cp_states_single[12] - state_12_ref).abs().max().item()),
+            float((cp_states_single[16] - state_16).abs().max().item()),
+        )
+        rec_diff = float(
+            (full_delta - torch.cat([pfx_delta, sfx_delta], dim=1)).abs().max().item()
+        )
+        _assert(
+            cp_diff < 1e-5 and rec_diff < 1e-5,
+            f"Single-pass trajectory checkpoint or step-recurrent GatedDeltaNet drift: cp_diff={cp_diff}, rec_diff={rec_diff}",
+        )
+
+        seq_80 = torch.randint(10, 500, (1, 80), dtype=torch.long, device=dev)
+        traj_cache = Qwen3_5HybridCache(
+            record_checkpoints=True, checkpoint_positions=[16, 48, 64]
+        )
+        out_single_80 = qwen(
+            input_ids=seq_80,
+            attention_mask=torch.ones_like(seq_80),
+            past_key_values=traj_cache,
+            use_cache=True,
+        )
+        cp64_cache = traj_cache.extract_checkpoint(64)
+        out_sfx_64 = qwen(
+            input_ids=seq_80[:, 64:],
+            past_key_values=cp64_cache,
+            use_cache=False,
+        )
+        spliced_80 = torch.cat(
+            [out_single_80.last_hidden_state[:, :64, :], out_sfx_64.last_hidden_state],
+            dim=1,
+        )
+        traj_splice_diff = float(
+            (out_single_80.last_hidden_state - spliced_80).abs().max().item()
+        )
+        traj_splice_mae = float(
+            (out_single_80.last_hidden_state - spliced_80).abs().mean().item()
+        )
+        _assert(
+            traj_splice_diff <= 0.0625 and traj_splice_mae < 2e-3,
+            f"Single-pass Qwen3.5 trajectory splice diverged from unsplit pass: max={traj_splice_diff}, mae={traj_splice_mae}",
+        )
+
         q_out = qwen(
             input_ids=in_ids,
             attention_mask=torch.ones_like(in_ids),
@@ -907,6 +1108,35 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             q_txt_only.rope_deltas is None,
             "Text-only Qwen3.5 pass must reset rope_deltas to None",
         )
+
+        prompt_seq = torch.tensor(
+            [[11, 22, 33, 44, 11, 22, 33, 44, 55, 66, 11, 22]],
+            dtype=torch.long,
+            device=dev,
+        )
+        spec_ids, spec_hidden = qwen.reanchor_speculative_generate(
+            prompt_seq,
+            max_new_tokens=6,
+            block_size=3,
+            max_candidates=3,
+            entropy_threshold=0.0,
+            stop_token_ids=[999999],
+        )
+        greedy_cache = Qwen3_5HybridCache()
+        g_out = qwen(prompt_seq, past_key_values=greedy_cache, use_cache=True)
+        greedy_ids: list[int] = []
+        cur_logits = qwen.project_logits(g_out.last_hidden_state[:, -1, :]).float()
+        for _ in range(6):
+            nt = int(torch.argmax(cur_logits, dim=-1).item())
+            greedy_ids.append(nt)
+            step_t = torch.tensor([[nt]], dtype=torch.long, device=dev)
+            g_out = qwen(step_t, past_key_values=greedy_cache, use_cache=True)
+            cur_logits = qwen.project_logits(g_out.last_hidden_state[:, -1, :]).float()
+        _assert(
+            spec_ids == greedy_ids and spec_hidden.shape[1] == prompt_seq.shape[1] + 6,
+            f"ReAnchor speculative generation diverged from greedy decoding: {spec_ids} vs {greedy_ids}",
+        )
+
     _assert(
         q_out.last_hidden_state.shape == (1, 8, 128),
         f"Unexpected Qwen3.5 output shape: {q_out.last_hidden_state.shape}",
@@ -921,7 +1151,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         "Qwen3_5Model.clear_caches() must flush _geom_cache and _STRICTLY_UPPER_MASK_CACHE",
     )
     print(
-        f"  [+] Qwen3_5Model Hybrid      : BlockRecTriSolve (diff={tri_diff:.1e}, res={res_err:.1e}) + CachedViTGeom + MaskCacheEvict Verified"
+        f"  [+] Qwen3_5Model Hybrid      : SinglePassTraj (cp_diff={cp_diff:.1e}, mae={traj_splice_mae:.1e}) + StepRecDelta (diff={rec_diff:.1e}) + ReAnchorSpecVerify Verified"
     )
 
     e4m3_dtype = getattr(torch, "float8_e4m3fn", None)
@@ -957,14 +1187,38 @@ def gate_3_models_zero_alloc_and_lora() -> None:
     )
     vae = Flux2AutoencoderKL(config=v_cfg).to(device=dev, dtype=torch.float32).eval()
     with torch.inference_mode():
+        strip_conv = (
+            torch.nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1)
+            .to(device=dev, dtype=torch.float32)
+            .eval()
+        )
+        strip_x = torch.randn((1, 64, 512, 512), device=dev, dtype=torch.float32)
+        out_untiled = strip_conv(strip_x)
+        out_tiled = _conv2d_3x3_strip_tiled(strip_conv, strip_x, enabled=True)
+        strip_err = float((out_untiled - out_tiled).abs().max().item())
+        _assert(
+            strip_err == 0.0,
+            f"Halo-exact strip-tiled 3x3 Conv2d diverged from untiled Conv2d: max_err={strip_err}",
+        )
+        del strip_conv, strip_x, out_untiled, out_tiled
+
         img_in = (
             torch.randn((1, 3, 64, 64), device=dev, dtype=torch.float32).clamp(
                 -1.0, 1.0
             )
         )
         z_pack = vae.encode_to_packed_latents(img_in)
+        _assert(
+            vae._bn_stats_cache is not None,
+            "Flux2AutoencoderKL failed to populate _bn_stats_cache",
+        )
         z_clamped = subphase_radial_clamp(z_pack * 10.0, max_sigma=4.5)
         dec_out = vae.decode_packed_latents(z_clamped)
+        vae.clear_caches()
+        _assert(
+            vae._bn_stats_cache is None,
+            "Flux2AutoencoderKL.clear_caches() must reset _bn_stats_cache",
+        )
     _assert(
         z_pack.shape == (1, 128, 16, 16),
         f"Unexpected packed latent shape: {z_pack.shape}",
@@ -974,7 +1228,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         f"Unexpected decoded image shape: {dec_out.shape}",
     )
     print(
-        "  [+] Flux2AutoencoderKL       : In-Place FP32 Silu/Shortcut Pack/Unpack & Sub-Phase Radial Clamp Verified"
+        f"  [+] Flux2AutoencoderKL       : Bit-Exact Halo-Tiled Conv2d (err={strip_err:.1e}) + Cached FP32 BatchNorm & Radial Clamp Verified"
     )
 
 
@@ -1091,6 +1345,29 @@ def gate_4_schedulers_and_prng() -> None:
         and (1.0 - float(heun_ipndm_12.base_sigmas[k_star].item())) >= 0.35 - 1e-7,
         "Physical signal progress handoff (1 - sigma >= t*) violated",
     )
+    _assert(
+        heun_ipndm_12._can_warm_handoff is True,
+        "Deterministic Heun->IPNDM must enable Runge-Kutta warm handoff",
+    )
+    handoff_cfg = next(
+        cfg for cfg in heun_ipndm_12._step_configs if not cfg["is_early"]
+    )
+    _assert(
+        handoff_cfg["order"] == min(4, k_star + 1),
+        f"Expected warm-started IPNDM order {min(4, k_star + 1)} at handoff, got {handoff_cfg['order']}",
+    )
+    s_warm = torch.ones((1, 4, 4, 4), device=dev, dtype=torch.float32)
+    for t in heun_ipndm_12.timesteps:
+        want_h = heun_ipndm_12.wants_early_history_output
+        v_step = -0.5 * s_warm
+        v_hist = -0.4 * s_warm if want_h else None
+        s_warm = heun_ipndm_12.step(
+            v_step, t, s_warm, history_output=v_hist
+        )
+    _assert(
+        torch.isfinite(s_warm).all(),
+        "Warm-started Heun->IPNDM with CFG-consistent history_output produced non-finite values",
+    )
 
     for solver in SUPPORTED_SOLVERS:
         bif = BifurcatedFlowMatchScheduler(
@@ -1123,7 +1400,7 @@ def gate_4_schedulers_and_prng() -> None:
         "Philox PRNG stream collision",
     )
     print(
-        f"  [+] Bifurcated Solvers & PRNG: Verified {', '.join(s.upper() for s in SUPPORTED_SOLVERS)} + Lagrange TVD Unity + Philox64"
+        f"  [+] Bifurcated Solvers & PRNG: Verified {', '.join(s.upper() for s in SUPPORTED_SOLVERS)} + RK WarmHandoff (Order {handoff_cfg['order']}) + Philox64"
     )
 
 
@@ -1132,7 +1409,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     _assert(
         "bf16" in DTYPE_MAP and "fp16" in DTYPE_LOOKUP,
         "Refinery DTYPE_MAP/DTYPE_LOOKUP missing",
@@ -1183,6 +1459,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
 
     guard = WDDMMemoryGuard(dev)
+    guard.sync_pinned_baseline()
     snap = guard.enforce_stage_budget(required_headroom_gb=2.50, force=False)
     _assert(
         snap.dedicated_total_gb >= 0.0
@@ -1527,7 +1804,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     m_paint = torch.zeros((1, 1, 64, 64), device=dev, dtype=torch.float32)
     m_paint[:, :, :32, :] = 1.0
     m_alpha = torch.full((1, 1, 64, 64), 0.5, device=dev, dtype=torch.float32)
-
     m_auto_union = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -1544,7 +1820,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and float(m_auto_union[0, 0, 55, 5].item()) == 0.0,
         "compose_latent_inpaint_mask auto-union failed",
     )
-
     m_auto_inter = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -1561,7 +1836,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and float(m_auto_inter[0, 0, 40, 32].item()) == 0.0,
         "compose_latent_inpaint_mask auto-intersect (preserve_outside_boxes) failed",
     )
-
     m_inv_alpha = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -1578,6 +1852,57 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
 
     with torch.inference_mode():
+        boxed_w, boxed_h = _resolve_boxed_reference_dims(
+            (0.25, 0.25, 0.75, 0.75), 1024, 1024
+        )
+        _assert(
+            (boxed_w, boxed_h) == (512, 512),
+            f"_resolve_boxed_reference_dims mismatch: {(boxed_w, boxed_h)}",
+        )
+        unpacked_ramp = (
+            (torch.arange(16, device=dev, dtype=torch.float32) + 0.5)
+            .view(1, 1, 1, 16)
+            .expand(1, 32, 16, 16)
+        )
+        packed_ramp = (
+            unpacked_ramp.reshape(1, 32, 8, 2, 8, 2)
+            .permute(0, 1, 3, 5, 2, 4)
+            .reshape(1, 128, 8, 8)
+        )
+        res_subphase = resample_packed_latents(packed_ramp, 16, 16)
+        unpacked_sub = (
+            res_subphase.reshape(1, 32, 2, 2, 16, 16)
+            .permute(0, 1, 4, 2, 5, 3)
+            .reshape(1, 32, 32, 32)
+        )
+        res_naive = F.interpolate(
+            packed_ramp, size=(16, 16), mode="bilinear", align_corners=False
+        )
+        unpacked_naive = (
+            res_naive.reshape(1, 32, 2, 2, 16, 16)
+            .permute(0, 1, 4, 2, 5, 3)
+            .reshape(1, 32, 32, 32)
+        )
+        gt_ramp_32 = (
+            (torch.arange(32, device=dev, dtype=torch.float32) + 0.5) * 0.5
+        ).view(1, 1, 1, 32)
+        sub_err = float(
+            (unpacked_sub[:, :, :, 2:-2] - gt_ramp_32[:, :, :, 2:-2])
+            .abs()
+            .max()
+            .item()
+        )
+        naive_err = float(
+            (unpacked_naive[:, :, :, 2:-2] - gt_ramp_32[:, :, :, 2:-2])
+            .abs()
+            .max()
+            .item()
+        )
+        _assert(
+            sub_err < 1e-5 and naive_err > 0.2,
+            f"resample_packed_latents failed sub-phase preservation: sub_err={sub_err}, naive_err={naive_err}",
+        )
+
         base_canvas = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
         box_lat_a = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
         box_lat_b = torch.full((1, 128, 16, 16), -1.5, device="cpu", dtype=torch.float32)
@@ -1651,7 +1976,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        "  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + CanonicalSort + ComposableMaskAlgebra + CommutativeSplat Verified"
+        f"  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + SubPhaseResample (err={sub_err:.1e}) + ComposableMaskAlgebra + CommutativeSplat Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)

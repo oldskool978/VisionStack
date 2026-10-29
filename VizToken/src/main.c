@@ -128,7 +128,6 @@ int main(int argc, char **argv) {
         argv = w_argv;
     }
 #endif
-
     int exit_code = 0;
 
     if (argc < 2) {
@@ -161,11 +160,13 @@ int main(int argc, char **argv) {
             out_telem,
             &telem
         );
+
         if (rc != 0) {
             fprintf(stderr, "[!] Vocabulary compilation failed with error code: %d\n", rc);
             exit_code = 1;
             goto cleanup;
         }
+
         printf("[+] Serialization Succeeded (SWISS5 Zero-Init Container):\n");
         printf("    Tokens:         %u\n", telem.total_tokens);
         printf("    Capacity:       %u (Load: %.2f%%)\n", telem.table_capacity, telem.load_factor * 100.0);

@@ -5,8 +5,9 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import itertools
 import json
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -80,11 +81,166 @@ def _get_eye_matrix(
     return eye
 
 
+class Qwen3_5HybridCache:
+    def __init__(
+        self,
+        record_checkpoints: bool = False,
+        checkpoint_positions: Optional[Sequence[int]] = None,
+        min_checkpoint_token: int = 0,
+    ) -> None:
+        self.conv_states: Dict[int, torch.Tensor] = {}
+        self.recurrent_states: Dict[int, torch.Tensor] = {}
+        self.key_cache: Dict[int, torch.Tensor] = {}
+        self.value_cache: Dict[int, torch.Tensor] = {}
+        self.past_seen_tokens: int = 0
+        self.rope_deltas: Optional[torch.Tensor] = None
+
+        self.record_checkpoints: bool = bool(record_checkpoints)
+        self.requested_checkpoints: Optional[Set[int]] = (
+            {int(x) for x in checkpoint_positions}
+            if checkpoint_positions is not None
+            else None
+        )
+        self.min_checkpoint_token: int = int(min_checkpoint_token)
+        self.checkpoint_offsets: List[int] = []
+        self.conv_checkpoints: Dict[int, Dict[int, torch.Tensor]] = {}
+        self.recurrent_checkpoints: Dict[int, Dict[int, torch.Tensor]] = {}
+
+    def resolve_active_checkpoints(
+        self, past_seen: int, seq_len: int
+    ) -> List[int]:
+        if not self.record_checkpoints:
+            return []
+        total_len = past_seen + seq_len
+        min_tok = max(past_seen + 1, self.min_checkpoint_token, 8)
+        max_tok = total_len - 1
+        if min_tok > max_tok:
+            return []
+
+        if self.requested_checkpoints is not None:
+            valid = sorted(
+                pos
+                for pos in self.requested_checkpoints
+                if min_tok <= pos <= max_tok
+            )
+            self.checkpoint_offsets = valid
+            return valid
+
+        span = total_len - min_tok
+        candidates: Set[int] = set()
+        for frac in (0.50, 0.75, 0.82, 0.90):
+            raw_pos = min_tok + int(round(span * frac))
+            snapped_4 = (raw_pos // 4) * 4
+            if min_tok <= snapped_4 <= max_tok:
+                candidates.add(snapped_4)
+            elif min_tok <= raw_pos <= max_tok:
+                candidates.add(raw_pos)
+
+        highest_64 = (max_tok // 64) * 64
+        if min_tok <= highest_64 <= max_tok:
+            candidates.add(highest_64)
+
+        valid = sorted(candidates)
+        self.checkpoint_offsets = valid
+        return valid
+
+    def extract_checkpoint(self, token_offset: int) -> Qwen3_5HybridCache:
+        offset = int(token_offset)
+        if offset == self.past_seen_tokens and offset not in self.recurrent_checkpoints:
+            return self.clone_and_expand(1)
+        if (
+            offset not in self.conv_checkpoints
+            or offset not in self.recurrent_checkpoints
+        ):
+            raise KeyError(
+                f"Checkpoint offset {offset} not recorded in Qwen3_5HybridCache (available: {self.checkpoint_offsets})"
+            )
+        extracted = Qwen3_5HybridCache()
+        extracted.past_seen_tokens = offset
+        if self.rope_deltas is not None:
+            extracted.rope_deltas = self.rope_deltas.clone()
+        for k, v in self.conv_checkpoints[offset].items():
+            extracted.conv_states[k] = v.contiguous().clone()
+        for k, v in self.recurrent_checkpoints[offset].items():
+            extracted.recurrent_states[k] = v.contiguous().clone()
+        for k, v in self.key_cache.items():
+            extracted.key_cache[k] = v[:, :, :offset, :].contiguous().clone()
+        for k, v in self.value_cache.items():
+            extracted.value_cache[k] = v[:, :, :offset, :].contiguous().clone()
+        return extracted
+
+    def clone_and_expand(self, batch_repeats: int = 1) -> Qwen3_5HybridCache:
+        cloned = Qwen3_5HybridCache()
+        cloned.past_seen_tokens = int(self.past_seen_tokens)
+        if self.rope_deltas is not None:
+            cloned.rope_deltas = (
+                self.rope_deltas.repeat(batch_repeats, 1).contiguous()
+                if batch_repeats > 1
+                else self.rope_deltas.clone()
+            )
+        for k, v in self.conv_states.items():
+            cloned.conv_states[k] = (
+                v.repeat(batch_repeats, 1, 1).contiguous()
+                if batch_repeats > 1
+                else v.clone()
+            )
+        for k, v in self.recurrent_states.items():
+            cloned.recurrent_states[k] = (
+                v.repeat(batch_repeats, 1, 1, 1).contiguous()
+                if batch_repeats > 1
+                else v.clone()
+            )
+        for k, v in self.key_cache.items():
+            cloned.key_cache[k] = (
+                v.repeat(batch_repeats, 1, 1, 1).contiguous()
+                if batch_repeats > 1
+                else v.clone()
+            )
+        for k, v in self.value_cache.items():
+            cloned.value_cache[k] = (
+                v.repeat(batch_repeats, 1, 1, 1).contiguous()
+                if batch_repeats > 1
+                else v.clone()
+            )
+        return cloned
+
+    def select_batch_item(
+        self, batch_idx: int, total_valid_tokens: Optional[int] = None
+    ) -> Qwen3_5HybridCache:
+        selected = Qwen3_5HybridCache()
+        selected.past_seen_tokens = (
+            int(total_valid_tokens)
+            if total_valid_tokens is not None
+            else int(self.past_seen_tokens)
+        )
+        if self.rope_deltas is not None:
+            idx_r = min(batch_idx, self.rope_deltas.shape[0] - 1)
+            selected.rope_deltas = self.rope_deltas[idx_r : idx_r + 1].clone()
+        for k, v in self.conv_states.items():
+            selected.conv_states[k] = v[batch_idx : batch_idx + 1].contiguous().clone()
+        for k, v in self.recurrent_states.items():
+            selected.recurrent_states[k] = (
+                v[batch_idx : batch_idx + 1].contiguous().clone()
+            )
+        for k, v in self.key_cache.items():
+            kv_slice = v[batch_idx : batch_idx + 1]
+            if total_valid_tokens is not None:
+                kv_slice = kv_slice[:, :, :total_valid_tokens, :]
+            selected.key_cache[k] = kv_slice.contiguous().clone()
+        for k, v in self.value_cache.items():
+            vv_slice = v[batch_idx : batch_idx + 1]
+            if total_valid_tokens is not None:
+                vv_slice = vv_slice[:, :, :total_valid_tokens, :]
+            selected.value_cache[k] = vv_slice.contiguous().clone()
+        return selected
+
+
 @dataclass
 class Qwen3_5ModelOutput:
     last_hidden_state: torch.Tensor
     pooler_output: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None
     rope_deltas: Optional[torch.Tensor] = None
+    past_key_values: Optional[Qwen3_5HybridCache] = None
 
 
 @dataclass
@@ -254,17 +410,43 @@ class Qwen3_5RMSNormGated(nn.Module):
         return gated.to(in_dtype)
 
 
+def _extract_conv_state_at_offset(
+    mixed_qkv: torch.Tensor,
+    prev_conv_state: Optional[torch.Tensor],
+    local_offset: int,
+    state_len: int = 3,
+) -> torch.Tensor:
+    if local_offset >= state_len:
+        return mixed_qkv[:, :, local_offset - state_len : local_offset].contiguous()
+    if prev_conv_state is not None:
+        return torch.cat(
+            [prev_conv_state[:, :, local_offset:], mixed_qkv[:, :, :local_offset]],
+            dim=-1,
+        ).contiguous()
+    pad_left = state_len - local_offset
+    return F.pad(mixed_qkv[:, :, :local_offset], (pad_left, 0)).contiguous()
+
+
 def _causal_conv1d_fn(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
-) -> torch.Tensor:
+    conv_state: Optional[torch.Tensor] = None,
+    return_final_state: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     seq_len = hidden_states.shape[-1]
     w_dtype = _resolve_compute_dtype(weight, hidden_states.dtype)
     w = weight.squeeze(1) if weight.ndim == 3 else weight
     w = w if w.dtype == w_dtype else w.to(w_dtype)
     k_size = w.shape[-1]
+    state_len = k_size - 1
+
+    new_conv_state: Optional[torch.Tensor] = None
+    if return_final_state:
+        new_conv_state = _extract_conv_state_at_offset(
+            hidden_states, conv_state, seq_len, state_len=state_len
+        )
 
     x = hidden_states.transpose(1, 2)
     if x.dtype != w_dtype:
@@ -274,11 +456,27 @@ def _causal_conv1d_fn(
     for tap in range(1, min(k_size, seq_len)):
         out[:, tap:, :].addcmul_(x[:, :-tap, :], w[:, k_size - 1 - tap])
 
+    if conv_state is not None and state_len > 0:
+        c_state = conv_state.transpose(1, 2)
+        if c_state.dtype != w_dtype:
+            c_state = c_state.to(w_dtype)
+        for tap in range(1, k_size):
+            n_from_state = min(tap, seq_len)
+            state_start = state_len - tap
+            out[:, :n_from_state, :].addcmul_(
+                c_state[:, state_start : state_start + n_from_state, :],
+                w[:, k_size - 1 - tap],
+            )
+
     if bias is not None:
         out = out + bias.to(w_dtype)
     if activation:
         out = _act_fn(out, activation)
-    return out.to(hidden_states.dtype).transpose(1, 2)
+
+    res = out.to(hidden_states.dtype).transpose(1, 2)
+    if return_final_state and new_conv_state is not None:
+        return res, new_conv_state
+    return res
 
 
 def _invert_unit_lower_triangular_block(u_blk: torch.Tensor) -> torch.Tensor:
@@ -291,7 +489,6 @@ def _invert_unit_lower_triangular_block(u_blk: torch.Tensor) -> torch.Tensor:
         a4 = a2 @ a2
         a8 = a4 @ a4
         return ((inv @ (eye + a2)) @ (eye + a4)) @ (eye + a8)
-
     cur = a
     step = 1
     while step < b_sz:
@@ -312,6 +509,7 @@ def _solve_unit_lower_triangular(
     block_size = 16
     num_blocks = n // block_size
     batch_shape = ut_system.shape[:-2]
+
     u_blocks = ut_system.reshape(
         *batch_shape, num_blocks, block_size, num_blocks, block_size
     )
@@ -333,6 +531,7 @@ def _solve_unit_lower_triangular(
         )
         u_sub = u_part[..., 1, :, :, 0, :]
         u21 = u_sub.diagonal(dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
+
         t21 = -(t22 @ (u21 @ t11))
 
         next_inv = torch.zeros(
@@ -343,12 +542,82 @@ def _solve_unit_lower_triangular(
         next_inv[..., :cur_size, :cur_size] = t11
         next_inv[..., cur_size:, :cur_size] = t21
         next_inv[..., cur_size:, cur_size:] = t22
+
         inv_blocks = next_inv
         cur_size *= 2
         cur_num = half_num
 
     mat = inv_blocks.squeeze(-3)
     return mat @ rhs
+
+
+def _recurrent_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm: bool = True,
+    checkpoint_positions: Optional[Sequence[int]] = None,
+    checkpoint_states_out: Optional[Dict[int, torch.Tensor]] = None,
+    past_seen_tokens: int = 0,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    initial_dtype = query.dtype
+    batch_size, sequence_length, _, k_head_dim = key.shape
+    num_v_heads, v_head_dim = value.shape[-2:]
+
+    q_f32, k_f32, v_f32, beta_f32, g_f32 = [
+        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+        for x in (query, key, value, beta, g)
+    ]
+    if use_qk_l2norm:
+        q_f32 = _l2norm_fp32(q_f32, dim=-1, eps=1e-6)
+        k_f32 = _l2norm_fp32(k_f32, dim=-1, eps=1e-6)
+    q_f32 = q_f32 * (k_head_dim**-0.5)
+    decay_exp = g_f32.exp()
+
+    state = (
+        initial_state.to(device=q_f32.device, dtype=torch.float32).clone()
+        if initial_state is not None
+        else torch.zeros(
+            (batch_size, num_v_heads, k_head_dim, v_head_dim),
+            dtype=torch.float32,
+            device=q_f32.device,
+        )
+    )
+    out = torch.empty(
+        (batch_size, num_v_heads, sequence_length, v_head_dim),
+        dtype=torch.float32,
+        device=q_f32.device,
+    )
+    cp_set = set(int(x) for x in checkpoint_positions) if checkpoint_positions else None
+
+    for t in range(sequence_length):
+        q_t = q_f32[:, :, t, :].unsqueeze(-2)
+        k_t = k_f32[:, :, t, :].unsqueeze(-2)
+        v_t = v_f32[:, :, t, :].unsqueeze(-2)
+        b_t = beta_f32[:, :, t].unsqueeze(-1).unsqueeze(-1)
+        d_t = decay_exp[:, :, t].unsqueeze(-1).unsqueeze(-1)
+
+        state = state * d_t
+        v_pred = k_t @ state
+        v_new = b_t * (v_t - v_pred)
+        state = state + k_t.transpose(-1, -2) @ v_new
+        out[:, :, t : t + 1, :] = q_t @ state
+
+        if cp_set is not None and checkpoint_states_out is not None:
+            abs_tok = past_seen_tokens + t + 1
+            if abs_tok in cp_set:
+                checkpoint_states_out[abs_tok] = state.clone()
+
+    out_t = out.transpose(1, 2).to(
+        initial_dtype, memory_format=torch.contiguous_format
+    )
+    if output_final_state:
+        return out_t, state
+    return out_t
 
 
 def _chunk_gated_delta_rule(
@@ -358,10 +627,31 @@ def _chunk_gated_delta_rule(
     g: torch.Tensor,
     beta: torch.Tensor,
     chunk_size: int = 64,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
     use_qk_l2norm: bool = True,
-) -> torch.Tensor:
+    checkpoint_positions: Optional[Sequence[int]] = None,
+    checkpoint_states_out: Optional[Dict[int, torch.Tensor]] = None,
+    past_seen_tokens: int = 0,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    sequence_length = key.shape[1]
+    if initial_state is not None and sequence_length <= 8:
+        return _recurrent_gated_delta_rule(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm=use_qk_l2norm,
+            checkpoint_positions=checkpoint_positions,
+            checkpoint_states_out=checkpoint_states_out,
+            past_seen_tokens=past_seen_tokens,
+        )
+
     initial_dtype = query.dtype
-    batch_size, sequence_length, _, k_head_dim = key.shape
+    batch_size, _, _, k_head_dim = key.shape
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
     padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)
@@ -376,7 +666,6 @@ def _chunk_gated_delta_rule(
         x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
         for x in (query, key, value, beta, g)
     ]
-
     if use_qk_l2norm:
         query = _l2norm_fp32(query, dim=-1, eps=1e-6)
         key = _l2norm_fp32(key, dim=-1, eps=1e-6)
@@ -419,7 +708,6 @@ def _chunk_gated_delta_rule(
 
     decayed_k_beta = k_beta * exp_cum_decay.unsqueeze(-1)
     del k_beta
-
     rhs_combined = torch.cat([v_beta, decayed_k_beta], dim=-1)
     del v_beta, decayed_k_beta
     solved_combined = _solve_unit_lower_triangular(ut_system, rhs_combined)
@@ -429,14 +717,34 @@ def _chunk_gated_delta_rule(
     )
     del solved_combined
 
-    last_recurrent_state = torch.zeros(
-        recurrent_state_shape, dtype=new_values.dtype, device=new_values.device
+    last_recurrent_state = (
+        initial_state.to(dtype=new_values.dtype, device=new_values.device).clone()
+        if initial_state is not None
+        else torch.zeros(
+            recurrent_state_shape, dtype=new_values.dtype, device=new_values.device
+        )
     )
     core_attn_out = torch.zeros_like(new_values)
 
+    has_subchunk_cp = False
+    chunk_cp_map: Dict[int, List[Tuple[int, int]]] = {}
+    if checkpoint_positions and checkpoint_states_out is not None:
+        for cp in checkpoint_positions:
+            local_cp = int(cp) - past_seen_tokens
+            if 1 <= local_cp <= sequence_length:
+                c_idx = (local_cp - 1) // chunk_size
+                s_off = local_cp - c_idx * chunk_size
+                chunk_cp_map.setdefault(c_idx, []).append((s_off, int(cp)))
+                if s_off != chunk_size:
+                    has_subchunk_cp = True
+
+    key_unscaled = key if has_subchunk_cp else None
+    cum_decay_saved = cum_decay if has_subchunk_cp else None
+
     query = query * exp_cum_decay.unsqueeze(-1)
     key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
-    del cum_decay
+    if not has_subchunk_cp:
+        del cum_decay
     chunk_decay = exp_cum_decay[..., -1][..., None, None]
     del exp_cum_decay
 
@@ -444,24 +752,43 @@ def _chunk_gated_delta_rule(
         v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ last_recurrent_state
         inter_chunk_attn = query[:, :, i] @ last_recurrent_state
         core_attn_out[:, :, i] = inter_chunk_attn + intra_chunk_attn[:, :, i] @ v_new
-        last_recurrent_state = (
+        next_recurrent_state = (
             last_recurrent_state * chunk_decay[:, :, i]
             + key[:, :, i].transpose(-1, -2) @ v_new
         )
+        if i in chunk_cp_map and checkpoint_states_out is not None:
+            for s_off, abs_cp in chunk_cp_map[i]:
+                if s_off == chunk_size:
+                    checkpoint_states_out[abs_cp] = next_recurrent_state.clone()
+                elif key_unscaled is not None and cum_decay_saved is not None:
+                    decay_s = cum_decay_saved[:, :, i, s_off - 1 : s_off]
+                    k_s = key_unscaled[:, :, i, :s_off] * (
+                        decay_s - cum_decay_saved[:, :, i, :s_off]
+                    ).exp().unsqueeze(-1)
+                    state_s = (
+                        last_recurrent_state * decay_s.exp().unsqueeze(-1)
+                        + k_s.transpose(-1, -2) @ v_new[:, :, :s_off]
+                    )
+                    checkpoint_states_out[abs_cp] = state_s.clone()
+        last_recurrent_state = next_recurrent_state
 
     del (
         query,
         key,
+        key_unscaled,
+        cum_decay_saved,
         new_values,
         k_cumdecay,
         intra_chunk_attn,
-        last_recurrent_state,
         chunk_decay,
     )
     core_attn_out = core_attn_out.reshape(padded_output_shape)[:, :, :sequence_length]
-    return core_attn_out.transpose(1, 2).to(
+    out_tensor = core_attn_out.transpose(1, 2).to(
         initial_dtype, memory_format=torch.contiguous_format
     )
+    if output_final_state:
+        return out_tensor, last_recurrent_state
+    return out_tensor
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -505,6 +832,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        cache: Optional[Qwen3_5HybridCache] = None,
     ) -> torch.Tensor:
         if attention_mask is not None and attention_mask.ndim == 2:
             hidden_states = (
@@ -519,12 +847,47 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = _linear(self.in_proj_b, hidden_states)
         a = _linear(self.in_proj_a, hidden_states)
 
-        mixed_qkv = _causal_conv1d_fn(
-            mixed_qkv,
-            self.conv1d.weight.squeeze(1),
-            self.conv1d.bias,
-            activation=self.activation,
-        ).transpose(1, 2)
+        prev_conv_state = (
+            cache.conv_states.get(self.layer_idx) if cache is not None else None
+        )
+        prev_rec_state = (
+            cache.recurrent_states.get(self.layer_idx) if cache is not None else None
+        )
+        past_seen = cache.past_seen_tokens if cache is not None else 0
+        cp_offsets = (
+            cache.checkpoint_offsets
+            if (cache is not None and cache.record_checkpoints)
+            else None
+        )
+
+        if cp_offsets and cache is not None:
+            state_len = self.conv_kernel_size - 1
+            for cp in cp_offsets:
+                local_off = cp - past_seen
+                if 1 <= local_off <= seq_len:
+                    c_snap = _extract_conv_state_at_offset(
+                        mixed_qkv, prev_conv_state, local_off, state_len=state_len
+                    )
+                    cache.conv_checkpoints.setdefault(cp, {})[self.layer_idx] = c_snap
+
+        if cache is not None:
+            conv_out, next_conv_state = _causal_conv1d_fn(
+                mixed_qkv,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_state=prev_conv_state,
+                return_final_state=True,
+            )  # type: ignore[misc]
+            cache.conv_states[self.layer_idx] = next_conv_state
+            mixed_qkv = conv_out.transpose(1, 2)
+        else:
+            mixed_qkv = _causal_conv1d_fn(
+                mixed_qkv,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                activation=self.activation,
+            ).transpose(1, 2)  # type: ignore[union-attr]
 
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
@@ -543,14 +906,38 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(rep, dim=2)
             key = key.repeat_interleave(rep, dim=2)
 
-        core_attn_out = _chunk_gated_delta_rule(
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta,
-            use_qk_l2norm=True,
-        )
+        if cache is not None:
+            layer_rec_cps: Optional[Dict[int, torch.Tensor]] = (
+                {} if cp_offsets else None
+            )
+            core_attn_out, next_rec_state = _chunk_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=prev_rec_state,
+                output_final_state=True,
+                use_qk_l2norm=True,
+                checkpoint_positions=cp_offsets,
+                checkpoint_states_out=layer_rec_cps,
+                past_seen_tokens=past_seen,
+            )  # type: ignore[misc]
+            cache.recurrent_states[self.layer_idx] = next_rec_state
+            if layer_rec_cps:
+                for cp, r_state in layer_rec_cps.items():
+                    cache.recurrent_checkpoints.setdefault(cp, {})[
+                        self.layer_idx
+                    ] = r_state
+        else:
+            core_attn_out = _chunk_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                use_qk_l2norm=True,
+            )  # type: ignore[assignment]
         del query, key, value, g, beta
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -665,6 +1052,7 @@ class Qwen3_5Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        cache: Optional[Qwen3_5HybridCache] = None,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -691,7 +1079,21 @@ class Qwen3_5Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
+        has_past = False
+        if cache is not None:
+            past_k = cache.key_cache.get(self.layer_idx)
+            past_v = cache.value_cache.get(self.layer_idx)
+            if past_k is not None and past_v is not None:
+                has_past = True
+                key_states = torch.cat([past_k, key_states], dim=2)
+                value_states = torch.cat([past_v, value_states], dim=2)
+            cache.key_cache[self.layer_idx] = key_states
+            cache.value_cache[self.layer_idx] = value_states
+
         enable_gqa = self.num_key_value_groups > 1
+        q_len = query_states.shape[2]
+        kv_len = key_states.shape[2]
+
         if attention_mask is not None and attention_mask.ndim == 4:
             attn_output = F.scaled_dot_product_attention(
                 query_states,
@@ -702,12 +1104,26 @@ class Qwen3_5Attention(nn.Module):
                 scale=self.scaling,
                 enable_gqa=enable_gqa,
             )
+        elif has_past and q_len > 1:
+            past_len = kv_len - q_len
+            causal_mask = torch.ones(
+                (q_len, kv_len), dtype=torch.bool, device=query_states.device
+            ).tril(diagonal=past_len)
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask[None, None, :, :],
+                is_causal=False,
+                scale=self.scaling,
+                enable_gqa=enable_gqa,
+            )
         else:
             attn_output = F.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
-                is_causal=(query_states.shape[2] > 1),
+                is_causal=(q_len > 1 and not has_past),
                 scale=self.scaling,
                 enable_gqa=enable_gqa,
             )
@@ -762,17 +1178,21 @@ class Qwen3_5DecoderLayer(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         linear_mask: Optional[torch.Tensor] = None,
         full_attn_mask: Optional[torch.Tensor] = None,
+        cache: Optional[Qwen3_5HybridCache] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         if self.block_type == "linear_attention":
-            hidden_states = self.linear_attn(hidden_states, attention_mask=linear_mask)
+            hidden_states = self.linear_attn(
+                hidden_states, attention_mask=linear_mask, cache=cache
+            )
         else:
             hidden_states = self.self_attn(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=full_attn_mask,
+                cache=cache,
             )
 
         hidden_states = residual + hidden_states
@@ -1209,6 +1629,8 @@ class Qwen3_5TextModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Qwen3_5HybridCache] = None,
+        use_cache: bool = False,
         **kwargs,
     ) -> Qwen3_5ModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1216,11 +1638,31 @@ class Qwen3_5TextModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        active_cache: Optional[Qwen3_5HybridCache] = (
+            past_key_values
+            if past_key_values is not None
+            else (Qwen3_5HybridCache() if use_cache else None)
+        )
+        past_seen = active_cache.past_seen_tokens if active_cache is not None else 0
+
         batch_size, seq_len, _ = inputs_embeds.shape
         device = inputs_embeds.device
 
+        if active_cache is not None and active_cache.record_checkpoints:
+            active_cache.resolve_active_checkpoints(past_seen, seq_len)
+
         if position_ids is None:
-            pos = torch.arange(seq_len, device=device).view(1, 1, -1)
+            pos = (
+                torch.arange(past_seen, past_seen + seq_len, device=device).view(
+                    1, 1, -1
+                )
+            )
+            if (
+                active_cache is not None
+                and active_cache.rope_deltas is not None
+                and past_seen > 0
+            ):
+                pos = pos + active_cache.rope_deltas.to(device=device).unsqueeze(0)
             position_ids = pos.expand(3, batch_size, -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, batch_size, -1)
@@ -1231,12 +1673,22 @@ class Qwen3_5TextModel(nn.Module):
         full_attn_mask: Optional[torch.Tensor] = None
         if attention_mask is not None and attention_mask.ndim == 2:
             if not attention_mask.bool().all():
-                linear_mask = attention_mask.bool()
-                causal = torch.tril(
-                    torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
+                linear_mask = attention_mask[:, -seq_len:].bool()
+                total_len = past_seen + seq_len
+                causal = torch.ones(
+                    (seq_len, total_len), dtype=torch.bool, device=device
+                ).tril(diagonal=past_seen)
+                full_mask_2d = (
+                    attention_mask[:, :total_len].bool()
+                    if attention_mask.shape[1] >= total_len
+                    else F.pad(
+                        attention_mask.bool(),
+                        (total_len - attention_mask.shape[1], 0),
+                        value=True,
+                    )
                 )
                 full_attn_mask = (
-                    causal[None, None, :, :] & linear_mask[:, None, None, :]
+                    causal[None, None, :, :] & full_mask_2d[:, None, None, :]
                 )
 
         hidden_states = inputs_embeds
@@ -1248,11 +1700,85 @@ class Qwen3_5TextModel(nn.Module):
                 position_embeddings=position_embeddings,
                 linear_mask=linear_mask,
                 full_attn_mask=full_attn_mask,
+                cache=active_cache,
             )
+
+        if active_cache is not None:
+            active_cache.past_seen_tokens = past_seen + seq_len
 
         del position_embeddings, linear_mask, full_attn_mask
         hidden_states = self.norm(hidden_states)
-        return Qwen3_5ModelOutput(last_hidden_state=hidden_states)
+        return Qwen3_5ModelOutput(
+            last_hidden_state=hidden_states,
+            past_key_values=active_cache,
+        )
+
+
+class _PromptSuffixDrafter:
+    def __init__(self, history_tokens: Sequence[int], max_order: int = 4) -> None:
+        self.max_order = max_order
+        self.table: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = {}
+        self.add_tokens(history_tokens)
+
+    def add_tokens(self, tokens: Sequence[int], block_len: int = 4) -> None:
+        tok_list = [int(t) for t in tokens]
+        n = len(tok_list)
+        if n <= block_len:
+            return
+        for order in range(1, self.max_order + 1):
+            for i in range(n - order - block_len + 1):
+                ctx = tuple(tok_list[i : i + order])
+                cont = tuple(tok_list[i + order : i + order + block_len])
+                bucket = self.table.setdefault(ctx, [])
+                if cont not in bucket:
+                    bucket.append(cont)
+                    if len(bucket) > 8:
+                        bucket.pop(0)
+
+    def propose_candidates(
+        self,
+        context_tokens: Sequence[int],
+        block_len: int = 4,
+        max_candidates: int = 4,
+        first_token_override: Optional[int] = None,
+    ) -> List[List[int]]:
+        candidates: List[List[int]] = []
+        ctx_list = [int(x) for x in context_tokens]
+        if first_token_override is not None:
+            ctx_list = ctx_list + [int(first_token_override)]
+        for order in range(min(self.max_order, len(ctx_list)), 0, -1):
+            key = tuple(ctx_list[-order:])
+            matches = self.table.get(key)
+            if matches:
+                for m in reversed(matches):
+                    seq = (
+                        [int(first_token_override)] + list(m[: max(0, block_len - 1)])
+                        if first_token_override is not None
+                        else list(m[:block_len])
+                    )
+                    if len(seq) == block_len and seq not in candidates:
+                        candidates.append(seq)
+                        if len(candidates) >= max_candidates:
+                            return candidates
+        return candidates
+
+
+def _levenshtein_distance(seq_a: Sequence[int], seq_b: Sequence[int]) -> int:
+    la, lb = len(seq_a), len(seq_b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    curr = [0] * (lb + 1)
+    for i in range(1, la + 1):
+        curr[0] = i
+        ai = seq_a[i - 1]
+        for j in range(1, lb + 1):
+            cost = 0 if ai == seq_b[j - 1] else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev, curr = curr, prev
+    return prev[lb]
 
 
 class Qwen3_5Model(nn.Module):
@@ -1278,6 +1804,23 @@ class Qwen3_5Model(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.embed_tokens
 
+    def project_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        w = self.language_model.embed_tokens.weight
+        if w.dtype in _FP8_DTYPES:
+            compute_dtype = (
+                hidden_states.dtype
+                if hidden_states.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                else torch.bfloat16
+            )
+            x_in = (
+                hidden_states
+                if hidden_states.dtype == compute_dtype
+                else hidden_states.to(compute_dtype)
+            )
+            return F.linear(x_in, w.to(compute_dtype))
+        x_in = hidden_states if hidden_states.dtype == w.dtype else hidden_states.to(w.dtype)
+        return F.linear(x_in, w)
+
     def get_vision_position_ids(
         self,
         start_position: int,
@@ -1293,7 +1836,6 @@ class Qwen3_5Model(nn.Module):
         pos_t = torch.arange(llm_grid_t, device=device, dtype=torch.long) + start_position
         pos_h = torch.arange(llm_grid_h, device=device, dtype=torch.long) + start_position
         pos_w = torch.arange(llm_grid_w, device=device, dtype=torch.long) + start_position
-
         t_grid, h_grid, w_grid = torch.meshgrid(pos_t, pos_h, pos_w, indexing="ij")
         return torch.stack([t_grid, h_grid, w_grid], dim=0).reshape(3, -1)
 
@@ -1382,6 +1924,8 @@ class Qwen3_5Model(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Qwen3_5HybridCache] = None,
+        use_cache: bool = False,
         **kwargs,
     ) -> Qwen3_5ModelOutput:
         if inputs_embeds is None:
@@ -1396,7 +1940,10 @@ class Qwen3_5Model(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             del img_splits, image_embeds, image_mask
 
-        if position_ids is None:
+        has_past = (
+            past_key_values is not None and past_key_values.past_seen_tokens > 0
+        )
+        if position_ids is None and not has_past:
             if input_ids is not None and image_grid_thw is not None:
                 position_ids, self.rope_deltas = self.get_rope_index(
                     input_ids,
@@ -1411,8 +1958,197 @@ class Qwen3_5Model(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
+        if outputs.past_key_values is not None and not has_past:
+            outputs.past_key_values.rope_deltas = self.rope_deltas
         return Qwen3_5ModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             rope_deltas=self.rope_deltas,
+            past_key_values=outputs.past_key_values,
         )
+
+    @torch.inference_mode()
+    def reanchor_speculative_generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int = 128,
+        block_size: int = 4,
+        max_candidates: int = 4,
+        entropy_threshold: float = 1.25,
+        stop_token_ids: Optional[Sequence[int]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        draft_proposer: Optional[
+            Callable[[List[int], int, int, Optional[int]], List[List[int]]]
+        ] = None,
+    ) -> Tuple[List[int], torch.Tensor]:
+        device = next(self.parameters()).device
+        stop_set = set(int(x) for x in (stop_token_ids or [248044, 248043]))
+        prompt_tokens = [int(x) for x in input_ids[0].tolist()]
+        drafter = _PromptSuffixDrafter(prompt_tokens)
+
+        prefill_out = self.forward(
+            input_ids=input_ids.to(device=device),
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            use_cache=True,
+        )
+        cache = prefill_out.past_key_values
+        hidden_chunks: List[torch.Tensor] = [prefill_out.last_hidden_state]
+        generated: List[int] = []
+
+        last_hidden = prefill_out.last_hidden_state[:, -1:, :]
+        logits = self.project_logits(last_hidden[:, 0, :]).float()
+        probs = F.softmax(logits, dim=-1)
+        log_probs = torch.log(probs.clamp(min=1e-12))
+        entropy = float(-(probs * log_probs).sum(dim=-1).item())
+        next_tok = int(torch.argmax(logits, dim=-1).item())
+
+        while len(generated) < max_new_tokens:
+            generated.append(next_tok)
+            if next_tok in stop_set or len(generated) >= max_new_tokens:
+                step_ids = torch.tensor([[next_tok]], dtype=torch.long, device=device)
+                step_out = self.forward(
+                    input_ids=step_ids, past_key_values=cache, use_cache=True
+                )
+                hidden_chunks.append(step_out.last_hidden_state)
+                break
+
+            full_history = prompt_tokens + generated[:-1]
+            if draft_proposer is not None:
+                g0_list = draft_proposer(full_history, block_size, 1, None)
+            else:
+                g0_list = drafter.propose_candidates(
+                    full_history, block_len=block_size, max_candidates=1
+                )
+            g0 = g0_list[0] if g0_list else [next_tok] * block_size
+
+            reanchor_active = (entropy > entropy_threshold) and (next_tok != g0[0])
+            candidate_chains: List[List[int]] = []
+            if g0[0] == next_tok:
+                candidate_chains.append(g0)
+
+            if reanchor_active:
+                if draft_proposer is not None:
+                    gd_list = draft_proposer(
+                        full_history, block_size, max_candidates, next_tok
+                    )
+                else:
+                    gd_list = drafter.propose_candidates(
+                        full_history,
+                        block_len=block_size,
+                        max_candidates=max_candidates,
+                        first_token_override=next_tok,
+                    )
+                scored: List[Tuple[int, List[int]]] = []
+                for cand in gd_list:
+                    if cand not in candidate_chains:
+                        dist = _levenshtein_distance(g0[1:], cand[1:])
+                        scored.append((dist, cand))
+                scored.sort(key=lambda pair: pair[0])
+                for _, cand in scored:
+                    if len(candidate_chains) < max_candidates:
+                        candidate_chains.append(cand)
+
+            if not candidate_chains:
+                step_ids = torch.tensor([[next_tok]], dtype=torch.long, device=device)
+                step_out = self.forward(
+                    input_ids=step_ids, past_key_values=cache, use_cache=True
+                )
+                cache = step_out.past_key_values
+                hidden_chunks.append(step_out.last_hidden_state)
+                last_h = step_out.last_hidden_state[:, -1:, :]
+                logits = self.project_logits(last_h[:, 0, :]).float()
+                probs = F.softmax(logits, dim=-1)
+                entropy = float(
+                    -(probs * torch.log(probs.clamp(min=1e-12))).sum(dim=-1).item()
+                )
+                next_tok = int(torch.argmax(logits, dim=-1).item())
+                drafter.add_tokens((prompt_tokens + generated)[-16:], block_len=block_size)
+                continue
+
+            num_k = len(candidate_chains)
+            b_len = len(candidate_chains[0])
+            cand_tensor = torch.tensor(
+                candidate_chains, dtype=torch.long, device=device
+            )
+            prev_seen = cache.past_seen_tokens if cache is not None else 0
+            batched_cache = (
+                cache.clone_and_expand(num_k)
+                if cache is not None
+                else Qwen3_5HybridCache()
+            )
+            verify_out = self.forward(
+                input_ids=cand_tensor,
+                past_key_values=batched_cache,
+                use_cache=True,
+            )
+            verify_logits = self.project_logits(verify_out.last_hidden_state).float()
+            target_preds = torch.argmax(verify_logits, dim=-1)
+
+            best_k = 0
+            best_acc = 1
+            for k_idx in range(num_k):
+                acc = 1
+                for pos in range(b_len - 1):
+                    pred_t = int(target_preds[k_idx, pos].item())
+                    if pred_t in stop_set:
+                        break
+                    if pred_t == candidate_chains[k_idx][pos + 1]:
+                        acc += 1
+                    else:
+                        break
+                if acc > best_acc:
+                    best_acc = acc
+                    best_k = k_idx
+
+            rem_budget = max_new_tokens - len(generated) + 1
+            best_acc = min(best_acc, rem_budget)
+
+            winning_chain = candidate_chains[best_k]
+            for pos in range(1, best_acc):
+                generated.append(winning_chain[pos])
+
+            accepted_hidden = verify_out.last_hidden_state[
+                best_k : best_k + 1, :best_acc, :
+            ].contiguous()
+            hidden_chunks.append(accepted_hidden)
+
+            if best_acc == b_len and verify_out.past_key_values is not None:
+                cache = verify_out.past_key_values.select_batch_item(
+                    best_k, total_valid_tokens=prev_seen + b_len
+                )
+            elif cache is not None:
+                sub_ids = cand_tensor[best_k : best_k + 1, :best_acc]
+                commit_out = self.forward(
+                    input_ids=sub_ids, past_key_values=cache, use_cache=True
+                )
+                cache = commit_out.past_key_values
+
+            final_pos = best_acc - 1
+            final_logits = verify_logits[best_k : best_k + 1, final_pos, :]
+            probs = F.softmax(final_logits, dim=-1)
+            entropy = float(
+                -(probs * torch.log(probs.clamp(min=1e-12))).sum(dim=-1).item()
+            )
+            next_tok = int(target_preds[best_k, final_pos].item())
+            drafter.add_tokens((prompt_tokens + generated)[-16:], block_len=block_size)
+
+            if next_tok in stop_set or any(t in stop_set for t in generated[-best_acc:]):
+                if next_tok in stop_set and len(generated) < max_new_tokens:
+                    generated.append(next_tok)
+                    step_ids = torch.tensor(
+                        [[next_tok]], dtype=torch.long, device=device
+                    )
+                    step_out = self.forward(
+                        input_ids=step_ids, past_key_values=cache, use_cache=True
+                    )
+                    hidden_chunks.append(step_out.last_hidden_state)
+                break
+
+        full_hidden = torch.cat(hidden_chunks, dim=1)
+        return generated, full_hidden

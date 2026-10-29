@@ -146,6 +146,7 @@ class WDDMMemoryGuard:
             target_hw_idx = self.device.index if self.device.index is not None else 0
             hw_seen = 0
             adapter_idx = 0
+
             while True:
                 adapter = ctypes.c_void_p()
                 hr = self._call_com(
@@ -192,6 +193,7 @@ class WDDMMemoryGuard:
                         self._call_com(adapter, 2, [ctypes.c_void_p])
                         break
                     hw_seen += 1
+
                 self._call_com(adapter, 2, [ctypes.c_void_p])
                 adapter_idx += 1
 
@@ -249,6 +251,16 @@ class WDDMMemoryGuard:
             _, shr_used = self._query_video_memory_info()
             self.shared_baseline_gb = shr_used
 
+    def sync_pinned_baseline(self, min_dedicated_headroom_gb: float = 1.0) -> None:
+        if not self.active:
+            return
+        ded_used, shr_used = self._query_video_memory_info()
+        ded_avail = max(0.0, self.dedicated_total_gb - ded_used)
+        if ded_avail >= min_dedicated_headroom_gb:
+            self.shared_baseline_gb = shr_used
+        elif shr_used < self.shared_baseline_gb:
+            self.shared_baseline_gb = shr_used
+
     def poll(self) -> WDDMMemorySnapshot:
         pt_alloc_bytes = 0
         pt_res_bytes = 0
@@ -272,6 +284,8 @@ class WDDMMemoryGuard:
 
         if self.active:
             ded_used, shr_used = self._query_video_memory_info()
+            if shr_used < self.shared_baseline_gb:
+                self.shared_baseline_gb = shr_used
             ded_avail = max(0.0, self.dedicated_total_gb - ded_used)
             shr_delta = max(0.0, shr_used - self.shared_baseline_gb)
             contig_avail = ded_avail + max(0.0, pt_reclaim_gb - pt_split_gb)
@@ -300,6 +314,7 @@ class WDDMMemoryGuard:
             except Exception:
                 total_b = int(32 * (1024**3))
                 free_b = max(0, total_b - pt_res_bytes)
+
         ded_total = total_b / (1024**3)
         ded_avail = free_b / (1024**3)
         ded_used = max(0.0, ded_total - ded_avail)
@@ -352,6 +367,7 @@ class WDDMMemoryGuard:
             )
             or (low_dedicated and split_bytes > _MAX_INACTIVE_SPLIT_BYTES)
         )
+
         if needs_eviction:
             gc.collect()
             reclaimable_bytes = max(

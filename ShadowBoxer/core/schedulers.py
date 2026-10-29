@@ -18,6 +18,7 @@ def compute_moss_v2_sigmas(
 ) -> torch.Tensor:
     if num_inference_steps < 1 or shift <= 0 or training_shift <= 0:
         raise ValueError("Steps and shifts must be positive.")
+
     total = int(num_train_timesteps)
 
     def _grid(count: int, s: float) -> torch.Tensor:
@@ -85,16 +86,20 @@ class MOSSImageScheduler:
         sample: torch.Tensor,
         generator: Optional[torch.Generator] = None,
         return_dict: bool = False,
+        history_output: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor]]:
         num_steps = len(self.timesteps)
         if self._step_index is None or self._step_index >= num_steps:
             self._step_index = 0
+
         idx = self._step_index
         dt = self.sigmas[idx + 1] - self.sigmas[idx]
         prev_sample = sample.float() + dt * model_output.float()
+
         self._step_index += 1
         if self._step_index >= num_steps:
             self._step_index = None
+
         return (prev_sample,) if return_dict else prev_sample
 
 
@@ -129,12 +134,13 @@ class BifurcatedFlowMatchScheduler:
         self._step_configs: List[Dict[str, Any]] = []
         self._step_index: Optional[int] = None
         self._k_star: int = 0
-
         self._sample_anchor: Optional[torch.Tensor] = None
         self._v0: Optional[torch.Tensor] = None
+        self._v0_hist: Optional[torch.Tensor] = None
         self._h: Optional[float] = None
         self._history: List[torch.Tensor] = []
         self._boundary_flushed: bool = False
+        self._can_warm_handoff: bool = False
         self.has_corrector: bool = False
         self._early_steps: int = 0
         self._late_steps: int = 0
@@ -143,6 +149,7 @@ class BifurcatedFlowMatchScheduler:
         self._step_index = 0
         self._sample_anchor = None
         self._v0 = None
+        self._v0_hist = None
         self._h = None
         self._history.clear()
         self._boundary_flushed = False
@@ -152,6 +159,17 @@ class BifurcatedFlowMatchScheduler:
         if self._step_index is None or self._step_index >= len(self._step_configs):
             return True
         return bool(self._step_configs[self._step_index]["is_early"])
+
+    @property
+    def wants_early_history_output(self) -> bool:
+        if (
+            not self._can_warm_handoff
+            or self._step_index is None
+            or self._step_index >= len(self._step_configs)
+        ):
+            return False
+        cfg = self._step_configs[self._step_index]
+        return bool(cfg["is_early"] and cfg["mode"] in ("predictor", "multistep"))
 
     @property
     def current_progress(self) -> float:
@@ -227,6 +245,7 @@ class BifurcatedFlowMatchScheduler:
             l1_sum = abs(cand[0]) + abs(cand[1]) + abs(cand[2]) + abs(cand[3])
             if l1_sum <= 2.15 * abs_h + 1e-12:
                 return cand
+
         return (h_n, 0.0, 0.0, 0.0)
 
     def set_timesteps(
@@ -241,10 +260,10 @@ class BifurcatedFlowMatchScheduler:
             self.shift = float(shift)
         if handoff_threshold is not None:
             self.handoff_threshold = max(0.0, min(1.0, float(handoff_threshold)))
+
         target_device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
-
         if self.use_v2_grid:
             snapped = compute_moss_v2_sigmas(
                 num_inference_steps=num_inference_steps,
@@ -288,6 +307,13 @@ class BifurcatedFlowMatchScheduler:
         early_has_corrector = self.early_solver in corrector_types
         late_has_corrector = self.late_solver in corrector_types
 
+        self._can_warm_handoff = (
+            self.eta <= 0.0
+            and self.early_solver in ("heun", "ipndm", "multitree")
+            and self.late_solver in ("ipndm", "multitree")
+            and self.ipndm_max_order > 1
+        )
+
         step_configs: List[Dict[str, Any]] = []
         eval_timesteps: List[float] = []
 
@@ -297,6 +323,7 @@ class BifurcatedFlowMatchScheduler:
             s_curr = float(base_sigmas_np[i])
             s_next = float(base_sigmas_np[i + 1])
             dt = s_next - s_curr
+
             interval_corrector = (
                 (early_has_corrector if is_early else late_has_corrector)
                 and (s_next > 0.0)
@@ -332,7 +359,7 @@ class BifurcatedFlowMatchScheduler:
             else:
                 t_step = s_curr * self.num_train_timesteps
                 eval_timesteps.append(t_step)
-                j = i if is_early else (i - k_star)
+                j = i if (is_early or self._can_warm_handoff) else (i - k_star)
                 order = min(self.ipndm_max_order, j + 1)
                 h_n_1 = (
                     float(base_sigmas_np[i] - base_sigmas_np[i - 1]) if j >= 1 else 0.0
@@ -429,6 +456,9 @@ class BifurcatedFlowMatchScheduler:
         sample: torch.Tensor,
         generator: Optional[torch.Generator] = None,
         return_dict: bool = False,
+        history_output: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]
+        ] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor]]:
         num_passes = len(self._step_configs)
         if self._step_index is None or self._step_index >= num_passes:
@@ -439,7 +469,16 @@ class BifurcatedFlowMatchScheduler:
             if isinstance(model_output, (tuple, list))
             else model_output.float()
         )
+        if history_output is not None:
+            v_hist = (
+                history_output[0].float()
+                if isinstance(history_output, (tuple, list))
+                else history_output.float()
+            )
+        else:
+            v_hist = v
         sample_f32 = sample.float()
+
         cfg = self._step_configs[self._step_index]
         mode = cfg["mode"]
         s_curr = cfg["s_curr"]
@@ -449,12 +488,14 @@ class BifurcatedFlowMatchScheduler:
         solver = cfg["solver"]
 
         if not is_early and not self._boundary_flushed:
-            self._history.clear()
+            if not self._can_warm_handoff:
+                self._history.clear()
             self._boundary_flushed = True
 
         if mode == "predictor":
             self._sample_anchor = sample_f32.clone()
             self._v0 = v.detach()
+            self._v0_hist = v_hist.detach()
             self._h = dt
             prev_sample = sample_f32 + dt * v
         elif mode == "corrector":
@@ -462,7 +503,9 @@ class BifurcatedFlowMatchScheduler:
                 self._sample_anchor if self._sample_anchor is not None else sample_f32
             )
             v0 = self._v0 if self._v0 is not None else v
+            v0_hist = self._v0_hist if self._v0_hist is not None else v0
             h_dt = self._h if self._h is not None else dt
+
             if solver in ("heun", "sde_gpu_pp", "multitree"):
                 dx = (h_dt / 2.0) * (v0 + v)
             else:
@@ -477,8 +520,12 @@ class BifurcatedFlowMatchScheduler:
             else:
                 prev_sample = sample_0 + dx
 
+            if is_early and self._can_warm_handoff:
+                self._push_history(v0_hist)
+
             self._sample_anchor = None
             self._v0 = None
+            self._v0_hist = None
             self._h = None
         else:
             c0, c1, c2, c3 = cfg["weights"]
@@ -502,11 +549,12 @@ class BifurcatedFlowMatchScheduler:
                 prev_sample = sample_f32 + dx
 
             if solver in ("ipndm", "multitree") and self.ipndm_max_order > 1:
-                self._push_history(v)
+                self._push_history(v_hist if is_early else v)
 
         self._step_index += 1
         if self._step_index >= num_passes:
             self.reset()
+
         return (prev_sample,) if return_dict else prev_sample
 
 

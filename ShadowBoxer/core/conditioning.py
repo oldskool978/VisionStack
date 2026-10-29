@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 
 from schema import SUPPORTED_MASK_BLEND_MODES, bbox_to_normalized
-
 from .env import _canonicalize_device
 
 _AI_TOOLKIT_MAX_REF_DIM = 512
@@ -56,6 +55,7 @@ def _resolve_unboxed_reference_dims(
         else req_h
     )
     max_area = float(max(64 * 64, cap_w * cap_h))
+
     dims = _probe_image_dimensions(path)
     if dims is not None and dims[0] > 0 and dims[1] > 0:
         src_w, src_h = dims
@@ -64,7 +64,23 @@ def _resolve_unboxed_reference_dims(
         out_w = max(64, int(round((src_w * scale) / 16.0)) * 16)
         out_h = max(64, int(round((src_h * scale) / 16.0)) * 16)
         return out_w, out_h
+
     return max(64, (cap_w // 16) * 16), max(64, (cap_h // 16) * 16)
+
+
+def _resolve_boxed_reference_dims(
+    norm_bbox: Tuple[float, float, float, float],
+    canvas_w: int,
+    canvas_h: int,
+) -> Tuple[int, int]:
+    h_lat = max(1, int(canvas_h) // 16)
+    w_lat = max(1, int(canvas_w) // 16)
+    uy0, ux0, uy1, ux1 = norm_bbox
+    y0 = max(0, min(h_lat - 1, int(round(uy0 * h_lat))))
+    x0 = max(0, min(w_lat - 1, int(round(ux0 * w_lat))))
+    y1 = max(y0 + 1, min(h_lat, int(round(uy1 * h_lat))))
+    x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
+    return max(64, (x1 - x0) * 16), max(64, (y1 - y0) * 16)
 
 
 def _normalize_vizinjector_framing(framing_mode: Optional[str]) -> str:
@@ -74,6 +90,47 @@ def _normalize_vizinjector_framing(framing_mode: Optional[str]) -> str:
     if fm in ("contain", "stretch", "never_crop"):
         return fm
     return "inscribed"
+
+
+def resample_packed_latents(
+    packed_latents: torch.Tensor,
+    target_h_lat: int,
+    target_w_lat: int,
+) -> torch.Tensor:
+    if packed_latents.ndim != 4:
+        return packed_latents
+    b, c, h, w = packed_latents.shape
+    th = max(1, int(target_h_lat))
+    tw = max(1, int(target_w_lat))
+    if (h, w) == (th, tw):
+        return packed_latents
+    if c % 4 != 0:
+        return F.interpolate(
+            packed_latents,
+            size=(th, tw),
+            mode="bilinear",
+            align_corners=False,
+        )
+    orig_dtype = packed_latents.dtype
+    unpacked = (
+        packed_latents.float()
+        .reshape(b, c // 4, 2, 2, h, w)
+        .permute(0, 1, 4, 2, 5, 3)
+        .reshape(b, c // 4, 2 * h, 2 * w)
+    )
+    resampled = F.interpolate(
+        unpacked,
+        size=(2 * th, 2 * tw),
+        mode="bilinear",
+        align_corners=False,
+    )
+    repacked = (
+        resampled.reshape(b, c // 4, th, 2, tw, 2)
+        .permute(0, 1, 3, 5, 2, 4)
+        .reshape(b, c, th, tw)
+        .contiguous()
+    )
+    return repacked.to(dtype=orig_dtype)
 
 
 def build_box_aperture_mask(
@@ -87,7 +144,7 @@ def build_box_aperture_mask(
 ) -> Optional[torch.Tensor]:
     h_lat = max(1, height // 16)
     w_lat = max(1, width // 16)
-    active_boxes: List[Tuple[float, float, float, float]] = []
+    active_boxes: List[Tuple[int, int, int, int]] = []
     for item in layout_items:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
@@ -102,8 +159,11 @@ def build_box_aperture_mask(
                 bbox, height=height, width=width, coords_are_pixels=coords_are_pixels
             )
             if (uy1 - uy0) > 1e-4 and (ux1 - ux0) > 1e-4:
-                active_boxes.append((uy0, ux0, uy1, ux1))
-
+                y0 = max(0, min(h_lat - 1, int(round(uy0 * h_lat))))
+                x0 = max(0, min(w_lat - 1, int(round(ux0 * w_lat))))
+                y1 = max(y0 + 1, min(h_lat, int(round(uy1 * h_lat))))
+                x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
+                active_boxes.append((y0, x0, y1, x1))
     if not active_boxes:
         return None
 
@@ -112,11 +172,11 @@ def build_box_aperture_mask(
     feather = max(0.25, float(feather_radius_lat))
     mask = torch.zeros((h_lat, w_lat), device=device, dtype=torch.float32)
 
-    for uy0, ux0, uy1, ux1 in active_boxes:
-        ly0 = uy0 * h_lat
-        ly1 = uy1 * h_lat
-        lx0 = ux0 * w_lat
-        lx1 = ux1 * w_lat
+    for y0, x0, y1, x1 in active_boxes:
+        ly0 = float(y0)
+        ly1 = float(y1)
+        lx0 = float(x0)
+        lx1 = float(x1)
         dy = torch.maximum(torch.maximum(ly0 - yy, yy - ly1), torch.zeros_like(yy))
         dx = torch.maximum(torch.maximum(lx0 - xx, xx - lx1), torch.zeros_like(xx))
         dist = torch.sqrt(dy * dy + dx * dx)
@@ -149,7 +209,6 @@ def compose_latent_inpaint_mask(
     )
     if ref_t is None:
         return None
-
     eff_h = int(h_lat) if h_lat is not None else int(ref_t.shape[-2])
     eff_w = int(w_lat) if w_lat is not None else int(ref_t.shape[-1])
 
@@ -223,9 +282,7 @@ def splat_box_latents_to_canvas(
     if base_canvas is not None:
         canvas = base_canvas.to(device=device, dtype=torch.float32).clone()
         if canvas.shape[-2:] != (h_lat, w_lat):
-            canvas = F.interpolate(
-                canvas, size=(h_lat, w_lat), mode="bilinear", align_corners=False
-            )
+            canvas = resample_packed_latents(canvas, h_lat, w_lat)
     else:
         canvas = torch.zeros(
             (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
@@ -258,9 +315,7 @@ def splat_box_latents_to_canvas(
 
         b_lat = box_lat_cpu.to(device=device, dtype=torch.float32)
         if b_lat.shape[-2:] != (bh, bw):
-            b_lat = F.interpolate(
-                b_lat, size=(bh, bw), mode="bilinear", align_corners=False
-            )
+            b_lat = resample_packed_latents(b_lat, bh, bw)
 
         yy = torch.arange(bh, device=device, dtype=torch.float32).unsqueeze(1) + 0.5
         xx = torch.arange(bw, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
@@ -316,6 +371,7 @@ def load_image_tensor_16px(
         scale = min(1.0, math.sqrt((1024.0 * 1024.0) / float(max(1, w_in * h_in))))
         h_out = max(64, (int(round(h_in * scale)) // 16) * 16)
         w_out = max(64, (int(round(w_in * scale)) // 16) * 16)
+
     if (w_in, h_in) != (w_out, h_out):
         img = img.resize((w_out, h_out), resample=Image.Resampling.BICUBIC)
     arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
@@ -331,18 +387,19 @@ def pack_vision_patches_32px(
     scale = min(1.0, math.sqrt(float(max_pixels) / float(max(1, w_in * h_in))))
     h_vis = max(32, (int(round(h_in * scale)) // 32) * 32)
     w_vis = max(32, (int(round(w_in * scale)) // 32) * 32)
+
     if (w_in, h_in) != (w_vis, h_vis):
         img = img.resize((w_vis, h_vis), resample=Image.Resampling.BICUBIC)
-
     arr = np.asarray(img, dtype=np.float32) / 255.0
     mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
     std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
     normed = (arr - mean) / std
-    chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
 
+    chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
     grid_h = h_vis // 16
     grid_w = w_vis // 16
     merge = 2
+
     patches = chw.unsqueeze(1).expand(3, 2, h_vis, w_vis)
     patches = patches.view(
         3, 2, grid_h // merge, merge, 16, grid_w // merge, merge, 16
@@ -361,7 +418,9 @@ __all__ = [
     "_AI_TOOLKIT_MAX_REF_DIM",
     "_probe_image_dimensions",
     "_resolve_unboxed_reference_dims",
+    "_resolve_boxed_reference_dims",
     "_normalize_vizinjector_framing",
+    "resample_packed_latents",
     "build_box_aperture_mask",
     "compose_latent_inpaint_mask",
     "splat_box_latents_to_canvas",

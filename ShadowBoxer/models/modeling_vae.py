@@ -6,12 +6,84 @@ import json
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-from safetensors.torch import load_file as load_safetensors
+from safetensors import safe_open
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 _SDPA_QUERY_CHUNK_SIZE = 2048
+_CONV_STRIP_THRESHOLD_ELEMENTS = 64 * 512 * 512
+
+
+def _conv2d_3x3_strip_tiled(
+    conv: nn.Conv2d,
+    x: torch.Tensor,
+    enabled: bool = True,
+) -> torch.Tensor:
+    if (
+        not enabled
+        or x.ndim != 4
+        or conv.kernel_size != (3, 3)
+        or conv.stride != (1, 1)
+        or conv.padding != (1, 1)
+        or conv.dilation != (1, 1)
+    ):
+        return conv(x)
+
+    b, c_in, h, w = x.shape
+    if c_in * h * w < _CONV_STRIP_THRESHOLD_ELEMENTS:
+        return conv(x)
+
+    strip_h = 128 if (c_in * w >= 192 * 512) else 256
+    if h <= strip_h:
+        return conv(x)
+
+    c_out = conv.out_channels
+    out = torch.empty((b, c_out, h, w), dtype=x.dtype, device=x.device)
+    strip_buf = torch.empty(
+        (b, c_in, strip_h + 2, w), dtype=x.dtype, device=x.device
+    )
+    w_conv = (
+        conv.weight if conv.weight.dtype == x.dtype else conv.weight.to(x.dtype)
+    )
+    b_conv = (
+        (conv.bias if conv.bias.dtype == x.dtype else conv.bias.to(x.dtype))
+        if conv.bias is not None
+        else None
+    )
+
+    for y0 in range(0, h, strip_h):
+        y1 = min(y0 + strip_h, h)
+        sh = y1 - y0
+        buf = strip_buf if sh == strip_h else strip_buf[:, :, : sh + 2, :]
+        if y0 == 0:
+            buf[:, :, 0, :].zero_()
+            avail = min(h, sh + 1)
+            buf[:, :, 1 : 1 + avail, :].copy_(x[:, :, 0:avail, :])
+            if 1 + avail < sh + 2:
+                buf[:, :, 1 + avail : sh + 2, :].zero_()
+        else:
+            avail = min(h - (y0 - 1), sh + 2)
+            buf[:, :, 0:avail, :].copy_(
+                x[:, :, y0 - 1 : y0 - 1 + avail, :]
+            )
+            if avail < sh + 2:
+                buf[:, :, avail : sh + 2, :].zero_()
+
+        strip_out = F.conv2d(
+            buf,
+            w_conv,
+            b_conv,
+            stride=1,
+            padding=(0, 1),
+            dilation=1,
+            groups=conv.groups,
+        )
+        out[:, :, y0:y1, :].copy_(strip_out)
+        del strip_out
+
+    del strip_buf
+    return out
 
 
 @dataclass
@@ -79,13 +151,13 @@ class _ResnetBlock2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm1(x)
-        h = F.silu(h, inplace=True)
-        h = self.conv1(h)
         if self.conv_shortcut is not None:
             x = self.conv_shortcut(x)
+        h = F.silu(h, inplace=True)
+        h = _conv2d_3x3_strip_tiled(self.conv1, h)
         h = self.norm2(h)
         h = F.silu(h, inplace=True)
-        h = self.conv2(h)
+        h = _conv2d_3x3_strip_tiled(self.conv2, h)
         return h.add_(x)
 
 
@@ -120,8 +192,8 @@ class _AttentionBlock2D(nn.Module):
                     q[:, :, start:end, :], k, v, dropout_p=0.0, is_causal=False
                 ).squeeze(1)
         del q, k, v
-        out = self.to_out[0](out).transpose(1, 2).reshape(b, c, h, w)
-        return out.add_(x)
+        out = self.to_out[0](out)
+        return x.add_(out.transpose(1, 2).view(b, c, h, w))
 
 
 class _Downsample2D(nn.Module):
@@ -141,7 +213,7 @@ class _Upsample2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2.0, mode="nearest")
-        return self.conv(x)
+        return _conv2d_3x3_strip_tiled(self.conv, x)
 
 
 class _DownEncoderBlock2D(nn.Module):
@@ -168,20 +240,10 @@ class _DownEncoderBlock2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for resnet in self.resnets:
-            h = resnet.norm1(x)
-            h = F.silu(h, inplace=True)
-            h = resnet.conv1(h)
-            if resnet.conv_shortcut is not None:
-                x = resnet.conv_shortcut(x)
-            h = resnet.norm2(h)
-            h = F.silu(h, inplace=True)
-            h = resnet.conv2(h)
-            x = h.add_(x)
-            del h
+            x = resnet(x)
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
-                x = F.pad(x, (0, 1, 0, 1), mode="constant", value=0.0)
-                x = downsampler.conv(x)
+                x = downsampler(x)
         return x
 
 
@@ -209,20 +271,10 @@ class _UpDecoderBlock2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for resnet in self.resnets:
-            h = resnet.norm1(x)
-            h = F.silu(h, inplace=True)
-            h = resnet.conv1(h)
-            if resnet.conv_shortcut is not None:
-                x = resnet.conv_shortcut(x)
-            h = resnet.norm2(h)
-            h = F.silu(h, inplace=True)
-            h = resnet.conv2(h)
-            x = h.add_(x)
-            del h
+            x = resnet(x)
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
-                x = F.interpolate(x, scale_factor=2.0, mode="nearest")
-                x = upsampler.conv(x)
+                x = upsampler(x)
         return x
 
 
@@ -292,27 +344,13 @@ class _Flux2Encoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv_in(x)
+        x = _conv2d_3x3_strip_tiled(self.conv_in, x)
         for block in self.down_blocks:
-            for resnet in block.resnets:
-                h = resnet.norm1(x)
-                h = F.silu(h, inplace=True)
-                h = resnet.conv1(h)
-                if resnet.conv_shortcut is not None:
-                    x = resnet.conv_shortcut(x)
-                h = resnet.norm2(h)
-                h = F.silu(h, inplace=True)
-                h = resnet.conv2(h)
-                x = h.add_(x)
-                del h
-            if block.downsamplers is not None:
-                for downsampler in block.downsamplers:
-                    x = F.pad(x, (0, 1, 0, 1), mode="constant", value=0.0)
-                    x = downsampler.conv(x)
+            x = block(x)
         x = self.mid_block(x)
         x = self.conv_norm_out(x)
         x = F.silu(x, inplace=True)
-        return self.conv_out(x)
+        return _conv2d_3x3_strip_tiled(self.conv_out, x)
 
 
 class _Flux2Decoder(nn.Module):
@@ -361,27 +399,13 @@ class _Flux2Decoder(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z = self.conv_in(z)
+        z = _conv2d_3x3_strip_tiled(self.conv_in, z)
         z = self.mid_block(z)
         for block in self.up_blocks:
-            for resnet in block.resnets:
-                h = resnet.norm1(z)
-                h = F.silu(h, inplace=True)
-                h = resnet.conv1(h)
-                if resnet.conv_shortcut is not None:
-                    z = resnet.conv_shortcut(z)
-                h = resnet.norm2(h)
-                h = F.silu(h, inplace=True)
-                h = resnet.conv2(h)
-                z = h.add_(z)
-                del h
-            if block.upsamplers is not None:
-                for upsampler in block.upsamplers:
-                    z = F.interpolate(z, scale_factor=2.0, mode="nearest")
-                    z = upsampler.conv(z)
+            z = block(z)
         z = self.conv_norm_out(z)
         z = F.silu(z, inplace=True)
-        return self.conv_out(z)
+        return _conv2d_3x3_strip_tiled(self.conv_out, z)
 
 
 class Flux2AutoencoderKL(nn.Module):
@@ -439,7 +463,6 @@ class Flux2AutoencoderKL(nn.Module):
             use_post_quant_conv=use_post_quant_conv,
             use_quant_conv=use_quant_conv,
         )
-
         packed_channels = latent_channels * patch_size[0] * patch_size[1]
         self.bn = nn.BatchNorm2d(
             packed_channels,
@@ -474,6 +497,47 @@ class Flux2AutoencoderKL(nn.Module):
             if use_post_quant_conv
             else None
         )
+        self._bn_stats_cache: Optional[
+            Tuple[torch.device, int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+
+    def clear_caches(self) -> None:
+        self._bn_stats_cache = None
+
+    def _apply(self, fn, recurse: bool = True):
+        super()._apply(fn, recurse=recurse)
+        self._bn_stats_cache = None
+        return self
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        self._bn_stats_cache = None
+
+    def _get_bn_stats(
+        self, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rm = self.bn.running_mean
+        rv = self.bn.running_var
+        rm_ptr = int(rm.data_ptr())
+        rv_ptr = int(rv.data_ptr())
+        if (
+            self._bn_stats_cache is not None
+            and self._bn_stats_cache[0] == device
+            and self._bn_stats_cache[1] == rm_ptr
+            and self._bn_stats_cache[2] == rv_ptr
+        ):
+            return (
+                self._bn_stats_cache[3],
+                self._bn_stats_cache[4],
+                self._bn_stats_cache[5],
+            )
+        eps = self.config.batch_norm_eps
+        mean = rm.to(device=device, dtype=torch.float32).view(1, -1, 1, 1).contiguous()
+        var_eps = rv.to(device=device, dtype=torch.float32) + eps
+        std = var_eps.sqrt().view(1, -1, 1, 1).contiguous()
+        inv_std = torch.rsqrt(var_eps).view(1, -1, 1, 1).contiguous()
+        self._bn_stats_cache = (device, rm_ptr, rv_ptr, mean, std, inv_std)
+        return mean, std, inv_std
 
     @classmethod
     def from_config_dir(cls, model_dir: Union[str, Path]) -> Flux2AutoencoderKL:
@@ -493,32 +557,40 @@ class Flux2AutoencoderKL(nn.Module):
         sf_files = sorted(path.glob("*.safetensors"))
         if not sf_files:
             raise FileNotFoundError(f"No .safetensors files found in {path}")
+
         target_dev = torch.device(device) if isinstance(device, str) else device
+        cfg_file = path / "config.json"
+        cfg = (
+            Flux2VAEConfig.from_json_file(cfg_file)
+            if cfg_file.is_file()
+            else Flux2VAEConfig()
+        )
+
         state_dict = {}
         for sf in sf_files:
-            raw = load_safetensors(str(sf), device="cpu")
-            for k, v in raw.items():
-                if v.is_floating_point():
-                    t_dtype = torch.float32 if k.startswith("bn.") else dtype
-                    state_dict[k] = v.to(device=target_dev, dtype=t_dtype)
-                else:
-                    state_dict[k] = v.to(device=target_dev)
-            del raw
+            resolved_sf = sf.resolve(strict=True)
+            with safe_open(str(resolved_sf), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if k == "decoder.conv_out.weight":
+                        shape = f.get_slice(k).get_shape()
+                        if len(shape) >= 2 and int(shape[1]) == 96:
+                            cfg.decoder_block_out_channels = (96, 192, 384, 384)
+                    v = f.get_tensor(k)
+                    if v.is_floating_point():
+                        t_dtype = torch.float32 if k.startswith("bn.") else dtype
+                        state_dict[k] = v.to(device=target_dev, dtype=t_dtype)
+                    else:
+                        state_dict[k] = v.to(device=target_dev)
+                    del v
 
         if "bn.num_batches_tracked" not in state_dict:
             state_dict["bn.num_batches_tracked"] = torch.tensor(
                 0, dtype=torch.long, device=target_dev
             )
 
-        model = cls.from_config_dir(path)
-        if "decoder.conv_out.weight" in state_dict:
-            actual_dec_ch0 = int(state_dict["decoder.conv_out.weight"].shape[1])
-            expected_dec_ch0 = int(model.decoder.conv_out.weight.shape[1])
-            if actual_dec_ch0 != expected_dec_ch0 and actual_dec_ch0 == 96:
-                model.config.decoder_block_out_channels = (96, 192, 384, 384)
-                model = cls(config=model.config)
-
+        model = cls(config=cfg)
         model.load_state_dict(state_dict, strict=True, assign=True)
+        del state_dict
         model.to(device=target_dev, dtype=dtype)
         model.eval().requires_grad_(False)
         return model
@@ -540,13 +612,11 @@ class Flux2AutoencoderKL(nn.Module):
     @torch.inference_mode()
     def decode_packed_latents(self, latents: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=self.device.type, enabled=False):
-            z = latents.to(device=self.device, dtype=torch.float32)
+            z = latents.to(device=self.device, dtype=torch.float32).clone()
             del latents
-            eps = self.config.batch_norm_eps
-            std = (self.bn.running_var.float() + eps).sqrt().to(z).view(1, -1, 1, 1)
-            mean = self.bn.running_mean.float().to(z).view(1, -1, 1, 1)
-            z = torch.addcmul(mean, z, std)
-            del std, mean
+            mean, std, _ = self._get_bn_stats(self.device)
+            z.mul_(std).add_(mean)
+
             b, c, h, w = z.shape
             z = (
                 z.reshape(b, c // 4, 2, 2, h, w)
@@ -555,6 +625,7 @@ class Flux2AutoencoderKL(nn.Module):
             )
             if z.dtype != self.dtype:
                 z = z.to(dtype=self.dtype)
+
             if self.post_quant_conv is not None:
                 z = self.post_quant_conv(z)
             decoded = self.decoder(z)
@@ -572,6 +643,7 @@ class Flux2AutoencoderKL(nn.Module):
                 h = self.quant_conv(h)
             posterior_mode, _ = torch.chunk(h.float(), 2, dim=1)
             del h
+
             b, c, h2, w2 = posterior_mode.shape
             z_patch = (
                 posterior_mode.reshape(b, c, h2 // 2, 2, w2 // 2, 2)
@@ -579,13 +651,7 @@ class Flux2AutoencoderKL(nn.Module):
                 .reshape(b, c * 4, h2 // 2, w2 // 2)
             )
             del posterior_mode
-            eps = self.config.batch_norm_eps
-            inv_std = (
-                torch.rsqrt(self.bn.running_var.float() + eps)
-                .to(z_patch)
-                .view(1, -1, 1, 1)
-            )
-            mean = self.bn.running_mean.float().to(z_patch).view(1, -1, 1, 1)
-            z_patch = z_patch.sub_(mean).mul_(inv_std)
-            del inv_std, mean
+
+            mean, _, inv_std = self._get_bn_stats(self.device)
+            z_patch.sub_(mean).mul_(inv_std)
             return z_patch.float()

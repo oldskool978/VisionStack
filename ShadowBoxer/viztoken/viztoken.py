@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+import threading
 from typing import (
     AbstractSet,
     Any,
@@ -40,6 +41,50 @@ QWEN35_PRETOKENIZE_REGEX = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
     r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
+
+_TLS_SCRATCH = threading.local()
+
+
+def _acquire_tls_int32_buffer(min_capacity: int) -> Tuple[Any, int]:
+    cap = getattr(_TLS_SCRATCH, "int32_cap", 0)
+    buf = getattr(_TLS_SCRATCH, "int32_buf", None)
+    if buf is None or cap < min_capacity:
+        alloc_cap = max(min_capacity, 4096)
+        buf = (ctypes.c_int32 * alloc_cap)()
+        if alloc_cap <= 262144:
+            _TLS_SCRATCH.int32_buf = buf
+            _TLS_SCRATCH.int32_cap = alloc_cap
+        return buf, alloc_cap
+    return buf, cap
+
+
+def _acquire_tls_prefix_buffers(min_capacity: int) -> Tuple[Any, Any]:
+    cap = getattr(_TLS_SCRATCH, "pfx_cap", 0)
+    buf_a = getattr(_TLS_SCRATCH, "pfx_buf_a", None)
+    buf_b = getattr(_TLS_SCRATCH, "pfx_buf_b", None)
+    if buf_a is None or buf_b is None or cap < min_capacity:
+        alloc_cap = max(min_capacity, 4096)
+        buf_a = (ctypes.c_int32 * alloc_cap)()
+        buf_b = (ctypes.c_int32 * alloc_cap)()
+        if alloc_cap <= 262144:
+            _TLS_SCRATCH.pfx_buf_a = buf_a
+            _TLS_SCRATCH.pfx_buf_b = buf_b
+            _TLS_SCRATCH.pfx_cap = alloc_cap
+        return buf_a, buf_b
+    return buf_a, buf_b
+
+
+def _acquire_tls_char_buffer(min_capacity: int) -> Tuple[Any, int]:
+    cap = getattr(_TLS_SCRATCH, "char_cap", 0)
+    buf = getattr(_TLS_SCRATCH, "char_buf", None)
+    if buf is None or cap < min_capacity:
+        alloc_cap = max(min_capacity, 8192)
+        buf = (ctypes.c_char * alloc_cap)()
+        if alloc_cap <= 1048576:
+            _TLS_SCRATCH.char_buf = buf
+            _TLS_SCRATCH.char_cap = alloc_cap
+        return buf, alloc_cap
+    return buf, cap
 
 
 class SpecialDisk(ctypes.Structure):
@@ -204,6 +249,7 @@ def _inspect_swiss_container(
             eot_token_id = int(unpacked[15])
             fast_magic = int(unpacked[16])
             has_fast_tables = fast_magic == _SWISS5_FAST_MAGIC
+
             specials: List[Tuple[str, int]] = []
             if specials_offset > 0 and specials_count > 0:
                 f.seek(specials_offset)
@@ -240,6 +286,7 @@ def compile_vocab(
     binding = get_binding()
     in_path = Path(in_tiktoken_path).resolve()
     out_path = Path(out_bin_path).resolve()
+
     in_path_str = str(in_path).encode("utf-8")
     out_path_str = str(out_path).encode("utf-8")
     telem_path_str = (
@@ -314,29 +361,45 @@ def find_common_prefix(
         tokens_a = tokens_a.detach().cpu().numpy().ravel()
     if hasattr(tokens_b, "detach"):
         tokens_b = tokens_b.detach().cpu().numpy().ravel()
+
     len_a = len(tokens_a)
     len_b = len(tokens_b)
     limit = len_a if len_a < len_b else len_b
     if limit == 0:
         return 0
+
+    if isinstance(tokens_a, (list, tuple)) and isinstance(tokens_b, (list, tuple)):
+        if limit < 32:
+            for i in range(limit):
+                if tokens_a[i] != tokens_b[i]:
+                    return i
+            return limit
+        try:
+            binding = get_binding()
+            buf_a, buf_b = _acquire_tls_prefix_buffers(limit)
+            buf_a[:limit] = tokens_a[:limit]
+            buf_b[:limit] = tokens_b[:limit]
+            return int(binding.find_common_prefix(buf_a, limit, buf_b, limit))
+        except Exception:
+            for i in range(limit):
+                if tokens_a[i] != tokens_b[i]:
+                    return i
+            return limit
+
     try:
         import numpy as np
 
-        is_arr_a = isinstance(tokens_a, np.ndarray)
-        is_arr_b = isinstance(tokens_b, np.ndarray)
-        if is_arr_a or is_arr_b or limit > 16:
-            arr_a = np.ascontiguousarray(tokens_a[:limit], dtype=np.int32)
-            arr_b = np.ascontiguousarray(tokens_b[:limit], dtype=np.int32)
-            binding = get_binding()
-            ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-            ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-            return int(binding.find_common_prefix(ptr_a, limit, ptr_b, limit))
+        arr_a = np.ascontiguousarray(tokens_a[:limit], dtype=np.int32)
+        arr_b = np.ascontiguousarray(tokens_b[:limit], dtype=np.int32)
+        binding = get_binding()
+        ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        return int(binding.find_common_prefix(ptr_a, limit, ptr_b, limit))
     except Exception:
-        pass
-    for i in range(limit):
-        if tokens_a[i] != tokens_b[i]:
-            return i
-    return limit
+        for i in range(limit):
+            if tokens_a[i] != tokens_b[i]:
+                return i
+        return limit
 
 
 class Encoding:
@@ -410,8 +473,8 @@ class Encoding:
         self._n_vocab = max(base_v, total_v)
         self._eot_token = eot_id
         self._has_fast_tables = has_fast
-        defaults = spec_list if spec_list else build_default_qwen35_specials()
 
+        defaults = spec_list if spec_list else build_default_qwen35_specials()
         self._special_token_to_id: Dict[str, int] = {
             literal: s_id for literal, s_id in defaults
         }
@@ -419,6 +482,39 @@ class Encoding:
         self._id_to_special_token: Dict[int, str] = {
             s_id: literal for literal, s_id in defaults
         }
+
+        self._img_pad_id = self._special_token_to_id.get("<|image_pad|>", 248056)
+        self._vision_end_id = self._special_token_to_id.get("<|vision_end|>", 248054)
+        self._chat_sys_start = self._encode_all_special_unchecked(
+            "<|im_start|>system\n"
+        )
+        self._chat_im_end_nl = self._encode_all_special_unchecked("<|im_end|>\n")
+        self._chat_user_start = self._encode_all_special_unchecked(
+            "<|im_start|>user\n"
+        )
+        self._chat_user_vis_no_id = self._encode_all_special_unchecked(
+            "<|im_start|>user\n<|vision_start|>"
+        )
+        self._chat_inter_vis_no_id = self._encode_all_special_unchecked(
+            "<|vision_end|><|vision_start|>"
+        )
+        self._chat_user_vis_id_cache: Dict[int, List[int]] = {
+            idx: self._encode_all_special_unchecked(
+                f"<|im_start|>user\nPicture {idx}: <|vision_start|>"
+                if idx == 1
+                else f"<|vision_end|>Picture {idx}: <|vision_start|>"
+            )
+            for idx in range(1, 9)
+        }
+        self._chat_tail_think_on = self._encode_all_special_unchecked(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
+        self._chat_tail_think_off = self._encode_all_special_unchecked(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        self._chat_tail_trace_open = self._encode_all_special_unchecked(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
 
     def close(self) -> None:
         if hasattr(self, "_ctx") and self._ctx:
@@ -474,11 +570,11 @@ class Encoding:
         raw = text.encode("utf-8")
         byte_len = len(raw)
         max_tokens = max(byte_len, 16)
-        out_buf = (ctypes.c_int32 * max_tokens)()
+        out_buf, _ = _acquire_tls_int32_buffer(max_tokens)
         count = self._binding.encode(
             self._ctx, raw, byte_len, out_buf, max_tokens
         )
-        return list(out_buf[:count])
+        return out_buf[:count]
 
     def encode_ordinary(self, text: str) -> List[int]:
         if not text:
@@ -488,11 +584,11 @@ class Encoding:
         raw = text.encode("utf-8")
         byte_len = len(raw)
         max_tokens = max(byte_len, 16)
-        out_buf = (ctypes.c_int32 * max_tokens)()
+        out_buf, _ = _acquire_tls_int32_buffer(max_tokens)
         count = self._binding.encode_ordinary(
             self._ctx, raw, byte_len, out_buf, max_tokens
         )
-        return list(out_buf[:count])
+        return out_buf[:count]
 
     def encode(
         self,
@@ -563,43 +659,57 @@ class Encoding:
         add_vision_id: bool = True,
     ) -> List[int]:
         norm_prompt = unicodedata.normalize("NFC", prompt).strip()
-        sys_prefix = ""
+        toks: List[int] = []
+
         if system_prompt is not None:
             norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
             if norm_sys:
-                sys_prefix = f"<|im_start|>system\n{norm_sys}<|im_end|>\n"
+                toks.extend(self._chat_sys_start)
+                toks.extend(self._encode_all_special_unchecked(norm_sys))
+                toks.extend(self._chat_im_end_nl)
+
+        if not image_patch_counts:
+            toks.extend(self._chat_user_start)
+            if norm_prompt:
+                toks.extend(self._encode_all_special_unchecked(norm_prompt))
+        else:
+            img_pad_id = self._img_pad_id
+            for idx, count in enumerate(image_patch_counts, start=1):
+                if add_vision_id:
+                    vis_seg = self._chat_user_vis_id_cache.get(idx)
+                    if vis_seg is None:
+                        vis_seg = self._encode_all_special_unchecked(
+                            f"<|im_start|>user\nPicture {idx}: <|vision_start|>"
+                            if idx == 1
+                            else f"<|vision_end|>Picture {idx}: <|vision_start|>"
+                        )
+                    toks.extend(vis_seg)
+                else:
+                    toks.extend(
+                        self._chat_user_vis_no_id
+                        if idx == 1
+                        else self._chat_inter_vis_no_id
+                    )
+                toks.extend([img_pad_id] * max(1, int(count)))
+            toks.append(self._vision_end_id)
+            if norm_prompt:
+                toks.extend(self._encode_all_special_unchecked(norm_prompt))
+
         if thinking_trace is not None:
             norm_trace = unicodedata.normalize("NFC", thinking_trace).strip()
         else:
             norm_trace = ""
-        if norm_trace:
-            think_suffix = f"<think>\n{norm_trace}\n</think>\n\n"
-        else:
-            think_suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
 
-        if not image_patch_counts:
-            full_text = (
-                f"{sys_prefix}<|im_start|>user\n{norm_prompt}<|im_end|>\n"
-                f"<|im_start|>assistant\n{think_suffix}"
+        if norm_trace:
+            toks.extend(self._chat_tail_trace_open)
+            toks.extend(
+                self._encode_all_special_unchecked(f"{norm_trace}\n</think>\n\n")
             )
-            toks = self._encode_all_special_unchecked(full_text)
+        elif enable_thinking:
+            toks.extend(self._chat_tail_think_on)
         else:
-            img_pad_id = self._special_token_to_id.get("<|image_pad|>", 248056)
-            toks = []
-            for idx, count in enumerate(image_patch_counts, start=1):
-                vis_label = f"Picture {idx}: " if add_vision_id else ""
-                seg = (
-                    f"{sys_prefix}<|im_start|>user\n{vis_label}<|vision_start|>"
-                    if idx == 1
-                    else f"<|vision_end|>{vis_label}<|vision_start|>"
-                )
-                toks.extend(self._encode_all_special_unchecked(seg))
-                toks.extend([img_pad_id] * max(1, int(count)))
-            tail = (
-                f"<|vision_end|>{norm_prompt}<|im_end|>\n"
-                f"<|im_start|>assistant\n{think_suffix}"
-            )
-            toks.extend(self._encode_all_special_unchecked(tail))
+            toks.extend(self._chat_tail_think_off)
+
         if max_sequence_length > 0 and len(toks) > max_sequence_length:
             toks = toks[:max_sequence_length]
         return toks
@@ -658,32 +768,42 @@ class Encoding:
         if not self._ctx:
             raise RuntimeError("Operation attempted on closed VizToken context.")
 
-        try:
-            import numpy as np
-
-            contiguous_arr = np.ascontiguousarray(tokens, dtype=np.int32).ravel()
-            count = int(contiguous_arr.size)
-            if count == 0:
-                return ""
-            c_tokens = contiguous_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-        except Exception:
+        if isinstance(tokens, (list, tuple)):
             count = len(tokens)
             if count == 0:
                 return ""
-            arr_type = ctypes.c_int32 * count
-            c_tokens = arr_type(*tokens)
+            in_buf, _ = _acquire_tls_int32_buffer(count)
+            in_buf[:count] = tokens
+            c_tokens = ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_int32))
+        else:
+            try:
+                import numpy as np
+
+                contiguous_arr = np.ascontiguousarray(tokens, dtype=np.int32).ravel()
+                count = int(contiguous_arr.size)
+                if count == 0:
+                    return ""
+                c_tokens = contiguous_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+            except Exception:
+                tok_list = list(tokens)
+                count = len(tok_list)
+                if count == 0:
+                    return ""
+                in_buf, _ = _acquire_tls_int32_buffer(count)
+                in_buf[:count] = tok_list
+                c_tokens = ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_int32))
 
         alloc_size = max(count * 8 + 64, 1024)
-        buf = ctypes.create_string_buffer(alloc_size)
+        buf, buf_cap = _acquire_tls_char_buffer(alloc_size)
         needed = self._binding.decode(
-            self._ctx, c_tokens, count, buf, alloc_size
+            self._ctx, c_tokens, count, buf, buf_cap
         )
-        if needed >= alloc_size:
-            buf = ctypes.create_string_buffer(needed + 1)
+        if needed >= buf_cap:
+            buf, buf_cap = _acquire_tls_char_buffer(needed + 1)
             needed = self._binding.decode(
-                self._ctx, c_tokens, count, buf, needed + 1
+                self._ctx, c_tokens, count, buf, buf_cap
             )
-        return buf.raw[:needed].decode("utf-8", errors=errors)
+        return buf[:needed].decode("utf-8", errors=errors)
 
     def decode_batch(
         self,

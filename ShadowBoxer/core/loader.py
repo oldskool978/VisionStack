@@ -36,12 +36,14 @@ def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
         ROOT_DIR / ".hf_cache" / "hub",
     ]
     repo_folder_name = "models--" + repo_str.replace("/", "--")
+
     seen_dirs = set()
     for hub_dir in hub_candidates:
         resolved_hub = hub_dir.resolve()
         if resolved_hub in seen_dirs or not resolved_hub.exists():
             continue
         seen_dirs.add(resolved_hub)
+
         cand = resolved_hub / repo_folder_name / "snapshots"
         if cand.exists():
             snapshots = sorted(
@@ -70,7 +72,11 @@ def _resolve_target_tensor_dtype(
         or clean_key.startswith("bn.")
     ):
         return torch.float32
-    if clean_key.endswith("A_log") or dtype is None:
+    if (
+        clean_key.endswith("A_log")
+        or clean_key.endswith("dt_bias")
+        or dtype is None
+    ):
         return src_tensor.dtype
     if src_tensor.dtype == torch.float32 and dtype != torch.float32:
         return dtype
@@ -180,6 +186,7 @@ def load_sharded_safetensors_into(
             if not _same_device(param.device, target_dev):
                 t_dtype = _resolve_target_tensor_dtype(name, param, dtype)
                 param.data = param.data.to(device=target_dev, dtype=t_dtype)
+
         for name, buf in target_module.named_buffers():
             if buf.is_floating_point():
                 if (

@@ -140,9 +140,39 @@ def validate_skip_layers(
     return set(parsed)
 
 
+def _snap_box_to_latent_grid(
+    box: Optional[NormBBox],
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+) -> Optional[NormBBox]:
+    if box is None:
+        return None
+    uy0, ux0, uy1, ux1 = box
+    if height is not None and width is not None and height > 0 and width > 0:
+        h_lat = int(height)
+        w_lat = int(width)
+        y0 = max(0, min(h_lat - 1, int(round(uy0 * h_lat))))
+        x0 = max(0, min(w_lat - 1, int(round(ux0 * w_lat))))
+        y1 = max(y0 + 1, min(h_lat, int(round(uy1 * h_lat))))
+        x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
+        if y0 == 0 and x0 == 0 and y1 == h_lat and x1 == w_lat:
+            return None
+        return (
+            round(y0 / float(h_lat), 6),
+            round(x0 / float(w_lat), 6),
+            round(y1 / float(h_lat), 6),
+            round(x1 / float(w_lat), 6),
+        )
+    if uy0 <= 1e-5 and ux0 <= 1e-5 and uy1 >= 1.0 - 1e-5 and ux1 >= 1.0 - 1e-5:
+        return None
+    return (round(uy0, 6), round(ux0, 6), round(uy1, 6), round(ux1, 6))
+
+
 def _normalize_ref_bboxes(
     ref_shapes: Optional[List[Tuple[int, int]]],
     ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]],
+    height: Optional[int] = None,
+    width: Optional[int] = None,
 ) -> Tuple[Optional[NormBBox], ...]:
     if not ref_shapes:
         return ()
@@ -158,10 +188,11 @@ def _normalize_ref_bboxes(
             x0 = max(0.0, min(1.0, float(b[1])))
             y1 = max(y0, min(1.0, float(b[2])))
             x1 = max(x0, min(1.0, float(b[3])))
-            if y0 <= 1e-5 and x0 <= 1e-5 and y1 >= 1.0 - 1e-5 and x1 >= 1.0 - 1e-5:
-                out.append(None)
-            else:
-                out.append((round(y0, 6), round(x0, 6), round(y1, 6), round(x1, 6)))
+            out.append(
+                _snap_box_to_latent_grid(
+                    (y0, x0, y1, x1), height=height, width=width
+                )
+            )
     return tuple(out)
 
 
@@ -248,6 +279,15 @@ def _rotate(
     return torch.addcmul(x * cos, torch.cat((b, a), -1), sin_signed)
 
 
+def _slice_blhd_to_bhld(
+    t: torch.Tensor, start: int, end: int
+) -> torch.Tensor:
+    s = t[:, start:end, :, :]
+    if t.shape[0] > 1 and (end - start) < t.shape[1]:
+        s = s.contiguous()
+    return s.transpose(1, 2)
+
+
 def _attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -267,7 +307,6 @@ def _attention(
 
     q_rot = _rotate(q, rope)
     k_rot = _rotate(k, rope)
-
     if q_rot.dtype != v.dtype:
         q_rot = q_rot.to(v.dtype)
     if k_rot.dtype != v.dtype:
@@ -275,13 +314,14 @@ def _attention(
 
     if iso_kv_spec is not None and attn_mask is None:
         if len(iso_kv_spec) == 4:
-            target_tokens, ref_token_lengths, _, collab_groups = iso_kv_spec  # type: ignore[misc]
+            target_tokens, ref_token_lengths, _, collab_groups = iso_kv_spec
         else:
-            target_tokens, ref_token_lengths, _ = iso_kv_spec  # type: ignore[misc]
+            target_tokens, ref_token_lengths, _ = iso_kv_spec
             collab_groups = tuple((i,) for i in range(len(ref_token_lengths)))
+
         total_ref = sum(ref_token_lengths)
         if total_ref > 0:
-            b_sz, total_seq, _, head_dim = q_rot.shape
+            b_sz, total_seq, _, _ = q_rot.shape
             text_start = target_tokens + total_ref
             text_len = total_seq - text_start
             if not v.is_contiguous():
@@ -291,11 +331,7 @@ def _attention(
             k_full = k_rot.transpose(1, 2)
             v_full = v.transpose(1, 2)
 
-            q_target = (
-                q_rot[:, :target_tokens, :, :]
-                .view(b_sz, target_tokens, heads, head_dim)
-                .transpose(1, 2)
-            )
+            q_target = _slice_blhd_to_bhld(q_rot, 0, target_tokens)
             eff_target_bias = (
                 target_attn_bias.to(dtype=q_target.dtype)
                 if (
@@ -311,11 +347,7 @@ def _attention(
             del out_target
 
             if text_len > 0:
-                q_text = (
-                    q_rot[:, text_start:, :, :]
-                    .view(b_sz, text_len, heads, head_dim)
-                    .transpose(1, 2)
-                )
+                q_text = _slice_blhd_to_bhld(q_rot, text_start, total_seq)
                 out_text = F.scaled_dot_product_attention(
                     q_text, k_full, v_full, attn_mask=None
                 )
@@ -330,33 +362,27 @@ def _attention(
 
             k_text_blhd = k_rot[:, text_start:, :, :]
             v_text_blhd = v[:, text_start:, :, :]
+            num_ref_spans = len(ref_spans)
 
             for r_idx, (c_start, c_end) in enumerate(ref_spans):
                 r_len = c_end - c_start
                 if r_len <= 0:
                     continue
-                q_ref = (
-                    q_rot[:, c_start:c_end, :, :]
-                    .view(b_sz, r_len, heads, head_dim)
-                    .transpose(1, 2)
-                )
+                q_ref = _slice_blhd_to_bhld(q_rot, c_start, c_end)
                 peers = (
                     collab_groups[r_idx]
                     if r_idx < len(collab_groups)
                     else (r_idx,)
                 )
-                if len(peers) == 1 and peers[0] == r_idx and c_end == text_start:
-                    rem_len = total_seq - c_start
-                    k_ref = (
-                        k_rot[:, c_start:, :, :]
-                        .view(b_sz, rem_len, heads, head_dim)
-                        .transpose(1, 2)
-                    )
-                    v_ref = (
-                        v[:, c_start:, :, :]
-                        .view(b_sz, rem_len, heads, head_dim)
-                        .transpose(1, 2)
-                    )
+                is_suffix_contiguous = (
+                    len(peers) > 0
+                    and peers[-1] == num_ref_spans - 1
+                    and len(peers) == (peers[-1] - peers[0] + 1)
+                )
+                if is_suffix_contiguous:
+                    span_start = ref_spans[peers[0]][0]
+                    k_ref = _slice_blhd_to_bhld(k_rot, span_start, total_seq)
+                    v_ref = _slice_blhd_to_bhld(v, span_start, total_seq)
                     out_ref = F.scaled_dot_product_attention(
                         q_ref, k_ref, v_ref, attn_mask=None
                     )
@@ -380,6 +406,7 @@ def _attention(
                         attn_mask=None,
                     )
                     del k_cat, v_cat, k_pieces, v_pieces
+
                 out_blhd[:, c_start:c_end, :, :].copy_(out_ref.transpose(1, 2))
                 del out_ref
 
@@ -387,7 +414,7 @@ def _attention(
             return out_blhd.flatten(2)
 
     if target_attn_bias is not None and attn_mask is None:
-        b_sz, total_seq, _, head_dim = q_rot.shape
+        _, total_seq, _, _ = q_rot.shape
         target_tokens = int(target_attn_bias.shape[2])
         if 0 < target_tokens < total_seq:
             if not v.is_contiguous():
@@ -396,11 +423,7 @@ def _attention(
             k_full = k_rot.transpose(1, 2)
             v_full = v.transpose(1, 2)
 
-            q_target = (
-                q_rot[:, :target_tokens, :, :]
-                .view(b_sz, target_tokens, heads, head_dim)
-                .transpose(1, 2)
-            )
+            q_target = _slice_blhd_to_bhld(q_rot, 0, target_tokens)
             eff_target_bias = (
                 target_attn_bias.to(dtype=q_target.dtype)
                 if target_attn_bias.dtype != q_target.dtype
@@ -412,12 +435,7 @@ def _attention(
             out_blhd[:, :target_tokens, :, :].copy_(out_target.transpose(1, 2))
             del out_target
 
-            rem_tokens = total_seq - target_tokens
-            q_rest = (
-                q_rot[:, target_tokens:, :, :]
-                .view(b_sz, rem_tokens, heads, head_dim)
-                .transpose(1, 2)
-            )
+            q_rest = _slice_blhd_to_bhld(q_rot, target_tokens, total_seq)
             out_rest = F.scaled_dot_product_attention(
                 q_rest, k_full, v_full, attn_mask=None
             )
@@ -466,6 +484,7 @@ def _apply_mod_inplace(
             shift_a, scale_a, _, shift_f, scale_f, _ = modulation.unbind(1)
         shift = shift_f if is_ffn else shift_a
         scale_p1 = 1 + (scale_f if is_ffn else scale_a)
+
     y.mul_(scale_p1).add_(shift)
 
 
@@ -492,6 +511,7 @@ def _apply_gate_residual_inplace(
         else:
             _, _, gate_a, _, _, gate_f = modulation.unbind(1)
         gate = gate_f if is_ffn else gate_a
+
     if gate.shape[1] == 1:
         return x.addcmul_(delta, gate.to(x.dtype))
     delta.mul_(gate)
@@ -594,7 +614,10 @@ class _Block(nn.Module):
         del q, k, v
         proj_o = _linear(self.proj["o"], attn_out)
         del attn_out
-        x = _apply_gate_residual_inplace(x.clone(), proj_o, modulation, is_ffn=False)
+
+        if x.is_inference() and not x.is_contiguous():
+            x = x.clone()
+        x = _apply_gate_residual_inplace(x, proj_o, modulation, is_ffn=False)
         del proj_o
 
         y = self.norm2(x)
@@ -614,8 +637,11 @@ class _Block(nn.Module):
             ffn_out = torch.empty_like(x)
             for start in range(0, seq_len, _FFN_TILE_TOKENS):
                 end = min(start + _FFN_TILE_TOKENS, seq_len)
+                y_tile = y[:, start:end, :]
+                if y.shape[0] > 1:
+                    y_tile = y_tile.contiguous()
                 hidden, gate = _linear(
-                    self.proj["ffn_up_gate"], y[:, start:end, :]
+                    self.proj["ffn_up_gate"], y_tile
                 ).chunk(2, -1)
                 act = _situ_inplace(hidden, gate)
                 del gate
@@ -692,25 +718,44 @@ class _RoPE(nn.Module):
         image[:, 3] -= cx
 
         coord_parts = [image]
+
         if ref_shapes:
-            norm_boxes = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
-            h_f = float(height)
-            w_f = float(width)
+            norm_boxes = _normalize_ref_bboxes(
+                ref_shapes, ref_bboxes, height=height, width=width
+            )
             for r_idx, ((rh, rw), r_box) in enumerate(
                 zip(ref_shapes, norm_boxes), start=1
             ):
                 if r_box is not None:
                     uy0, ux0, uy1, ux1 = r_box
-                    row_centers = (
-                        torch.arange(rh, device=device, dtype=torch.float32) + 0.5
-                    ) / float(max(1, rh))
-                    col_centers = (
-                        torch.arange(rw, device=device, dtype=torch.float32) + 0.5
-                    ) / float(max(1, rw))
-                    u_y = uy0 + row_centers * (uy1 - uy0)
-                    u_x = ux0 + col_centers * (ux1 - ux0)
-                    y_axis = (u_y - 0.5) * h_f
-                    x_axis = (u_x - 0.5) * w_f
+                    y0 = max(0, min(height - 1, int(round(uy0 * height))))
+                    x0 = max(0, min(width - 1, int(round(ux0 * width))))
+                    y1 = max(y0 + 1, min(height, int(round(uy1 * height))))
+                    x1 = max(x0 + 1, min(width, int(round(ux1 * width))))
+
+                    if rh == (y1 - y0) and rw == (x1 - x0):
+                        y_axis = (
+                            torch.arange(y0, y1, device=device, dtype=torch.float32)
+                            - cy
+                        )
+                        x_axis = (
+                            torch.arange(x0, x1, device=device, dtype=torch.float32)
+                            - cx
+                        )
+                    else:
+                        row_centers = (
+                            torch.arange(rh, device=device, dtype=torch.float32) + 0.5
+                        ) / float(max(1, rh))
+                        col_centers = (
+                            torch.arange(rw, device=device, dtype=torch.float32) + 0.5
+                        ) / float(max(1, rw))
+                        y_axis = (
+                            float(y0) + row_centers * float(y1 - y0)
+                        ) - 0.5 - cy
+                        x_axis = (
+                            float(x0) + col_centers * float(x1 - x0)
+                        ) - 0.5 - cx
+
                     gh, gw = torch.meshgrid(y_axis, x_axis, indexing="ij")
                     ref_coord = torch.stack(
                         (
@@ -760,7 +805,9 @@ class _RoPE(nn.Module):
         ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         ref_key = tuple(ref_shapes) if ref_shapes else ()
-        bbox_key = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+        bbox_key = _normalize_ref_bboxes(
+            ref_shapes, ref_bboxes, height=height, width=width
+        )
         cache_key = (height, width, text_length, ref_key, bbox_key, str(device), dtype)
         cached = self._expanded_cache.get(cache_key)
         if cached is not None:
@@ -772,15 +819,17 @@ class _RoPE(nn.Module):
         )
         sin_half = phase.sin().flatten(-2).to(dtype=dtype)
         cos_half = phase.cos().flatten(-2).to(dtype=dtype)
+
         sin_signed = (
             torch.cat((-sin_half, sin_half), dim=-1)[None, :, None, :].contiguous()
         )
         cos_full = torch.cat((cos_half, cos_half), dim=-1)[None, :, None, :].contiguous()
+
         total_img_tokens = sin_signed.shape[1] - text_length
         sin_text = sin_signed[:, total_img_tokens:, :, :]
         cos_text = cos_full[:, total_img_tokens:, :, :]
-        pair = ((sin_signed, cos_full), (sin_text, cos_text))
 
+        pair = ((sin_signed, cos_full), (sin_text, cos_text))
         self._expanded_cache[cache_key] = pair
         while len(self._expanded_cache) > 16:
             self._expanded_cache.popitem(last=False)
@@ -797,12 +846,15 @@ class _RoPE(nn.Module):
         ref_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> torch.Tensor:
         ref_key = tuple(ref_shapes) if ref_shapes else ()
-        bbox_key = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+        bbox_key = _normalize_ref_bboxes(
+            ref_shapes, ref_bboxes, height=height, width=width
+        )
         cache_key = (height, width, text_length, ref_key, bbox_key, str(device), dtype)
         cached = self._phase_cache.get(cache_key)
         if cached is not None:
             self._phase_cache.move_to_end(cache_key)
             return cached
+
         phase = self._compute_phase(
             height, width, text_length, device, ref_shapes, bbox_key
         )
@@ -846,7 +898,6 @@ class MOSSImageTransformer(nn.Module):
             raise ValueError(
                 "Require dim divisible by heads, head_dim divisible by 8, and even freq_dim."
             )
-
         self.config = MOSSImageConfig(
             dim=dim,
             ffn_dim=ffn_dim,
@@ -870,7 +921,6 @@ class MOSSImageTransformer(nn.Module):
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
-
         self._lora_backups: Dict[str, torch.Tensor] = {}
         self._active_lora_tag: Optional[str] = None
         self._isolated_mask_cache: OrderedDict[
@@ -975,6 +1025,7 @@ class MOSSImageTransformer(nn.Module):
             self.unfuse_lora()
         if abs(scale) < 1e-7:
             return 0
+
         param_dict = dict(self.named_parameters())
         down_keys = [
             k
@@ -982,6 +1033,7 @@ class MOSSImageTransformer(nn.Module):
             if k.endswith(".lora_A.weight") or k.endswith(".lora_down.weight")
         ]
         fused_count = 0
+
         for d_key in down_keys:
             if d_key.endswith(".lora_A.weight"):
                 prefix = d_key[: -len(".lora_A.weight")]
@@ -989,6 +1041,7 @@ class MOSSImageTransformer(nn.Module):
             else:
                 prefix = d_key[: -len(".lora_down.weight")]
                 u_key = prefix + ".lora_up.weight"
+
             if u_key not in lora_state:
                 continue
 
@@ -1012,6 +1065,7 @@ class MOSSImageTransformer(nn.Module):
 
             lora_a = lora_state[d_key].to(device=param.device, dtype=torch.float32)
             lora_b = lora_state[u_key].to(device=param.device, dtype=torch.float32)
+
             alpha_key = prefix + ".alpha"
             rank = float(lora_a.shape[0])
             alpha = (
@@ -1020,6 +1074,7 @@ class MOSSImageTransformer(nn.Module):
                 else rank
             )
             eff_scale = float(scale) * (alpha / max(rank, 1.0))
+
             delta = (lora_b @ lora_a) * eff_scale
             if delta.shape == param.shape:
                 if param.dtype in _FP8_DTYPES:
@@ -1031,6 +1086,7 @@ class MOSSImageTransformer(nn.Module):
                 else:
                     param.data.copy_((param.data.float() + delta).to(param.dtype))
                 fused_count += 1
+
         self._active_lora_tag = target_tag
         self._mod_zero_cache.clear()
         self.clear_transient_caches()
@@ -1108,7 +1164,7 @@ class MOSSImageTransformer(nn.Module):
             _resolve_compute_dtype(self.video_head_modulation.weight, w_dtype)
         )
         mod = _linear(self.shared_block_modulation, mod_in).view(batch, 6, -1)
-        head = _linear(self.video_head_modulation, head_in).view(batch, 2, -1)
+        head = _linear(self.video_head_modulation, head_in).view(batch, 2, -1).float()
 
         self._time_mod_cache[cache_key] = (timestep, mod, head)
         while len(self._time_mod_cache) > 4:
@@ -1235,21 +1291,27 @@ class MOSSImageTransformer(nn.Module):
         return r_emb
 
     def _acquire_mod_seq_buf(
-        self, num_regimes: int, device: torch.device, dtype: torch.dtype
+        self,
+        num_regimes: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        batch_size: int = 1,
     ) -> torch.Tensor:
         dim = self.config.dim
         alloc_regimes = max(2, int(num_regimes))
+        alloc_batch = max(1, int(batch_size))
         if (
             self._mod_seq_buf is None
             or self._mod_seq_buf.device != device
             or self._mod_seq_buf.dtype != dtype
+            or self._mod_seq_buf.shape[0] < alloc_batch
             or self._mod_seq_buf.shape[2] < alloc_regimes
             or self._mod_seq_buf.shape[3] != dim
         ):
             self._mod_seq_buf = torch.empty(
-                (1, 6, alloc_regimes, dim), device=device, dtype=dtype
+                (alloc_batch, 6, alloc_regimes, dim), device=device, dtype=dtype
             )
-        return self._mod_seq_buf[:, :, :alloc_regimes, :]
+        return self._mod_seq_buf[:alloc_batch, :, :alloc_regimes, :]
 
     @staticmethod
     def _build_isolated_reference_mask(
@@ -1272,6 +1334,7 @@ class MOSSImageTransformer(nn.Module):
         for r_len in ref_token_lengths:
             ref_spans.append((cursor, cursor + r_len))
             cursor += r_len
+
         for r_idx, (c_start, c_end) in enumerate(ref_spans):
             mask[:, :, c_start:c_end, c_start:c_end] = True
             mask[:, :, c_start:c_end, text_start:] = True
@@ -1350,12 +1413,19 @@ class MOSSImageTransformer(nn.Module):
             iso_val = iso_tuple[r_idx] if r_idx < len(iso_tuple) else 0.0
             if r_box is not None and iso_val > 1e-6 and r_len > 0:
                 uy0, ux0, uy1, ux1 = r_box
-                area = max(1e-4, min(1.0, (uy1 - uy0) * (ux1 - ux0)))
+                y0_int = max(0, min(height - 1, int(round(uy0 * height))))
+                x0_int = max(0, min(width - 1, int(round(ux0 * width))))
+                y1_int = max(y0_int + 1, min(height, int(round(uy1 * height))))
+                x1_int = max(x0_int + 1, min(width, int(round(ux1 * width))))
+                ly0 = float(y0_int)
+                ly1 = float(y1_int)
+                lx0 = float(x0_int)
+                lx1 = float(x1_int)
+                area = max(
+                    1e-4,
+                    min(1.0, ((ly1 - ly0) / height) * ((lx1 - lx0) / width)),
+                )
                 priority = math.exp(_HIERARCHICAL_AREA_GAMMA * (1.0 - area))
-                ly0 = uy0 * height
-                ly1 = uy1 * height
-                lx0 = ux0 * width
-                lx1 = ux1 * width
                 dy = torch.maximum(
                     torch.maximum(ly0 - yy, yy - ly1), torch.zeros_like(yy)
                 )
@@ -1420,10 +1490,13 @@ class MOSSImageTransformer(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
-        norm_boxes = _normalize_ref_bboxes(ref_shapes, ref_bboxes)
+        norm_boxes = _normalize_ref_bboxes(
+            ref_shapes, ref_bboxes, height=height, width=width
+        )
         iso_tuple = _normalize_box_isolation(norm_boxes, reference_box_isolation)
         if not any(v > 1e-6 for v in iso_tuple):
             return None
+
         key = (
             int(height),
             int(width),
@@ -1439,6 +1512,7 @@ class MOSSImageTransformer(nn.Module):
         if cached is not None:
             self._box_aperture_bias_cache.move_to_end(key)
             return cached
+
         bias = self._build_box_aperture_bias(
             height=height,
             width=width,
@@ -1471,6 +1545,7 @@ class MOSSImageTransformer(nn.Module):
         box_feather_radius: float = 1.25,
     ) -> Union[TransformerOutput, Tuple[torch.Tensor, ...]]:
         skip_set = validate_skip_layers(skip_layers, len(self.layers))
+
         if (
             hidden_states.ndim != 4
             or hidden_states.shape[1] != self.config.latent_channels
@@ -1482,8 +1557,8 @@ class MOSSImageTransformer(nn.Module):
             or encoder_hidden_states.shape[0] != batch
         ):
             raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
-
         mask = encoder_attention_mask
+
         mod, head = self._compute_time_modulation(
             timestep, batch, hidden_states.device
         )
@@ -1498,7 +1573,9 @@ class MOSSImageTransformer(nn.Module):
                 (int(r.shape[-2]), int(r.shape[-1])) for r in reference_latents
             ]
 
-        norm_boxes = _normalize_ref_bboxes(ref_shapes, reference_bboxes)
+        norm_boxes = _normalize_ref_bboxes(
+            ref_shapes, reference_bboxes, height=height, width=width
+        )
         pad_y = float(box_feather_radius) / float(max(1, height))
         pad_x = float(box_feather_radius) / float(max(1, width))
         collab_groups = _compute_collaborating_ref_groups(
@@ -1508,12 +1585,17 @@ class MOSSImageTransformer(nn.Module):
             pad_x=pad_x,
         )
 
-        outputs: List[torch.Tensor] = []
         target_tokens = height * width
         act_dtype = _resolve_compute_dtype(self.video_embedder.weight)
 
-        for index in range(batch):
-            video = hidden_states[index : index + 1].flatten(2).transpose(1, 2)
+        is_homogeneous = True
+        if batch > 1 and mask is not None:
+            valid_counts = mask.bool().sum(dim=-1)
+            if not bool((valid_counts == valid_counts[0]).all().item()):
+                is_homogeneous = False
+
+        if is_homogeneous:
+            video = hidden_states.flatten(2).transpose(1, 2)
             video = _linear(self.video_embedder, video.to(act_dtype).contiguous())
 
             seq_parts = [video]
@@ -1522,47 +1604,84 @@ class MOSSImageTransformer(nn.Module):
 
             if reference_latents:
                 for ref_lat in reference_latents:
-                    r_emb = self._get_or_compute_ref_projection(
-                        ref_lat, index, act_dtype, hidden_states.device
-                    )
+                    if batch == 1 or ref_lat.shape[0] == 1:
+                        r_emb_0 = self._get_or_compute_ref_projection(
+                            ref_lat, 0, act_dtype, hidden_states.device
+                        )
+                        r_emb = (
+                            r_emb_0.expand(batch, -1, -1) if batch > 1 else r_emb_0
+                        )
+                    else:
+                        r_embs = [
+                            self._get_or_compute_ref_projection(
+                                ref_lat, idx, act_dtype, hidden_states.device
+                            )
+                            for idx in range(batch)
+                        ]
+                        r_emb = torch.cat(r_embs, dim=0)
                     seq_parts.append(r_emb)
                     r_len = int(r_emb.shape[1])
                     ref_token_lengths.append(r_len)
                     total_img_tokens += r_len
 
-            text, full_rope_4d, text_len = self._get_or_compute_text_projection(
+            text_0, full_rope_4d, text_len = self._get_or_compute_text_projection(
                 encoder_hidden_states=encoder_hidden_states,
                 mask=mask,
-                index=index,
+                index=0,
                 act_dtype=video.dtype,
                 height=height,
                 width=width,
                 ref_shapes=ref_shapes,
                 ref_bboxes=reference_bboxes,
             )
+            if batch == 1:
+                text = text_0
+            else:
+                same_ctx = bool(
+                    (encoder_hidden_states[1:] == encoder_hidden_states[:1])
+                    .all()
+                    .item()
+                ) and (
+                    mask is None or bool((mask[1:] == mask[:1]).all().item())
+                )
+                if same_ctx:
+                    text = text_0.expand(batch, -1, -1)
+                else:
+                    text_list = [text_0]
+                    for idx in range(1, batch):
+                        t_i, _, _ = self._get_or_compute_text_projection(
+                            encoder_hidden_states=encoder_hidden_states,
+                            mask=mask,
+                            index=idx,
+                            act_dtype=video.dtype,
+                            height=height,
+                            width=width,
+                            ref_shapes=ref_shapes,
+                            ref_bboxes=reference_bboxes,
+                        )
+                        text_list.append(t_i)
+                    text = torch.cat(text_list, dim=0)
+
             seq_parts.append(text)
             x = torch.cat(seq_parts, 1)
             del seq_parts, video
 
-            mod_i = mod[index : index + 1]
             if mod_zero is not None and total_img_tokens > target_tokens:
                 mod_pair = self._acquire_mod_seq_buf(
-                    2, mod_i.device, mod_i.dtype
+                    2, mod.device, mod.dtype, batch_size=batch
                 )
-                mod_pair[:, :, 0, :].copy_(mod_i)
+                mod_pair[:, :, 0, :].copy_(mod)
                 mod_pair[:, 1, 0, :].add_(1.0)
                 mod_pair[:, 4, 0, :].add_(1.0)
-
-                mod_pair[:, :, 1, :].copy_(mod_zero)
+                mod_pair[:, :, 1, :].copy_(mod_zero.expand(batch, -1, -1))
                 mod_pair[:, 1, 1, :].add_(1.0)
                 mod_pair[:, 4, 1, :].add_(1.0)
-
-                mod_t_tuple: ModTuple6 = tuple(  # type: ignore[assignment]
+                mod_t_tuple: ModTuple6 = tuple(
                     mod_pair[:, :, 0:1, :].unbind(1)
-                )
-                mod_z_tuple: ModTuple6 = tuple(  # type: ignore[assignment]
+                )  # type: ignore[assignment]
+                mod_z_tuple: ModTuple6 = tuple(
                     mod_pair[:, :, 1:2, :].unbind(1)
-                )
+                )  # type: ignore[assignment]
                 active_mod: Union[ModTuple6, PiecewiseModSpec] = (
                     mod_t_tuple,
                     mod_z_tuple,
@@ -1571,7 +1690,7 @@ class MOSSImageTransformer(nn.Module):
                 )
             else:
                 shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
-                    mod_i[:, :, None, :].unbind(1)
+                    mod[:, :, None, :].unbind(1)
                 )
                 active_mod = (
                     shift_a,
@@ -1622,12 +1741,127 @@ class MOSSImageTransformer(nn.Module):
                         target_attn_bias=target_attn_bias,
                     )
 
-            x = self.final_norm_video(
-                x[:, :target_tokens].to(self.final_norm_video.weight.dtype)
+            x_target = x[:, :target_tokens]
+            if batch > 1:
+                x_target = x_target.contiguous()
+            x = self.final_norm_video(x_target.float())
+            x.mul_(1.0 + head[:, 1, None]).add_(head[:, 0, None])
+            x = _linear(self.final_linear_video, x.to(act_dtype))
+            sample = x.transpose(1, 2).reshape(batch, -1, height, width)
+            return TransformerOutput(sample=sample) if return_dict else (sample,)
+
+        outputs: List[torch.Tensor] = []
+        for index in range(batch):
+            video = hidden_states[index : index + 1].flatten(2).transpose(1, 2)
+            video = _linear(self.video_embedder, video.to(act_dtype).contiguous())
+
+            seq_parts = [video]
+            total_img_tokens = target_tokens
+            ref_token_lengths = []
+
+            if reference_latents:
+                for ref_lat in reference_latents:
+                    r_emb = self._get_or_compute_ref_projection(
+                        ref_lat, index, act_dtype, hidden_states.device
+                    )
+                    seq_parts.append(r_emb)
+                    r_len = int(r_emb.shape[1])
+                    ref_token_lengths.append(r_len)
+                    total_img_tokens += r_len
+
+            text, full_rope_4d, text_len = self._get_or_compute_text_projection(
+                encoder_hidden_states=encoder_hidden_states,
+                mask=mask,
+                index=index,
+                act_dtype=video.dtype,
+                height=height,
+                width=width,
+                ref_shapes=ref_shapes,
+                ref_bboxes=reference_bboxes,
             )
-            x = (
-                x * (1 + head[index : index + 1, 1, None])
-                + head[index : index + 1, 0, None]
+            seq_parts.append(text)
+            x = torch.cat(seq_parts, 1)
+            del seq_parts, video
+
+            mod_i = mod[index : index + 1]
+            if mod_zero is not None and total_img_tokens > target_tokens:
+                mod_pair = self._acquire_mod_seq_buf(
+                    2, mod_i.device, mod_i.dtype, batch_size=1
+                )
+                mod_pair[:, :, 0, :].copy_(mod_i)
+                mod_pair[:, 1, 0, :].add_(1.0)
+                mod_pair[:, 4, 0, :].add_(1.0)
+                mod_pair[:, :, 1, :].copy_(mod_zero)
+                mod_pair[:, 1, 1, :].add_(1.0)
+                mod_pair[:, 4, 1, :].add_(1.0)
+                mod_t_tuple = tuple(
+                    mod_pair[:, :, 0:1, :].unbind(1)
+                )  # type: ignore[assignment]
+                mod_z_tuple = tuple(
+                    mod_pair[:, :, 1:2, :].unbind(1)
+                )  # type: ignore[assignment]
+                active_mod = (
+                    mod_t_tuple,
+                    mod_z_tuple,
+                    target_tokens,
+                    total_img_tokens,
+                )
+            else:
+                shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
+                    mod_i[:, :, None, :].unbind(1)
+                )
+                active_mod = (
+                    shift_a,
+                    1 + scale_a,
+                    gate_a,
+                    shift_f,
+                    1 + scale_f,
+                    gate_f,
+                )
+
+            iso_kv_spec = None
+            if reference_latents and reference_isolated_kv and ref_token_lengths:
+                iso_kv_spec = (
+                    target_tokens,
+                    tuple(ref_token_lengths),
+                    text_len,
+                    collab_groups,
+                )
+
+            target_attn_bias = None
+            if (
+                reference_latents
+                and ref_token_lengths
+                and reference_bboxes is not None
+                and reference_box_isolation is not None
+            ):
+                target_attn_bias = self._get_box_aperture_bias(
+                    height=height,
+                    width=width,
+                    ref_token_lengths=ref_token_lengths,
+                    text_tokens=text_len,
+                    ref_shapes=ref_shapes,
+                    ref_bboxes=reference_bboxes,
+                    reference_box_isolation=reference_box_isolation,
+                    feather_radius_lat=box_feather_radius,
+                    device=hidden_states.device,
+                    dtype=x.dtype,
+                )
+
+            for layer_index, layer in enumerate(self.layers):
+                if layer_index not in skip_set:
+                    x = layer(
+                        x,
+                        full_rope_4d,
+                        active_mod,
+                        attn_mask=None,
+                        iso_kv_spec=iso_kv_spec,
+                        target_attn_bias=target_attn_bias,
+                    )
+
+            x = self.final_norm_video(x[:, :target_tokens].float())
+            x.mul_(1.0 + head[index : index + 1, 1, None]).add_(
+                head[index : index + 1, 0, None]
             )
             x = _linear(self.final_linear_video, x.to(act_dtype))
             outputs.append(x.transpose(1, 2).reshape(1, -1, height, width))
