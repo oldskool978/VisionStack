@@ -39,6 +39,7 @@ from engine import (
     build_box_aperture_mask,
     compose_latent_inpaint_mask,
     compute_moss_v2_sigmas,
+    couple_splat_velocity_prior,
     derive_stage_keys,
     load_sharded_safetensors_into,
     philox_randn,
@@ -80,6 +81,7 @@ from refinery import (
 )
 from schema import (
     BASELINE_ENGINE_DEFAULTS,
+    DEFAULT_BOX_REF_ISOLATION,
     GenerationRequest,
     SUPPORTED_MASK_BLEND_MODES,
     SUPPORTED_SOLVERS,
@@ -110,8 +112,8 @@ def gate_1_native_subsystems() -> None:
     )
     vt_dir = ROOT_DIR / "viztoken"
     vi_dir = ROOT_DIR / "vizinjector"
-    is_win = sys.platform == "win32"
 
+    is_win = sys.platform == "win32"
     vt_required = (
         ("viztoken.dll", "viztoken-cli.exe", "qwen35.ranks.bin", "viztoken.py")
         if is_win
@@ -225,6 +227,7 @@ def gate_1_native_subsystems() -> None:
         print(
             f"  [+] VizInjector Backend      : {viz.backend_name} (Vulkan Active: {viz.vulkan_active})"
         )
+
         req_me_default = VizInjectorRequest(edit_format="moss_image_edit")
         req_me_box = VizInjectorRequest(
             edit_format="moss_image_edit", framing_mode="inscribed"
@@ -264,6 +267,7 @@ def gate_1_native_subsystems() -> None:
             bundle.vit_patches is not None and bundle.llm_tokens == 144,
             f"Expected 144 LLM tokens for 384px ViT, got {bundle.llm_tokens}",
         )
+
         req_vit_only = VizInjectorRequest(
             target_width=1024,
             target_height=1024,
@@ -280,6 +284,7 @@ def gate_1_native_subsystems() -> None:
             and b_vit_only.meta.vit_size == (384, 384),
             f"ViT-only pass failed coupled grid geometry: vae={b_vit_only.meta.vae_size}, vit={b_vit_only.meta.vit_size}",
         )
+
         bundle.packed_latents = torch.randn((1, 128, 32, 32), dtype=torch.float32)
         bundle.vit_embeds = torch.randn((144, 4096), dtype=torch.bfloat16)
         bundle.meta.orig_size = (1024, 768)
@@ -356,7 +361,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             "Expected initial miss",
         )
         p_cache.insert(pos_tokens_1, h_pos1)
-
         stored_cpu = p_cache._cache[tuple(pos_tokens_1)]
         _assert(
             not stored_cpu.is_inference(),
@@ -454,7 +458,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
             hit_mm is not None and hit_mm.device.type == dev.type,
             "Multimodal prompt cache lookup failed",
         )
-
     print(
         f"  [+] PromptEmbedCache         : Pinned={stored_cpu.is_pinned() if has_gpu else 'CPU'} | FP32Recurrent=True | MultiCheckpointTrajectory={tuple(auto_cps)} tok"
     )
@@ -493,7 +496,6 @@ def gate_2_pinned_memory_and_cache_isolation() -> None:
                 viz_meta=None,
             )
             pinned_rec = r_cache.insert(key_v7, rec_in, vae_key=vae_key_v7)
-
         if has_gpu:
             _assert(
                 pinned_rec.packed_latents is not None
@@ -696,6 +698,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             bias_none is None,
             "Zero box_attn_isolation must return None without allocating a bias tensor",
         )
+
         bias_active = dit._get_box_aperture_bias(
             height=8,
             width=8,
@@ -841,6 +844,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             len(dit._box_aperture_bias_cache) >= 2,
             "Box aperture bias cache was not populated",
         )
+
         _assert(dit._mod_seq_buf is not None, "_mod_seq_buf was not allocated")
         buf_ptr_1 = dit._mod_seq_buf.data_ptr()
         _assert(
@@ -899,6 +903,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             len(dit._box_aperture_bias_cache) == 0,
             "clear_caches must flush _box_aperture_bias_cache",
         )
+
     print(
         f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap + FP32HeadMod + Lattice4DRoPE (0.0 err) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
     )
@@ -1136,7 +1141,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             spec_ids == greedy_ids and spec_hidden.shape[1] == prompt_seq.shape[1] + 6,
             f"ReAnchor speculative generation diverged from greedy decoding: {spec_ids} vs {greedy_ids}",
         )
-
     _assert(
         q_out.last_hidden_state.shape == (1, 8, 128),
         f"Unexpected Qwen3.5 output shape: {q_out.last_hidden_state.shape}",
@@ -1409,6 +1413,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     _assert(
         "bf16" in DTYPE_MAP and "fp16" in DTYPE_LOOKUP,
         "Refinery DTYPE_MAP/DTYPE_LOOKUP missing",
@@ -1439,6 +1444,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             q_fp16.dtype == torch.float16 and q_fp16.shape == w.shape,
             "TheRefinery FP16 quantization failed",
         )
+
         e4m3_dtype = DTYPE_LOOKUP.get("e4m3fn")
         if e4m3_dtype is not None:
             q_fp8 = refineTensor(
@@ -1546,8 +1552,16 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 and harness_def_req.late_solver == "ipndm"
                 and abs(harness_def_req.early_cfg - 3.2) < 1e-6
                 and abs(harness_def_req.late_cfg - 2.8) < 1e-6
-                and harness_def_req.uncond_skip_layers == [24],
+                and harness_def_req.uncond_skip_layers == [24]
+                and harness_def_req.layout_summary is None,
                 f"build_default_request() did not match V03 baseline: {harness_def_req}",
+            )
+            harness_def_req.prompt_mode = "layout_json"
+            harness_def_req.prompt = "A custom studio scene summary without shadowing"
+            _assert(
+                "A custom studio scene summary without shadowing"
+                in harness_def_req.compile_effective_prompt(),
+                "compile_effective_prompt() shadowed edited prompt in layout_json mode",
             )
 
             os.environ["SHADOWBOXER_DEFAULT_JSON"] = str(tmp_preset)
@@ -1746,38 +1760,58 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 "image_path": "box_hero.png",
                 "input_role": "photo_ref",
             },
+            {
+                "category": "object",
+                "caption": "Explicitly unisolated box reference",
+                "bbox": [600, 600, 960, 960],
+                "image_path": "box_uniso.png",
+                "input_role": "photo_ref",
+                "isolate_box_attn": 0.0,
+            },
         ],
     )
     mixed_specs, mixed_pic_map = req_mixed_roles.resolve_visual_references()
     _assert(
-        len(mixed_specs) == 3 and mixed_pic_map == {1: 1},
-        f"Expected Picture 1 strictly bound to box 1 (photo_ref), got map={mixed_pic_map}",
+        len(mixed_specs) == 4 and mixed_pic_map == {1: 1, 2: 2},
+        f"Expected Picture 1 & 2 strictly bound to photo_ref boxes, got map={mixed_pic_map}",
     )
     _assert(
         mixed_specs[0]["emits_vit"] is False
         and mixed_specs[0]["picture_index"] is None
         and mixed_specs[0]["dit_ref_index"] == 1
-        and mixed_specs[0]["framing_mode"] == "never_crop",
+        and mixed_specs[0]["framing_mode"] == "never_crop"
+        and abs(float(mixed_specs[0]["isolate_box_attn"]) - 0.0) < 1e-6,
         f"Global moss_image_edit ref spec mismatch: {mixed_specs[0]}",
     )
     _assert(
         mixed_specs[1]["emits_vit"] is False
         and mixed_specs[1]["picture_index"] is None
         and mixed_specs[1]["dit_ref_index"] == 2
-        and mixed_specs[1]["framing_mode"] == "inscribed",
+        and mixed_specs[1]["framing_mode"] == "inscribed"
+        and abs(float(mixed_specs[1]["isolate_box_attn"]) - DEFAULT_BOX_REF_ISOLATION)
+        < 1e-6,
         f"Box 0 depth_map ref spec mismatch: {mixed_specs[1]}",
     )
     _assert(
         mixed_specs[2]["emits_vit"] is True
         and mixed_specs[2]["picture_index"] == 1
         and mixed_specs[2]["dit_ref_index"] == 3
-        and mixed_specs[2]["framing_mode"] == "inscribed",
-        f"Box 1 photo_ref spec failed box-conformal framing or Picture 1 parity: {mixed_specs[2]}",
+        and mixed_specs[2]["framing_mode"] == "inscribed"
+        and abs(float(mixed_specs[2]["isolate_box_attn"]) - DEFAULT_BOX_REF_ISOLATION)
+        < 1e-6,
+        f"Box 1 photo_ref spec failed box-conformal framing, default isolation, or Picture 1 parity: {mixed_specs[2]}",
+    )
+    _assert(
+        mixed_specs[3]["emits_vit"] is True
+        and mixed_specs[3]["picture_index"] == 2
+        and mixed_specs[3]["dit_ref_index"] == 4
+        and abs(float(mixed_specs[3]["isolate_box_attn"]) - 0.0) < 1e-6,
+        f"Box 2 explicit isolate_box_attn=0.0 override was not respected: {mixed_specs[3]}",
     )
     compiled_mixed = req_mixed_roles.compile_effective_prompt()
     _assert(
         '"reference": "Picture 1"' in compiled_mixed
-        and '"reference": "Picture 2"' not in compiled_mixed
+        and '"reference": "Picture 2"' in compiled_mixed
         and '"reference": "Picture 3"' not in compiled_mixed,
         f"Mixed-role layout prompt desynchronized Picture index: {compiled_mixed}",
     )
@@ -1859,6 +1893,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             (boxed_w, boxed_h) == (512, 512),
             f"_resolve_boxed_reference_dims mismatch: {(boxed_w, boxed_h)}",
         )
+
         unpacked_ramp = (
             (torch.arange(16, device=dev, dtype=torch.float32) + 0.5)
             .view(1, 1, 1, 16)
@@ -1906,30 +1941,64 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         base_canvas = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
         box_lat_a = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
         box_lat_b = torch.full((1, 128, 16, 16), -1.5, device="cpu", dtype=torch.float32)
-        splat_canvas, splat_alpha = splat_box_latents_to_canvas(
+        splat_canvas, splat_alpha, splat_dn_map = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
-            splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.75)],
+            splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.60)],
             h_lat=32,
             w_lat=32,
             latent_channels=128,
             feather_radius_lat=2.0,
             device=dev,
+            default_denoise_strength=0.75,
+            return_denoise_map=True,
         )
         _assert(
             splat_canvas.shape == (1, 128, 32, 32)
-            and splat_alpha.shape == (1, 1, 32, 32),
+            and splat_alpha.shape == (1, 1, 32, 32)
+            and splat_dn_map.shape == (1, 1, 32, 32),
             "splat_box_latents_to_canvas output shape mismatch",
         )
         _assert(
             abs(float(splat_canvas[0, 0, 16, 16].item()) - 2.5) < 1e-5
             and float(splat_canvas[0, 0, 0, 0].item()) == 0.0
-            and 0.0 < float(splat_canvas[0, 0, 8, 16].item()) < 2.5,
-            "splat_box_latents_to_canvas failed interior/feather/exterior composite values",
+            and 0.0 < float(splat_canvas[0, 0, 8, 16].item()) < 2.5
+            and abs(float(splat_dn_map[0, 0, 16, 16].item()) - 0.60) < 1e-5,
+            "splat_box_latents_to_canvas failed interior/feather/exterior composite or denoise map values",
+        )
+        v_dit_zero = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
+        lat_high = torch.ones((1, 128, 32, 32), device=dev, dtype=torch.float32)
+        v_coupled_hi = couple_splat_velocity_prior(
+            v_dit=v_dit_zero,
+            latents=lat_high,
+            splat_canvas=splat_canvas,
+            splat_union_alpha=splat_alpha,
+            splat_denoise_map=splat_dn_map,
+            sigma_curr=0.90,
+        )
+        v_expected_splat = (1.0 - 2.5) / 0.90
+        v_interior_hi = float(v_coupled_hi[0, 0, 16, 16].item())
+        _assert(
+            float(v_coupled_hi[0, 0, 0, 0].abs().item()) == 0.0
+            and v_expected_splat < v_interior_hi < 0.0,
+            f"couple_splat_velocity_prior failed interior/exterior coupling at sigma=0.90: interior={v_interior_hi}",
+        )
+        v_dit_ones = torch.ones((1, 128, 32, 32), device=dev, dtype=torch.float32)
+        v_coupled_lo = couple_splat_velocity_prior(
+            v_dit=v_dit_ones,
+            latents=lat_high,
+            splat_canvas=splat_canvas,
+            splat_union_alpha=splat_alpha,
+            splat_denoise_map=splat_dn_map,
+            sigma_curr=0.20,
+        )
+        _assert(
+            float((v_coupled_lo - v_dit_ones).abs().max().item()) == 0.0,
+            "couple_splat_velocity_prior must hand off cleanly to v_dit below the denoise threshold",
         )
 
-        entry_1 = (box_lat_a, (0.125, 0.125, 0.625, 0.625), None, 0.75)
-        entry_2 = (box_lat_b, (0.375, 0.375, 0.875, 0.875), None, 0.75)
-        canvas_12, alpha_12 = splat_box_latents_to_canvas(
+        entry_1 = (box_lat_a, (0.125, 0.125, 0.625, 0.625), None, 0.65)
+        entry_2 = (box_lat_b, (0.375, 0.375, 0.875, 0.875), None, 0.85)
+        canvas_12, alpha_12, dn_12 = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[entry_1, entry_2],
             h_lat=32,
@@ -1937,8 +2006,9 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             latent_channels=128,
             feather_radius_lat=2.0,
             device=dev,
+            return_denoise_map=True,
         )
-        canvas_21, alpha_21 = splat_box_latents_to_canvas(
+        canvas_21, alpha_21, dn_21 = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[entry_2, entry_1],
             h_lat=32,
@@ -1946,10 +2016,12 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             latent_channels=128,
             feather_radius_lat=2.0,
             device=dev,
+            return_denoise_map=True,
         )
         _assert(
             float((canvas_12 - canvas_21).abs().max().item()) < 1e-6
-            and float((alpha_12 - alpha_21).abs().max().item()) < 1e-6,
+            and float((alpha_12 - alpha_21).abs().max().item()) < 1e-6
+            and float((dn_12 - dn_21).abs().max().item()) < 1e-6,
             "splat_box_latents_to_canvas violated commutative permutation invariance on overlapping boxes",
         )
 
@@ -1976,7 +2048,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        f"  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + SubPhaseResample (err={sub_err:.1e}) + ComposableMaskAlgebra + CommutativeSplat Verified"
+        f"  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + SubPhaseResample (err={sub_err:.1e}) + DefaultBoxIso ({DEFAULT_BOX_REF_ISOLATION}) + VelocitySplatPrior Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)
@@ -1995,13 +2067,11 @@ def main() -> None:
         "          SHADOWBOXER SOVEREIGN ENGINE CONVERGENCE & 5-GATE AUDIT SUITE"
     )
     print("=" * 92)
-
     gate_1_native_subsystems()
     gate_2_pinned_memory_and_cache_isolation()
     gate_3_models_zero_alloc_and_lora()
     gate_4_schedulers_and_prng()
     gate_5_refinery_schema_and_snapshots()
-
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 92)
     print(

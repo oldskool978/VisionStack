@@ -32,6 +32,7 @@ from .conditioning import (
     _resolve_unboxed_reference_dims,
     build_box_aperture_mask,
     compose_latent_inpaint_mask,
+    couple_splat_velocity_prior,
     load_image_tensor_16px,
     pack_vision_patches_32px,
     resample_packed_latents,
@@ -1371,6 +1372,7 @@ class MOSSImageEngine:
                     feather_radius_lat=float(request.mask_feather_radius or 1.25),
                     device=torch.device("cpu"),
                     only_flagged_boxes=only_flagged,
+                    include_paste_boxes=has_init,
                 )
 
         if has_init or bool(splat_entries):
@@ -1528,11 +1530,19 @@ class MOSSImageEngine:
 
         composite_used = False
         splat_union_alpha: Optional[torch.Tensor] = None
+        splat_denoise_map: Optional[torch.Tensor] = None
         eff_denoise_strength = float(request.denoise_strength)
 
         if splat_entries:
             composite_used = True
-            clean_init_latents, splat_union_alpha = splat_box_latents_to_canvas(
+            default_splat_dn = (
+                eff_denoise_strength if eff_denoise_strength < 0.999 else 0.75
+            )
+            (
+                clean_init_latents,
+                splat_union_alpha,
+                splat_denoise_map,
+            ) = splat_box_latents_to_canvas(
                 base_canvas=clean_init_latents,
                 splat_entries=splat_entries,
                 h_lat=h_lat,
@@ -1540,14 +1550,16 @@ class MOSSImageEngine:
                 latent_channels=self.transformer.config.latent_channels,
                 feather_radius_lat=float(request.mask_feather_radius or 1.25),
                 device=self.device,
+                default_denoise_strength=default_splat_dn,
+                return_denoise_map=True,
             )
             box_dns = [
                 float(e[3]) for e in splat_entries if e[3] is not None
             ]
-            if box_dns and eff_denoise_strength >= 0.999:
-                eff_denoise_strength = max(0.05, min(1.0, sum(box_dns) / len(box_dns)))
-            elif not has_init and eff_denoise_strength >= 0.999:
-                eff_denoise_strength = 0.78
+            if has_init and box_dns and eff_denoise_strength >= 0.999:
+                eff_denoise_strength = max(
+                    0.05, min(1.0, sum(box_dns) / len(box_dns))
+                )
         del splat_entries
 
         inpaint_mask_tensor: Optional[torch.Tensor] = None
@@ -1562,10 +1574,17 @@ class MOSSImageEngine:
                     mode="bilinear",
                     align_corners=False,
                 )
+            if not has_init and splat_union_alpha is not None:
+                bg_lock = (1.0 - inpaint_mask_tensor) * splat_union_alpha
+                inpaint_mask_tensor = (1.0 - bg_lock).clamp(0.0, 1.0)
         del inpaint_mask_cpu
 
         start_step = 0
-        if clean_init_latents is not None and 0.0 < eff_denoise_strength < 1.0:
+        if (
+            has_init
+            and clean_init_latents is not None
+            and 0.0 < eff_denoise_strength < 1.0
+        ):
             start_step = max(
                 0,
                 min(
@@ -1612,8 +1631,10 @@ class MOSSImageEngine:
                 device=self.device,
             )
 
-        if clean_init_latents is not None and (
-            start_step > 0 or inpaint_mask_tensor is not None
+        if (
+            has_init
+            and clean_init_latents is not None
+            and (start_step > 0 or inpaint_mask_tensor is not None)
         ):
             sigma_0 = float(active_scheduler.sigmas[0].item())
             noised_init = (1.0 - sigma_0) * clean_init_latents + sigma_0 * noise
@@ -1622,17 +1643,19 @@ class MOSSImageEngine:
                     inpaint_mask_tensor * noise
                     + (1.0 - inpaint_mask_tensor) * noised_init
                 )
-            elif not has_init and splat_union_alpha is not None:
-                latents = (
-                    splat_union_alpha * noised_init
-                    + (1.0 - splat_union_alpha) * noise
-                )
             else:
                 latents = noised_init
             del noised_init
         else:
             latents = noise
-        del splat_union_alpha
+
+        use_velocity_splat_prior = bool(
+            composite_used
+            and not has_init
+            and clean_init_latents is not None
+            and splat_union_alpha is not None
+            and splat_denoise_map is not None
+        )
 
         sde_gen = torch.Generator(device=self.device).manual_seed(k_sde & _MASK63)
         timesteps = active_scheduler.timesteps
@@ -1759,6 +1782,33 @@ class MOSSImageEngine:
                 total_nfe += 1
             del conditional
 
+            if (
+                use_velocity_splat_prior
+                and clean_init_latents is not None
+                and splat_union_alpha is not None
+                and splat_denoise_map is not None
+            ):
+                sigma_eval = float(timestep.item()) / float(
+                    active_scheduler.num_train_timesteps
+                )
+                prediction = couple_splat_velocity_prior(
+                    v_dit=prediction,
+                    latents=latents,
+                    splat_canvas=clean_init_latents,
+                    splat_union_alpha=splat_union_alpha,
+                    splat_denoise_map=splat_denoise_map,
+                    sigma_curr=sigma_eval,
+                )
+                if hist_prediction is not None:
+                    hist_prediction = couple_splat_velocity_prior(
+                        v_dit=hist_prediction,
+                        latents=latents,
+                        splat_canvas=clean_init_latents,
+                        splat_union_alpha=splat_union_alpha,
+                        splat_denoise_map=splat_denoise_map,
+                        sigma_curr=sigma_eval,
+                    )
+
             latents = active_scheduler.step(
                 prediction,
                 timestep,
@@ -1838,6 +1888,8 @@ class MOSSImageEngine:
             ref_bboxes_list,
             ref_box_iso_list,
             clean_init_latents,
+            splat_union_alpha,
+            splat_denoise_map,
             inpaint_mask_tensor,
             noise,
         )
@@ -1935,7 +1987,7 @@ class MOSSImageEngine:
             ),
             slg_scale_used=float(request.slg_scale or 0.0),
             eta_used=request.eta,
-            s_noise_used=request.s_noise,
+            s_noise_used=float(request.s_noise),
             enable_thinking_used=request.enable_thinking,
             viztoken_active=True,
             vizinjector_active=self.vizinjector_active,

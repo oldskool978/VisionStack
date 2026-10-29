@@ -79,6 +79,12 @@ def _graceful_exit(engine: Optional[MOSSImageEngine], code: int = 0) -> None:
 
 def build_default_request() -> GenerationRequest:
     d = get_active_engine_defaults()
+    raw_ls = d.get("layout_summary", None)
+    eff_ls = (
+        str(raw_ls).strip()
+        if (isinstance(raw_ls, str) and raw_ls.strip())
+        else None
+    )
     raw_kwargs: Dict[str, Any] = {
         "prompt": str(d.get("prompt", DEFAULT_POSITIVE_PROMPT)),
         "negative_prompt": str(d.get("negative_prompt", "")),
@@ -87,7 +93,7 @@ def build_default_request() -> GenerationRequest:
         "add_vision_id": bool(d.get("add_vision_id", True)),
         "model_variant": str(d.get("model_variant", "sft")),
         "prompt_mode": str(d.get("prompt_mode", "natural")),
-        "layout_summary": str(d.get("layout_summary", DEFAULT_LAYOUT_SUMMARY)),
+        "layout_summary": eff_ls,
         "layout_items": [dict(b) for b in d.get("layout_items", DEFAULT_LAYOUT_ITEMS)],
         "layout_coords_are_pixels": bool(d.get("layout_coords_are_pixels", True)),
         "preserve_canvas_outside_boxes": bool(
@@ -174,6 +180,7 @@ def load_or_create_initial_request(
             return req, f"ShadowBoxer/{target.name} (Active File)"
         except Exception as e:
             print(f"[!] Warning: Failed to parse {target}: {e}. Using baseline.")
+
     banner = (
         "ShadowBoxer/default.json (Active File)"
         if has_custom_default_preset()
@@ -393,6 +400,7 @@ def stage_test_input_files(
     p_init = dest_dir / "init_canvas.png"
     p_mask = dest_dir / "inpaint_mask.png"
     p_ctrl = dest_dir / "control_map.png"
+
     out_map = {
         "ref_a": p_ref_a,
         "ref_b": p_ref_b,
@@ -832,6 +840,7 @@ def interactive_loop(
 ) -> None:
     req = initial_req
     active_tag = banner_tag
+
     while True:
         render_menu(req, active_tag)
         try:

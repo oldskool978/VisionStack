@@ -4,9 +4,30 @@
   const DEFAULT_PROMPT_TEXT =
     'A wide view of a sleek brushed-steel refrigerator beside a warm walnut kitchen counter with a ceramic bowl of fresh citrus fruit. A small yellow sticky note on the refrigerator door is handwritten in crisp black marker: "Remember to test SFT & Base permutations @ 1024x1024"';
 
+  const DEFAULT_BOX_REF_ISOLATION = 0.65;
+
+  const CHARACTER_SYNONYMS = new Set([
+    "character",
+    "person",
+    "people",
+    "human",
+    "portrait",
+    "face",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "child",
+    "subject",
+    "figure",
+    "actor",
+    "model"
+  ]);
+
   const DEFAULT_LAYOUT_ITEMS = [
     {
-      category: "refrigerator",
+      label: "object",
+      category: "object",
       caption: "A sleek brushed-steel refrigerator door with a small yellow sticky note",
       bbox: [32, 48, 992, 592],
       enabled: true,
@@ -20,7 +41,9 @@
       denoise_strength: null
     },
     {
+      label: "text",
       category: "text",
+      caption: "Handwritten black marker text on a small yellow sticky note",
       text: "Remember to test SFT & Base permutations @ 1024x1024",
       bbox: [288, 144, 544, 480],
       enabled: true,
@@ -34,7 +57,8 @@
       denoise_strength: null
     },
     {
-      category: "bowl",
+      label: "object",
+      category: "object",
       caption: "A ceramic bowl of fresh citrus fruit on a warm walnut kitchen counter",
       bbox: [592, 608, 976, 976],
       enabled: true,
@@ -84,6 +108,44 @@
   };
 
   const el = (id) => document.getElementById(id);
+
+  function normalizeBoxLabel(rawLabel, hasText = false) {
+    if (hasText) return "text";
+    const s = String(rawLabel || "").trim().toLowerCase();
+    if (["text", "typography", "caption", "title", "sign", "label", "lettering"].includes(s)) {
+      return "text";
+    }
+    if (CHARACTER_SYNONYMS.has(s)) {
+      return "character";
+    }
+    return "object";
+  }
+
+  function isTypographyBox(item) {
+    if (!item || typeof item !== "object") return false;
+    const rawTxt = typeof item.text === "string" ? item.text.trim() : "";
+    return normalizeBoxLabel(item.label || item.category, Boolean(rawTxt)) === "text";
+  }
+
+  function resolveEffectiveBoxIsolation(item, height, width) {
+    if (!item || !item.image_path || !String(item.image_path).trim()) return 0.0;
+    if (item.isolate_box_attn !== null && item.isolate_box_attn !== undefined && String(item.isolate_box_attn).trim() !== "") {
+      return Math.max(0.0, Math.min(1.0, Number(item.isolate_box_attn)));
+    }
+    const globalIso = Math.max(0.0, Math.min(1.0, parseFloat(el("boxAttnIsolationInput").value) || 0.0));
+    if (globalIso > 1e-6) return globalIso;
+    if (Array.isArray(item.bbox) && item.bbox.length === 4) {
+      const hDenom = Math.max(1, height);
+      const wDenom = Math.max(1, width);
+      const uy0 = Math.max(0.0, Math.min(1.0, Math.min(item.bbox[0], item.bbox[2]) / hDenom));
+      const ux0 = Math.max(0.0, Math.min(1.0, Math.min(item.bbox[1], item.bbox[3]) / wDenom));
+      const uy1 = Math.max(uy0, Math.min(1.0, Math.max(item.bbox[0], item.bbox[2]) / hDenom));
+      const ux1 = Math.max(ux0, Math.min(1.0, Math.max(item.bbox[1], item.bbox[3]) / wDenom));
+      const area = (uy1 - uy0) * (ux1 - ux0);
+      return area < 0.98 ? DEFAULT_BOX_REF_ISOLATION : 0.0;
+    }
+    return DEFAULT_BOX_REF_ISOLATION;
+  }
 
   function parseIntList(raw) {
     if (!raw || typeof raw !== "string") return [];
@@ -139,6 +201,10 @@
       if (typeof b.z_order !== "number" || Number.isNaN(b.z_order)) {
         b.z_order = idx + 1;
       }
+      const hasTxt = typeof b.text === "string" && Boolean(b.text.trim());
+      const normLbl = normalizeBoxLabel(b.label || b.category, hasTxt);
+      if (!b.label) b.label = normLbl;
+      if (!b.category) b.category = normLbl;
     });
   }
 
@@ -150,13 +216,19 @@
   }
 
   function pixelToAbsCentralized(ymin, xmin, ymax, xmax, height, width) {
-    const cy = Math.floor(height / 2);
-    const cx = Math.floor(width / 2);
+    const hInt = Math.round(height);
+    const wInt = Math.round(width);
+    const cy = Math.floor(hInt / 2);
+    const cx = Math.floor(wInt / 2);
+    const maxY = hInt - cy;
+    const maxX = wInt - cx;
+    const effYmax = Math.round(ymax) === hInt - 1 ? hInt : ymax;
+    const effXmax = Math.round(xmax) === wInt - 1 ? wInt : xmax;
     return [
-      Math.round(ymin) - cy,
-      Math.round(xmin) - cx,
-      Math.round(ymax) - cy,
-      Math.round(xmax) - cx
+      Math.max(-cy, Math.min(maxY, Math.round(ymin - cy))),
+      Math.max(-cx, Math.min(maxX, Math.round(xmin - cx))),
+      Math.max(-cy, Math.min(maxY, Math.round(effYmax - cy))),
+      Math.max(-cx, Math.min(maxX, Math.round(effXmax - cx)))
     ];
   }
 
@@ -164,17 +236,24 @@
     const bbox = Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox : [0, 0, height, width];
     const hDenom = Math.max(1, height);
     const wDenom = Math.max(1, width);
-    const uy0 = Math.max(0.0, Math.min(1.0, Math.min(bbox[0], bbox[2]) / hDenom));
-    const ux0 = Math.max(0.0, Math.min(1.0, Math.min(bbox[1], bbox[3]) / wDenom));
-    const uy1 = Math.max(uy0, Math.min(1.0, Math.max(bbox[0], bbox[2]) / hDenom));
-    const ux1 = Math.max(ux0, Math.min(1.0, Math.max(bbox[1], bbox[3]) / wDenom));
+    const py0 = Math.max(0, Math.min(height - 1, Math.round(Math.min(bbox[0], bbox[2]))));
+    const px0 = Math.max(0, Math.min(width - 1, Math.round(Math.min(bbox[1], bbox[3]))));
+    const py1 = Math.max(py0 + 1, Math.min(height, Math.round(Math.max(bbox[0], bbox[2]))));
+    const px1 = Math.max(px0 + 1, Math.min(width, Math.round(Math.max(bbox[1], bbox[3]))));
+    const uy0 = Math.max(0.0, Math.min(1.0, py0 / hDenom));
+    const ux0 = Math.max(0.0, Math.min(1.0, px0 / wDenom));
+    const uy1 = Math.max(0.0, Math.min(1.0, py1 / hDenom));
+    const ux1 = Math.max(0.0, Math.min(1.0, px1 / wDenom));
     const area = Number(((uy1 - uy0) * (ux1 - ux0)).toFixed(6));
     const uyc = Number((0.5 * (uy0 + uy1)).toFixed(6));
     const uxc = Number((0.5 * (ux0 + ux1)).toFixed(6));
-    const cat = String(item.category || (item.text !== undefined ? "text" : "region")).trim();
-    const body = String(item.text !== undefined ? item.text : (item.caption || "")).trim();
-    const img = String(item.image_path || "").trim();
-    return [-area, uyc, uxc, Number(uy0.toFixed(6)), Number(ux0.toFixed(6)), cat, body, img];
+    const rawTxt = typeof item.text === "string" ? item.text.trim() : "";
+    const hasTxt = Boolean(rawTxt);
+    const lbl = normalizeBoxLabel(item.label || item.category, hasTxt);
+    const txtStr = hasTxt ? rawTxt : "";
+    const capStr = String(item.caption || item.description || "").trim();
+    const imgP = String(item.image_path || item.image || item.vizj_path || "").trim();
+    return [-area, uyc, uxc, Number(uy0.toFixed(6)), Number(ux0.toFixed(6)), lbl, txtStr, capStr, imgP];
   }
 
   function compareCanonicalKeys(ka, kb) {
@@ -299,6 +378,7 @@
         inpaintImg.hidden = true;
       }
     }
+
     if (compareBtn) {
       const hasMaster = Boolean(masterImg && !masterImg.hidden && masterImg.getAttribute("src"));
       compareBtn.hidden = !(hasMaster && url);
@@ -307,6 +387,7 @@
         compareBtn.classList.remove("active");
       }
     }
+
     if (viewportUnderlay && masterImg && compareSlider) {
       if (state.showCompareSplit && url && !masterImg.hidden) {
         viewportUnderlay.src = url;
@@ -332,9 +413,11 @@
   function reconcileSummaryQuotesJs(caption, activeTexts) {
     const cleanCap = (caption || "").trim();
     if (!cleanCap || !activeTexts || !activeTexts.length) return cleanCap;
+
     const quoteRegex = /"([^"\r\n]+)"/g;
     const matches = Array.from(cleanCap.matchAll(quoteRegex));
     if (!matches.length) return cleanCap;
+
     if (matches.length === activeTexts.length) {
       let out = "";
       let lastIdx = 0;
@@ -346,6 +429,7 @@
       out += cleanCap.slice(lastIdx);
       return out;
     }
+
     const defaultQuote = '"Remember to test SFT & Base permutations @ 1024x1024"';
     if (cleanCap.includes(defaultQuote)) {
       return cleanCap.replace(defaultQuote, `"${activeTexts[0]}"`);
@@ -360,7 +444,6 @@
     const width = parseInt(el("widthInput").value, 10) || 1024;
     const height = parseInt(el("heightInput").value, 10) || 1024;
     const canonicalIndices = getCanonicalEnabledBoxIndices(height, width);
-
     for (const inputId of ["promptInput", "layoutSummaryInput"]) {
       const field = el(inputId);
       if (!field || !field.value) continue;
@@ -369,8 +452,8 @@
       } else {
         const activeTexts = canonicalIndices
           .map((idx) => state.layoutItems[idx])
-          .filter((b) => (b.category === "text" || b.text !== undefined) && String(b.text || "").trim())
-          .map((b) => String(b.text).trim());
+          .filter((b) => isTypographyBox(b) && String(b.text || b.caption || "").trim())
+          .map((b) => String(b.text || b.caption).trim());
         field.value = reconcileSummaryQuotesJs(field.value, activeTexts);
       }
     }
@@ -564,6 +647,7 @@
       el("quotaBadge").textContent = data.user.is_admin
         ? "Quota: UNLIMITED"
         : `Quota: ${data.user.tokens_remaining}/${data.user.daily_quota}`;
+
       el("saveDefaultPresetBtn").hidden = !data.user.is_admin;
 
       if (data.theme && data.theme.theme_id) {
@@ -576,6 +660,7 @@
       if (data.engine_defaults && Object.keys(state.engineDefaults).length === 0) {
         applyEngineDefaultsToDeck(data.engine_defaults);
       }
+
       if (Array.isArray(data.default_layout_items) && data.default_layout_items.length > 0 && state.layoutItems.length === 0) {
         state.layoutItems = JSON.parse(JSON.stringify(data.default_layout_items));
         ensureBoxZOrders();
@@ -627,7 +712,7 @@
     }
 
     if (!activeSources.length) {
-      return hasSplatBoxes && !hasInit ? "Commutative Box Splatting (Soft Feather)" : "Img2Img Full-Canvas Denoise";
+      return hasSplatBoxes && !hasInit ? "Tweedie Velocity-Space Box Splat Prior" : "Img2Img Full-Canvas Denoise";
     }
 
     const opStr = activeSources.length > 1 ? ` [${blendMode.toUpperCase()}]` : "";
@@ -673,10 +758,12 @@
     const container = el("referenceList");
     const badge = el("assetCountBadge");
     if (badge) badge.textContent = String(state.references.length);
+
     if (!state.references.length) {
       container.innerHTML = `<div class="muted-note">No reference assets staged in your user vault.</div>`;
       return;
     }
+
     container.innerHTML = "";
     for (const ref of state.references) {
       const card = document.createElement("div");
@@ -764,10 +851,12 @@
     const badge = el("projectCountBadge");
     if (badge) badge.textContent = String(state.projects.length);
     if (!container) return;
+
     if (!state.projects.length) {
       container.innerHTML = `<div class="muted-note">Save a project to bundle your layout boxes, prompt, mask canvas, and reference assets.</div>`;
       return;
     }
+
     container.innerHTML = "";
     for (const proj of state.projects) {
       const card = document.createElement("div");
@@ -1162,7 +1251,8 @@
       guide.style.left = `${Math.round(xmin * geom.scaleX)}px`;
       guide.style.width = `${Math.max(12, Math.round((xmax - xmin) * geom.scaleX))}px`;
       guide.style.height = `${Math.max(12, Math.round((ymax - ymin) * geom.scaleY))}px`;
-      guide.textContent = `#${idx + 1} ${item.category || "box"}`;
+      const normLbl = normalizeBoxLabel(item.label || item.category, isTypographyBox(item));
+      guide.textContent = `#${idx + 1} ${normLbl}`;
       overlay.appendChild(guide);
     });
   }
@@ -1172,14 +1262,17 @@
     if (!hud) return;
     hud.hidden = !state.showViewportHud;
     if (!state.showViewportHud) return;
+
     const canvasW = Math.max(256, parseInt(el("widthInput").value, 10) || 1024);
     const canvasH = Math.max(256, parseInt(el("heightInput").value, 10) || 1024);
     const { boxPicMap } = computeBoxPictureBindings();
     hud.innerHTML = "";
+
     state.layoutItems.forEach((item, idx) => {
       if (item.enabled === false || !Array.isArray(item.bbox) || item.bbox.length !== 4) return;
       const [ymin, xmin, ymax, xmax] = item.bbox;
-      const isText = item.category === "text" || item.text !== undefined;
+      const isText = isTypographyBox(item);
+      const normLbl = normalizeBoxLabel(item.label || item.category, isText);
       const boxDiv = document.createElement("div");
       boxDiv.className = `viewport-hud-box ${isText ? "text-hud" : ""}`;
       boxDiv.style.top = `${((ymin / canvasH) * 100).toFixed(2)}%`;
@@ -1187,7 +1280,7 @@
       boxDiv.style.width = `${(((xmax - xmin) / canvasW) * 100).toFixed(2)}%`;
       boxDiv.style.height = `${(((ymax - ymin) / canvasH) * 100).toFixed(2)}%`;
       const picTag = boxPicMap[idx] ? ` [Pic ${boxPicMap[idx]}]` : "";
-      const label = isText ? `T: "${item.text || ""}"` : `${item.category || "region"}${picTag}`;
+      const label = isText ? `T: "${item.text || item.caption || ""}"` : `${normLbl}${picTag}`;
       boxDiv.textContent = `#${idx + 1} ${label}`;
       hud.appendChild(boxDiv);
     });
@@ -1243,30 +1336,48 @@
     for (const idx of canonicalIndices) {
       const b = state.layoutItems[idx];
       if (!b || b.enabled === false) continue;
-      const entry = { category: b.category || (b.text !== undefined ? "text" : "region") };
-      if (b.text !== undefined && String(b.text).trim() !== "") {
-        entry.text = b.text;
-        if (entry.category === "text") {
-          activeTexts.push(String(b.text).trim());
+      const rawTxt = typeof b.text === "string" ? b.text.trim() : "";
+      const labelVal = normalizeBoxLabel(b.label || b.category, Boolean(rawTxt));
+      const rawCap = b.caption || b.description;
+      let txtVal = rawTxt;
+      let capVal = typeof rawCap === "string" ? rawCap.trim() : "";
+
+      if (labelVal === "text") {
+        if (txtVal) {
+          activeTexts.push(txtVal);
+        } else if (capVal) {
+          txtVal = capVal;
+          activeTexts.push(txtVal);
         }
-      } else if (b.caption !== undefined && String(b.caption).trim() !== "") {
-        entry.caption = b.caption;
+        if (!capVal && txtVal) {
+          capVal = `Crisp legible text reading "${txtVal}"`;
+        }
+      } else if (!capVal) {
+        capVal = labelVal === "character" ? "Character subject" : "Scene object";
+      }
+
+      const entry = { label: labelVal };
+      if (Array.isArray(b.bbox) && b.bbox.length === 4) {
+        entry.bbox = pixelToAbsCentralized(b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], height, width);
       }
       if (boxPicMap[idx]) {
         entry.reference = `Picture ${boxPicMap[idx]}`;
       }
-      if (Array.isArray(b.bbox) && b.bbox.length === 4) {
-        entry.bbox = pixelToAbsCentralized(b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], height, width);
+      if (capVal) {
+        entry.caption = capVal;
+      }
+      if (labelVal === "text" && txtVal) {
+        entry.text = txtVal;
       }
       items.push(entry);
     }
 
     const reconciledCaption = reconcileSummaryQuotesJs(rawCaption, activeTexts);
     const payload = {
-      bbox_format: "yxyx",
-      bbox_coord_space: "abs_centralized",
       summary: { caption: reconciledCaption },
-      items
+      items,
+      bbox_coord_space: "abs_centralized",
+      bbox_format: "yxyx"
     };
     el("compiledJsonPreview").textContent = JSON.stringify(payload, null, 2);
 
@@ -1274,10 +1385,12 @@
     if (modeBadge) {
       const promptMode = el("promptModeSelect").value;
       const hasBoxRefs = Object.keys(boxDitMap).length > 0;
+      modeBadge.style.cursor = "pointer";
+      modeBadge.title = "Click to toggle Prompt Mode between Spatial Layout JSON and Natural Language";
       if (promptMode === "layout_json" || hasBoxRefs) {
         modeBadge.textContent = hasBoxRefs ? "LAYOUT JSON + 4D-RoPE ACTIVE" : "LAYOUT JSON ACTIVE";
       } else {
-        modeBadge.textContent = "NATURAL MODE (JSON INACTIVE)";
+        modeBadge.textContent = "NATURAL MODE (CLICK TO ACTIVATE JSON)";
       }
     }
     renderBindingsCard();
@@ -1347,13 +1460,13 @@
     const geom = computeStageGeometry("spatialStageContainer");
     syncStageAspectAndGuides();
     syncUnderlayLayers();
+
     const boxesLayer = el("spatialBoxesLayer");
     const listContainer = el("boxListContainer");
     if (!boxesLayer || !listContainer) return;
 
     const { boxPicMap, boxDitMap } = computeBoxPictureBindings();
     const globalFraming = el("framingModeSelect").value || "inscribed";
-    const globalIso = parseFloat(el("boxAttnIsolationInput").value) || 0.0;
     const globalSplat = Boolean(el("compositeBoxImagesCheck").checked);
 
     boxesLayer.innerHTML = "";
@@ -1362,11 +1475,13 @@
     state.layoutItems.forEach((item, idx) => {
       const isEnabled = item.enabled !== false;
       const [ymin, xmin, ymax, xmax] = item.bbox;
-      const isText = item.category === "text" || item.text !== undefined;
+      const isText = isTypographyBox(item);
+      const normLbl = normalizeBoxLabel(item.label || item.category, isText);
       const hasBoundRef = Boolean(item.image_path && String(item.image_path).trim());
       const refMeta = hasBoundRef ? findRefMeta(item.image_path) : null;
       const effFraming = item.framing_mode || (globalFraming === "never_crop" ? "inscribed" : globalFraming);
-      const effIso = item.isolate_box_attn !== null && item.isolate_box_attn !== undefined ? item.isolate_box_attn : (hasBoundRef ? globalIso : 0.0);
+      const effIso = resolveEffectiveBoxIsolation(item, geom.canvasH, geom.canvasW);
+      const hasExplicitIso = item.isolate_box_attn !== null && item.isolate_box_attn !== undefined && String(item.isolate_box_attn).trim() !== "";
       const effSplat = item.paste_to_canvas !== null && item.paste_to_canvas !== undefined ? Boolean(item.paste_to_canvas) : (hasBoundRef && globalSplat);
       const isSelected = idx === state.selectedBoxIndex;
       const baseZ = typeof item.z_order === "number" ? item.z_order : idx + 1;
@@ -1378,8 +1493,8 @@
         boxEl.style.zIndex = String(isSelected ? 100 + baseZ : baseZ);
         boxEl.style.top = `${Math.round(ymin * geom.scaleY)}px`;
         boxEl.style.left = `${Math.round(xmin * geom.scaleX)}px`;
-        boxEl.style.width = `${Math.max(20, Math.round((xmax - xmin) * geom.scaleX))}px`;
-        boxEl.style.height = `${Math.max(20, Math.round((ymax - ymin) * geom.scaleY))}px`;
+        boxEl.style.width = `${Math.max(12, Math.round((xmax - xmin) * geom.scaleX))}px`;
+        boxEl.style.height = `${Math.max(12, Math.round((ymax - ymin) * geom.scaleY))}px`;
 
         const thumbHtml = refMeta && !refMeta.is_vizj
           ? `<div class="spatial-box-thumb-clip"><img class="spatial-box-thumb" src="${refMeta.url}" alt="" style="object-fit: ${framingModeToCssObjectFit(effFraming)};" /></div>`
@@ -1392,7 +1507,7 @@
           badges.push(`<span class="box-mini-pill">4D#${boxDitMap[idx]} (${item.input_role || el("inputRoleSelect").value})</span>`);
         }
         if (hasBoundRef && effIso > 0) {
-          badges.push(`<span class="box-mini-pill">Iso ${Number(effIso).toFixed(2)}</span>`);
+          badges.push(`<span class="box-mini-pill">Iso ${Number(effIso).toFixed(2)}${hasExplicitIso ? "" : "*"}</span>`);
         }
         if (hasBoundRef && effSplat) {
           badges.push(`<span class="box-mini-pill">Splat</span>`);
@@ -1405,7 +1520,7 @@
           .map((dir) => `<div class="spatial-box-handle" data-handle="${dir}" data-box-idx="${idx}"></div>`)
           .join("");
 
-        const labelText = isText ? `T: "${item.text || ""}"` : `${item.category}: ${item.caption || ""}`;
+        const labelText = isText ? `T: "${item.text || item.caption || ""}"` : `${normLbl}: ${item.caption || ""}`;
         boxEl.innerHTML = `
           ${thumbHtml}
           <div class="spatial-box-tag">[#${idx + 1}] ${labelText}</div>
@@ -1436,13 +1551,14 @@
           const [origY0, origX0, origY1, origX1] = item.bbox;
           const boxW = origX1 - origX0;
           const boxH = origY1 - origY0;
+          let didMove = false;
 
           function updateDomAndReadouts() {
             const [cy0, cx0, cy1, cx1] = item.bbox;
             boxEl.style.top = `${Math.round(cy0 * geom.scaleY)}px`;
             boxEl.style.left = `${Math.round(cx0 * geom.scaleX)}px`;
-            boxEl.style.width = `${Math.max(20, Math.round((cx1 - cx0) * geom.scaleX))}px`;
-            boxEl.style.height = `${Math.max(20, Math.round((cy1 - cy0) * geom.scaleY))}px`;
+            boxEl.style.width = `${Math.max(12, Math.round((cx1 - cx0) * geom.scaleX))}px`;
+            boxEl.style.height = `${Math.max(12, Math.round((cy1 - cy0) * geom.scaleY))}px`;
             const hdr = listContainer.querySelector(`[data-box-coord-hdr="${idx}"]`);
             if (hdr) {
               const cc = pixelToAbsCentralized(cy0, cx0, cy1, cx1, geom.canvasH, geom.canvasW);
@@ -1455,7 +1571,11 @@
           function onMove(moveEv) {
             const dx = (moveEv.clientX - startX) / geom.scaleX;
             const dy = (moveEv.clientY - startY) / geom.scaleY;
+            if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+              didMove = true;
+            }
             const freeMotion = moveEv.altKey;
+            const minSpan = freeMotion ? 4 : 16;
 
             if (!handleDir) {
               const nx0 = snapCoord(Math.max(0, Math.min(geom.canvasW - boxW, origX0 + dx)), geom.canvasW - boxW, freeMotion);
@@ -1467,16 +1587,16 @@
               let ny1 = origY1;
               let nx1 = origX1;
               if (handleDir.includes("n")) {
-                ny0 = Math.min(ny1 - 32, snapCoord(origY0 + dy, geom.canvasH - 32, freeMotion));
+                ny0 = Math.min(ny1 - minSpan, snapCoord(origY0 + dy, geom.canvasH - minSpan, freeMotion));
               }
               if (handleDir.includes("s")) {
-                ny1 = Math.max(ny0 + 32, snapCoord(origY1 + dy, geom.canvasH, freeMotion));
+                ny1 = Math.max(ny0 + minSpan, snapCoord(origY1 + dy, geom.canvasH, freeMotion));
               }
               if (handleDir.includes("w")) {
-                nx0 = Math.min(nx1 - 32, snapCoord(origX0 + dx, geom.canvasW - 32, freeMotion));
+                nx0 = Math.min(nx1 - minSpan, snapCoord(origX0 + dx, geom.canvasW - minSpan, freeMotion));
               }
               if (handleDir.includes("e")) {
-                nx1 = Math.max(nx0 + 32, snapCoord(origX1 + dx, geom.canvasW, freeMotion));
+                nx1 = Math.max(nx0 + minSpan, snapCoord(origX1 + dx, geom.canvasW, freeMotion));
               }
               item.bbox = [ny0, nx0, ny1, nx1];
             }
@@ -1486,6 +1606,10 @@
           function onUp() {
             window.removeEventListener("mousemove", onMove);
             window.removeEventListener("mouseup", onUp);
+            if (didMove && el("promptModeSelect").value === "natural") {
+              el("promptModeSelect").value = "layout_json";
+              updateCompiledJsonPreview();
+            }
           }
 
           window.addEventListener("mousemove", onMove);
@@ -1508,7 +1632,9 @@
       const curFraming = item.framing_mode || "";
       const isoVal = item.isolate_box_attn !== null && item.isolate_box_attn !== undefined ? item.isolate_box_attn : "";
       const dnVal = item.denoise_strength !== null && item.denoise_strength !== undefined ? item.denoise_strength : "";
+      const isoPlaceholder = hasBoundRef ? `Attn Iso (Auto: ${effIso.toFixed(2)})` : "Attn Iso (Auto: 0.65)";
       const cCoords = pixelToAbsCentralized(ymin, xmin, ymax, xmax, geom.canvasH, geom.canvasW);
+      const displayCategory = item.category || item.label || normLbl;
 
       const card = document.createElement("div");
       card.className = `box-card ${!isEnabled ? "disabled-card" : ""} ${isSelected ? "selected-card" : ""}`;
@@ -1520,17 +1646,17 @@
             <strong data-box-coord-hdr="${idx}">#${idx + 1} [${cCoords.join(", ")}]</strong>
           </label>
           <div class="box-z-controls">
-            <span class="tiny-muted" title="UI Stack Layer">Z:${baseZ}</span>
+            <span class="tiny-muted" title="Canonical Qwen3.5 Label">${normLbl.toUpperCase()} | Z:${baseZ}</span>
             <button type="button" class="z-btn" data-z-up="${idx}" title="Bring box forward in UI pointer stack">&uarr;</button>
             <button type="button" class="z-btn" data-z-down="${idx}" title="Send box backward in UI pointer stack">&darr;</button>
             <button type="button" class="btn-link" data-remove-box="${idx}">Remove</button>
           </div>
         </div>
         <div class="field-row two-col">
-          <input type="text" class="input-text" data-box-cat="${idx}" value="${item.category || ""}" placeholder="Category" />
+          <input type="text" class="input-text" data-box-cat="${idx}" value="${displayCategory}" placeholder="Label (object / character / text)" title="Semantic role: object, character/person, or text" />
           <select class="input-select" data-box-img="${idx}" title="Bind Reference Asset to Box 4D-RoPE">${refOptions}</select>
         </div>
-        <input type="text" class="input-text" data-box-desc="${idx}" value="${(isText ? item.text : item.caption) || ""}" placeholder="${isText ? "Exact typography text" : "Region description"}" />
+        <input type="text" class="input-text" data-box-desc="${idx}" value="${(isText ? (item.text || item.caption) : item.caption) || ""}" placeholder="${isText ? "Exact typography text" : "Region description"}" />
         <div class="field-row two-col">
           <select class="input-select" data-box-role="${idx}" title="Per-Box Input Role Override">
             <option value="" ${curRole === "" ? "selected" : ""}>Role: Inherit Global</option>
@@ -1549,15 +1675,15 @@
           </select>
         </div>
         <div class="field-row two-col">
-          <input type="number" class="input-text" data-box-iso="${idx}" value="${isoVal}" min="0.0" max="1.0" step="0.05" placeholder="Attn Iso (Inherit)" title="Per-box 2D cosine log-aperture attention isolation [0.0 - 1.0]" />
-          <input type="number" class="input-text" data-box-dn="${idx}" value="${dnVal}" min="0.05" max="1.0" step="0.05" placeholder="Denoise (Inherit)" title="Per-box latent splat denoise strength [0.05 - 1.0]" />
+          <input type="number" class="input-text" data-box-iso="${idx}" value="${isoVal}" min="0.0" max="1.0" step="0.05" placeholder="${isoPlaceholder}" title="Per-box 2D cosine log-aperture attention isolation [0.0 - 1.0] (Blank = Auto 0.65, 0 = Full-Canvas Bleed)" />
+          <input type="number" class="input-text" data-box-dn="${idx}" value="${dnVal}" min="0.05" max="1.0" step="0.05" placeholder="Denoise (Auto: 0.75)" title="Per-box Tweedie velocity-space splat denoise handoff [0.05 - 1.0]" />
         </div>
         <div class="box-flags-row">
           <label class="checkbox-inline" title="Restrict canvas inpainting to this box aperture">
             <input type="checkbox" data-box-inpaint="${idx}" ${item.inpaint_box ? "checked" : ""} />
             <span>Inpaint Box Only</span>
           </label>
-          <label class="checkbox-inline" title="Commutatively splat this box's reference latents onto the initial canvas">
+          <label class="checkbox-inline" title="Lend this box's reference latents to the canvas via Tweedie velocity-space prior coupling">
             <input type="checkbox" data-box-paste="${idx}" ${item.paste_to_canvas ? "checked" : ""} />
             <span>Splat to Canvas</span>
           </label>
@@ -1582,12 +1708,14 @@
         shiftBoxZOrder(parseInt(btn.getAttribute("data-z-up"), 10), 1);
       });
     });
+
     listContainer.querySelectorAll("[data-z-down]").forEach((btn) => {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         shiftBoxZOrder(parseInt(btn.getAttribute("data-z-down"), 10), -1);
       });
     });
+
     listContainer.querySelectorAll("[data-box-enabled]").forEach((chk) => {
       chk.addEventListener("change", () => {
         const i = parseInt(chk.getAttribute("data-box-enabled"), 10);
@@ -1595,6 +1723,7 @@
         renderSpatialLayoutEditor();
       });
     });
+
     listContainer.querySelectorAll("[data-remove-box]").forEach((btn) => {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -1604,40 +1733,65 @@
         renderSpatialLayoutEditor();
       });
     });
+
     listContainer.querySelectorAll("[data-box-cat]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-cat"), 10);
-        state.layoutItems[i].category = inp.value;
+        const target = state.layoutItems[i];
+        target.category = inp.value;
+        const norm = normalizeBoxLabel(inp.value, false);
+        target.label = norm;
+        if (norm === "text" && target.text === undefined) {
+          target.text = target.caption || "";
+        } else if (norm !== "text" && target.text !== undefined) {
+          if (!target.caption) target.caption = target.text;
+          delete target.text;
+        }
+        if (el("promptModeSelect").value === "natural") {
+          el("promptModeSelect").value = "layout_json";
+        }
         updateCompiledJsonPreview();
       });
     });
+
     listContainer.querySelectorAll("[data-box-desc]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-desc"), 10);
         const target = state.layoutItems[i];
-        if (target.category === "text" || target.text !== undefined) {
+        const isT = isTypographyBox(target);
+        if (isT) {
           const prevText = target.text || "";
           target.text = inp.value;
+          target.label = "text";
           delete target.caption;
           syncTextEditToPrompt(prevText, inp.value);
         } else {
           target.caption = inp.value;
+          target.label = normalizeBoxLabel(target.label || target.category, false);
+        }
+        if (el("promptModeSelect").value === "natural") {
+          el("promptModeSelect").value = "layout_json";
         }
         const stageBox = boxesLayer.querySelector(`.spatial-box[data-box-idx="${i}"] .spatial-box-tag`);
         if (stageBox) {
-          const isT = target.category === "text" || target.text !== undefined;
-          stageBox.textContent = `[#${i + 1}] ${isT ? `T: "${target.text || ""}"` : `${target.category}: ${target.caption || ""}`}`;
+          const normL = normalizeBoxLabel(target.label || target.category, isT);
+          stageBox.textContent = `[#${i + 1}] ${isT ? `T: "${target.text || ""}"` : `${normL}: ${target.caption || ""}`}`;
         }
         updateCompiledJsonPreview();
       });
     });
+
     listContainer.querySelectorAll("[data-box-img]").forEach((sel) => {
       sel.addEventListener("change", () => {
         const i = parseInt(sel.getAttribute("data-box-img"), 10);
         state.layoutItems[i].image_path = sel.value;
+        if (sel.value && el("promptModeSelect").value === "natural") {
+          el("promptModeSelect").value = "layout_json";
+        }
         renderSpatialLayoutEditor();
       });
     });
+
     listContainer.querySelectorAll("[data-box-role]").forEach((sel) => {
       sel.addEventListener("change", () => {
         const i = parseInt(sel.getAttribute("data-box-role"), 10);
@@ -1645,6 +1799,7 @@
         renderSpatialLayoutEditor();
       });
     });
+
     listContainer.querySelectorAll("[data-box-framing]").forEach((sel) => {
       sel.addEventListener("change", () => {
         const i = parseInt(sel.getAttribute("data-box-framing"), 10);
@@ -1652,6 +1807,7 @@
         renderSpatialLayoutEditor();
       });
     });
+
     listContainer.querySelectorAll("[data-box-iso]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-iso"), 10);
@@ -1659,12 +1815,14 @@
         renderBindingsCard();
       });
     });
+
     listContainer.querySelectorAll("[data-box-dn]").forEach((inp) => {
       inp.addEventListener("input", () => {
         const i = parseInt(inp.getAttribute("data-box-dn"), 10);
         state.layoutItems[i].denoise_strength = parseOptionalFloat(inp.value, 0.05, 1.0);
       });
     });
+
     listContainer.querySelectorAll("[data-box-inpaint]").forEach((chk) => {
       chk.addEventListener("change", () => {
         const i = parseInt(chk.getAttribute("data-box-inpaint"), 10);
@@ -1672,6 +1830,7 @@
         renderSpatialLayoutEditor();
       });
     });
+
     listContainer.querySelectorAll("[data-box-paste]").forEach((chk) => {
       chk.addEventListener("change", () => {
         const i = parseInt(chk.getAttribute("data-box-paste"), 10);
@@ -1851,6 +2010,7 @@
     el("brushSizeInput").addEventListener("input", () => {
       el("brushSizeVal").textContent = `${el("brushSizeInput").value}px`;
     });
+
     el("brushHardnessInput").addEventListener("input", () => {
       el("brushHardnessVal").textContent = `${Math.round(parseFloat(el("brushHardnessInput").value) * 100)}%`;
     });
@@ -2141,6 +2301,7 @@
       ensureBoxZOrders();
       state.selectedBoxIndex = 0;
     }
+
     state.bindings.init_image_path = draft.init_image_path || null;
     state.bindings.inpaint_mask_path = draft.inpaint_mask_path || null;
     state.bindings.control_image_path = draft.control_image_path || null;
@@ -2157,10 +2318,12 @@
   function renderGallery() {
     const container = el("galleryList");
     el("galleryCountBadge").textContent = `${state.gallery.length} items`;
+
     if (!state.gallery.length) {
       container.innerHTML = `<div class="muted-note">Completed syntheses appear here with full recipe &amp; draft restoration.</div>`;
       return;
     }
+
     container.innerHTML = "";
     for (const item of state.gallery) {
       const card = document.createElement("div");
@@ -2247,7 +2410,9 @@
       try {
         const status = JSON.parse(ev.data);
         fill.style.width = `${status.progress_pct || 0}%`;
-        stageTxt.textContent = `[${status.progress_pct || 0}%] ${status.stage || status.status}`;
+        const aheadTag = status.users_ahead > 0 ? ` (Queue #${status.users_ahead + 1})` : "";
+        stageTxt.textContent = `[${status.progress_pct || 0}%]${aheadTag} ${status.stage || status.status}`;
+
         if (status.status === "COMPLETED") {
           es.close();
           state.activeEventSource = null;
@@ -2290,7 +2455,7 @@
       thinking_trace: thinkTrace || null,
       add_vision_id: el("addVisionIdCheck").checked,
       prompt_mode: promptMode,
-      layout_summary: explicitLayoutSummary || el("promptInput").value.trim(),
+      layout_summary: explicitLayoutSummary || null,
       layout_items: state.layoutItems,
       layout_coords_are_pixels: true,
       preserve_canvas_outside_boxes: el("preserveOutsideBoxesCheck").checked,
@@ -2302,7 +2467,7 @@
       width: parseInt(el("widthInput").value, 10) || 1024,
       height: parseInt(el("heightInput").value, 10) || 1024,
       num_inference_steps: parseInt(el("stepsInput").value, 10) || 50,
-      num_images_per_prompt: Math.max(1, Math.min(4, parseInt(el("numImagesInput").value, 10) || 1)),
+      num_images_per_prompt: Math.max(1, Math.min(8, parseInt(el("numImagesInput").value, 10) || 1)),
       shift: parseFloat(el("shiftInput").value) || 5.0,
       use_v2_grid: el("useV2GridCheck").checked,
       early_solver: el("earlySolverSelect").value,
@@ -2350,6 +2515,7 @@
       showLoginModal();
       return;
     }
+
     const btn = el("synthesizeBtn");
     const wrap = el("progressWrap");
     const fill = el("progressBarFill");
@@ -2377,7 +2543,10 @@
         method: "POST",
         body: payload
       });
+
+      btn.disabled = false;
       monitorJobProgress(jobStatus.job_id);
+      await pollHealthTelemetry(false);
     } catch (err) {
       btn.disabled = false;
       stageTxt.textContent = `Dispatch Error: ${err.message}`;
@@ -2420,7 +2589,7 @@
   function handleStageKeydown(ev) {
     const item = state.layoutItems[state.selectedBoxIndex];
     if (!item || item.enabled === false || !Array.isArray(item.bbox)) return;
-    const step = ev.shiftKey ? 64 : 16;
+    const step = ev.shiftKey ? 64 : (ev.altKey ? 1 : 16);
     const canvasW = parseInt(el("widthInput").value, 10) || 1024;
     const canvasH = parseInt(el("heightInput").value, 10) || 1024;
     const [y0, x0, y1, x1] = item.bbox;
@@ -2482,11 +2651,19 @@
       applyThemeVariables(ev.target.value);
     });
 
+    const modeBadge = el("layoutActiveModeBadge");
+    if (modeBadge) {
+      modeBadge.addEventListener("click", () => {
+        const sel = el("promptModeSelect");
+        sel.value = sel.value === "layout_json" ? "natural" : "layout_json";
+        updateCompiledJsonPreview();
+      });
+    }
+
     el("newProjectBtn").addEventListener("click", resetToNewProjectDraft);
     el("saveProjectBtn").addEventListener("click", () => saveCurrentProject(false));
     el("vaultSaveProjectBtn").addEventListener("click", () => saveCurrentProject(false));
     el("exportProjectBtn").addEventListener("click", () => saveCurrentProject(true));
-
     el("importProjectInput").addEventListener("change", async (ev) => {
       const file = ev.target.files && ev.target.files[0];
       if (!file) return;
@@ -2579,6 +2756,7 @@
       const x1 = snapCoord(geom.canvasW * 0.75, geom.canvasW);
       const maxZ = state.layoutItems.reduce((m, b) => Math.max(m, b.z_order || 1), 0);
       state.layoutItems.push({
+        label: "object",
         category: "object",
         caption: "New spatial subject region",
         bbox: [y0, x0, y1, x1],
@@ -2605,6 +2783,7 @@
       const x1 = snapCoord(geom.canvasW * 0.75, geom.canvasW);
       const maxZ = state.layoutItems.reduce((m, b) => Math.max(m, b.z_order || 1), 0);
       state.layoutItems.push({
+        label: "text",
         category: "text",
         text: "SOVEREIGN 2026",
         bbox: [y0, x0, y1, x1],
@@ -2635,6 +2814,7 @@
       state.layoutItems = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
       ensureBoxZOrders();
       state.selectedBoxIndex = 0;
+      el("promptModeSelect").value = "layout_json";
       renderSpatialLayoutEditor();
     });
 
@@ -2664,6 +2844,7 @@
     el("preserveOutsideBoxesCheck").addEventListener("change", renderBindingsCard);
     el("maskBlendModeSelect").addEventListener("change", renderBindingsCard);
     el("invertMaskCheck").addEventListener("change", renderBindingsCard);
+
     el("layoutUnderlaySelect").addEventListener("change", syncUnderlayLayers);
     el("layoutUnderlayOpacity").addEventListener("input", syncUnderlayLayers);
     el("inpaintUnderlayOpacity").addEventListener("input", syncUnderlayLayers);

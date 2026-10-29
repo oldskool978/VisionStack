@@ -141,18 +141,22 @@ def build_box_aperture_mask(
     feather_radius_lat: float,
     device: torch.device,
     only_flagged_boxes: bool = False,
+    include_paste_boxes: bool = True,
 ) -> Optional[torch.Tensor]:
     h_lat = max(1, height // 16)
     w_lat = max(1, width // 16)
     active_boxes: List[Tuple[int, int, int, int]] = []
+
     for item in layout_items:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
-        if only_flagged_boxes and not (
-            bool(item.get("inpaint_box", False))
-            or bool(item.get("paste_to_canvas", False))
-        ):
-            continue
+        if only_flagged_boxes:
+            is_inpaint = bool(item.get("inpaint_box", False))
+            is_paste = include_paste_boxes and bool(
+                item.get("paste_to_canvas", False)
+            )
+            if not (is_inpaint or is_paste):
+                continue
         bbox = item.get("bbox")
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
             uy0, ux0, uy1, ux1 = bbox_to_normalized(
@@ -164,14 +168,15 @@ def build_box_aperture_mask(
                 y1 = max(y0 + 1, min(h_lat, int(round(uy1 * h_lat))))
                 x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
                 active_boxes.append((y0, x0, y1, x1))
+
     if not active_boxes:
         return None
 
     yy = torch.arange(h_lat, device=device, dtype=torch.float32).unsqueeze(1) + 0.5
     xx = torch.arange(w_lat, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
     feather = max(0.25, float(feather_radius_lat))
-    mask = torch.zeros((h_lat, w_lat), device=device, dtype=torch.float32)
 
+    mask = torch.zeros((h_lat, w_lat), device=device, dtype=torch.float32)
     for y0, x0, y1, x1 in active_boxes:
         ly0 = float(y0)
         ly1 = float(y1)
@@ -209,6 +214,7 @@ def compose_latent_inpaint_mask(
     )
     if ref_t is None:
         return None
+
     eff_h = int(h_lat) if h_lat is not None else int(ref_t.shape[-2])
     eff_w = int(w_lat) if w_lat is not None else int(ref_t.shape[-1])
 
@@ -278,7 +284,12 @@ def splat_box_latents_to_canvas(
     latent_channels: int,
     feather_radius_lat: float,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    default_denoise_strength: float = 0.75,
+    return_denoise_map: bool = False,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
     if base_canvas is not None:
         canvas = base_canvas.to(device=device, dtype=torch.float32).clone()
         if canvas.shape[-2:] != (h_lat, w_lat):
@@ -288,10 +299,17 @@ def splat_box_latents_to_canvas(
             (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
         )
 
+    fallback_dn = max(0.05, min(1.0, float(default_denoise_strength)))
     if not splat_entries:
-        return canvas, torch.zeros(
+        zero_alpha = torch.zeros(
             (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
         )
+        if return_denoise_map:
+            dn_map = torch.full(
+                (1, 1, h_lat, w_lat), fallback_dn, device=device, dtype=torch.float32
+            )
+            return canvas, zero_alpha, dn_map
+        return canvas, zero_alpha
 
     accum_lat = torch.zeros(
         (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
@@ -299,12 +317,15 @@ def splat_box_latents_to_canvas(
     accum_weight = torch.zeros(
         (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
     )
+    accum_dn = torch.zeros(
+        (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
+    )
     union_alpha = torch.zeros(
         (1, 1, h_lat, w_lat), device=device, dtype=torch.float32
     )
     feather = max(0.25, float(feather_radius_lat))
 
-    for box_lat_cpu, norm_bbox, box_mask_cpu, _ in splat_entries:
+    for box_lat_cpu, norm_bbox, box_mask_cpu, box_dn in splat_entries:
         uy0, ux0, uy1, ux1 = norm_bbox
         y0 = max(0, min(h_lat - 1, int(round(uy0 * h_lat))))
         x0 = max(0, min(w_lat - 1, int(round(ux0 * w_lat))))
@@ -337,24 +358,61 @@ def splat_box_latents_to_canvas(
             local_alpha = local_alpha * b_mask.clamp(0.0, 1.0)
 
         local_alpha = local_alpha.clamp(0.0, 1.0)
+        eff_dn = (
+            max(0.05, min(1.0, float(box_dn)))
+            if box_dn is not None
+            else fallback_dn
+        )
+
         accum_lat[:, :, y0:y1, x0:x1] = (
             accum_lat[:, :, y0:y1, x0:x1] + local_alpha * b_lat
         )
         accum_weight[:, :, y0:y1, x0:x1] = (
             accum_weight[:, :, y0:y1, x0:x1] + local_alpha
         )
+        accum_dn[:, :, y0:y1, x0:x1] = (
+            accum_dn[:, :, y0:y1, x0:x1] + local_alpha * eff_dn
+        )
         union_alpha[:, :, y0:y1, x0:x1] = torch.maximum(
             union_alpha[:, :, y0:y1, x0:x1], local_alpha
         )
 
     union_alpha = union_alpha.clamp(0.0, 1.0)
-    norm_fg = torch.where(
-        accum_weight > 1e-6,
-        accum_lat / accum_weight.clamp(min=1e-6),
-        canvas,
-    )
+    safe_weight = accum_weight.clamp(min=1e-6)
+    norm_fg = torch.where(accum_weight > 1e-6, accum_lat / safe_weight, canvas)
     canvas = union_alpha * norm_fg + (1.0 - union_alpha) * canvas
+
+    if return_denoise_map:
+        dn_map = torch.where(
+            accum_weight > 1e-6,
+            (accum_dn / safe_weight).clamp(0.05, 1.0),
+            torch.full_like(accum_weight, fallback_dn),
+        )
+        return canvas, union_alpha, dn_map
     return canvas, union_alpha
+
+
+def couple_splat_velocity_prior(
+    v_dit: torch.Tensor,
+    latents: torch.Tensor,
+    splat_canvas: torch.Tensor,
+    splat_union_alpha: torch.Tensor,
+    splat_denoise_map: torch.Tensor,
+    sigma_curr: float,
+) -> torch.Tensor:
+    s_val = float(sigma_curr)
+    if s_val <= 0.05:
+        return v_dit
+    sigma_hand = splat_denoise_map.clamp(0.15, 0.92)
+    half_band = 0.18
+    tau = ((s_val - (sigma_hand - half_band)) / (2.0 * half_band)).clamp(0.0, 1.0)
+    if float(tau.max().item()) <= 1e-6:
+        return v_dit
+    psi = 0.5 * (1.0 - torch.cos(math.pi * tau))
+    g_max = (1.15 - 0.55 * splat_denoise_map).clamp(0.25, 0.92)
+    kappa = (splat_union_alpha * g_max * psi).clamp(0.0, 0.92)
+    v_splat = (latents.float() - splat_canvas.float()) / max(s_val, 0.05)
+    return ((1.0 - kappa) * v_dit.float() + kappa * v_splat).to(dtype=v_dit.dtype)
 
 
 def load_image_tensor_16px(
@@ -387,19 +445,18 @@ def pack_vision_patches_32px(
     scale = min(1.0, math.sqrt(float(max_pixels) / float(max(1, w_in * h_in))))
     h_vis = max(32, (int(round(h_in * scale)) // 32) * 32)
     w_vis = max(32, (int(round(w_in * scale)) // 32) * 32)
-
     if (w_in, h_in) != (w_vis, h_vis):
         img = img.resize((w_vis, h_vis), resample=Image.Resampling.BICUBIC)
+
     arr = np.asarray(img, dtype=np.float32) / 255.0
     mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
     std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
     normed = (arr - mean) / std
-
     chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
+
     grid_h = h_vis // 16
     grid_w = w_vis // 16
     merge = 2
-
     patches = chw.unsqueeze(1).expand(3, 2, h_vis, w_vis)
     patches = patches.view(
         3, 2, grid_h // merge, merge, 16, grid_w // merge, merge, 16
@@ -424,6 +481,7 @@ __all__ = [
     "build_box_aperture_mask",
     "compose_latent_inpaint_mask",
     "splat_box_latents_to_canvas",
+    "couple_splat_velocity_prior",
     "load_image_tensor_16px",
     "pack_vision_patches_32px",
 ]
