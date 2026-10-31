@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-pydantic
-starlette
-Pillow
-numpy
-safetensors
-pywebview
