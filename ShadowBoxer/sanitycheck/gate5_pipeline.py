@@ -317,10 +317,12 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 and int(cut_arr[256, 256, 3]) == 255,
                 "ref_cutout_c.png must be a 512x512 RGBA cutout with transparent borders and opaque interior",
             )
+
         ref_512_p = Path(tmpdir) / "ref_512.png"
         test_bw = np.zeros((512, 512, 3), dtype=np.uint8)
         test_bw[256:, :, :] = 255
         Image.fromarray(test_bw, mode="RGB").save(ref_512_p)
+
         unboxed_2304 = _resolve_unboxed_reference_dims(
             ref_512_p, 1024, 1024, "ai_toolkit_isolated", max_vit_patches=2304
         )
@@ -331,6 +333,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             unboxed_2304 == (768, 768) and unboxed_576 == (512, 512),
             f"_resolve_unboxed_reference_dims failed adaptive 4D-RoPE scaling: 2304->{unboxed_2304}, 576->{unboxed_576}",
         )
+
         fb_patches, fb_gthw, fb_llm = pack_vision_patches_32px(
             ref_512_p, max_patches=2304
         )
@@ -607,6 +610,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     _assert(
         c_bbox == [-512, -512, 512, 512], f"Unexpected centralized bbox: {c_bbox}"
     )
+
     norm_b = bbox_to_normalized(
         [256, 512, 768, 1024], height=1024, width=1024, coords_are_pixels=True
     )
@@ -979,7 +983,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and abs(float(horizon_map[0, 0, 8, 56].item()) - 1.0) < 1e-5,
         "build_box_denoise_horizon_map failed per-box denoise horizon synthesis",
     )
-
     nested_horizon_map = build_box_denoise_horizon_map(
         layout_items=[
             {
@@ -1010,7 +1013,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and abs(float(nested_horizon_map[0, 0, 12, 12].item()) - 0.80) < 1e-6,
         "Porter-Duff occlusion in build_box_denoise_horizon_map failed to keep nested child interior 100% uncontaminated",
     )
-
     warped_horizon = warp_denoise_to_sigma_horizon(horizon_map, shift=5.0)
     _assert(
         isinstance(warped_horizon, torch.Tensor)
@@ -1039,7 +1041,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and float(m_auto_union[0, 0, 55, 5].item()) == 0.0,
         "compose_latent_inpaint_mask auto-union failed",
     )
-
     m_auto_inter = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -1056,7 +1057,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and float(m_auto_inter[0, 0, 40, 32].item()) == 0.0,
         "compose_latent_inpaint_mask auto-intersect (preserve_outside_boxes) failed",
     )
-
     m_inv_alpha = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -1126,7 +1126,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             (boxed_w, boxed_h) == (512, 512),
             f"_resolve_boxed_reference_dims mismatch: {(boxed_w, boxed_h)}",
         )
-
         unpacked_ramp = (
             (torch.arange(16, device=dev, dtype=torch.float32) + 0.5)
             .view(1, 1, 1, 16)
@@ -1171,6 +1170,46 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             f"resample_packed_latents failed sub-phase preservation: sub_err={sub_err}, naive_err={naive_err}",
         )
 
+        bn_mean_128 = torch.linspace(
+            -1.2, 1.2, 128, device=dev, dtype=torch.float32
+        ).view(1, 128, 1, 1)
+        bn_std_128 = torch.linspace(
+            0.4, 2.2, 128, device=dev, dtype=torch.float32
+        ).view(1, 128, 1, 1)
+        packed_ramp_bn = (packed_ramp - bn_mean_128) / bn_std_128
+        res_bn_aware = resample_packed_latents(
+            packed_ramp_bn, 16, 16, bn_mean=bn_mean_128, bn_std=bn_std_128
+        )
+        res_bn_unaware = resample_packed_latents(packed_ramp_bn, 16, 16)
+        unpacked_bn_aware = (
+            (res_bn_aware * bn_std_128 + bn_mean_128)
+            .reshape(1, 32, 2, 2, 16, 16)
+            .permute(0, 1, 4, 2, 5, 3)
+            .reshape(1, 32, 32, 32)
+        )
+        unpacked_bn_unaware = (
+            (res_bn_unaware * bn_std_128 + bn_mean_128)
+            .reshape(1, 32, 2, 2, 16, 16)
+            .permute(0, 1, 4, 2, 5, 3)
+            .reshape(1, 32, 32, 32)
+        )
+        bn_aware_err = float(
+            (unpacked_bn_aware[:, :, :, 2:-2] - gt_ramp_32[:, :, :, 2:-2])
+            .abs()
+            .max()
+            .item()
+        )
+        bn_unaware_err = float(
+            (unpacked_bn_unaware[:, :, :, 2:-2] - gt_ramp_32[:, :, :, 2:-2])
+            .abs()
+            .max()
+            .item()
+        )
+        _assert(
+            bn_aware_err < 1e-5 and bn_unaware_err > 0.1,
+            f"BatchNorm2d(128) affine-invariant sub-phase resampling failed: aware_err={bn_aware_err}, unaware_err={bn_unaware_err}",
+        )
+
         base_canvas = torch.zeros((1, 128, 32, 32), device=dev, dtype=torch.float32)
         box_lat_a = torch.full((1, 128, 16, 16), 2.5, device="cpu", dtype=torch.float32)
         splat_canvas, splat_alpha, splat_dn_map = splat_box_latents_to_canvas(
@@ -1198,6 +1237,27 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             "splat_box_latents_to_canvas failed interior/feather/exterior composite or denoise map values",
         )
 
+        splat_bn_can, _ = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[
+                (packed_ramp_bn.cpu(), (0.25, 0.25, 0.75, 0.75), None, 0.50)
+            ],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            bn_mean=bn_mean_128,
+            bn_std=bn_std_128,
+        )
+        splat_bn_err = float(
+            (splat_bn_can[:, :, 8:24, 8:24] - res_bn_aware).abs().max().item()
+        )
+        _assert(
+            splat_bn_err < 1e-6,
+            f"splat_box_latents_to_canvas failed to forward bn_mean/bn_std during box latent resampling: err={splat_bn_err}",
+        )
+
         cutout_half = torch.full((1, 1, 16, 16), 0.5, device="cpu", dtype=torch.float32)
         _, cut_tnorm_alpha = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
@@ -1214,7 +1274,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(cut_tnorm_alpha[0, 0, 9, 16].item()) - 0.5) < 1e-6,
             "Gate 5.C Single-authority Godel t-norm failed: VizInjector cutout mask was double-feathered against box ramp",
         )
-
         _, kronecker_alpha, kronecker_dn = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.45)],
@@ -1232,7 +1291,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(kronecker_dn[0, 0, 8, 8].item()) - 0.45) < 1e-5,
             "0.0-feather splat_box_latents_to_canvas failed exact Kronecker perimeter support",
         )
-
         _, low_dn_alpha = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.05)],
@@ -1268,7 +1326,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             feather_rms > 0.94,
             f"Covariance-preserving sub-phase splatting suffered variance droop in feather zone: rms={feather_rms}",
         )
-
         no_base_canvas, no_base_alpha, no_base_dn = splat_box_latents_to_canvas(
             base_canvas=None,
             splat_entries=[(fg_gauss, (0.25, 0.25, 0.75, 0.75), None, 0.40)],
@@ -1466,7 +1523,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and v11_attn_carve[0][2] == 5.0,
             f"Gate 5.A resolve_foreground_aperture_carveouts failed V11 synthesis: ovr={v11_ovr}, attn={v11_attn_carve}",
         )
-
         v11_scaled_512 = scale_layout_items_to_canvas(
             v11_test_items,
             height=512,
@@ -1632,7 +1688,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             0.0 < rem_drift < drift_err,
             f"CFL drift restorer violated monotonic contraction at d=0.05, sigma=0.08, dt=-0.25: rem_drift={rem_drift}",
         )
-
         dn_locked = torch.zeros((1, 1, 32, 32), device=dev, dtype=torch.float32)
         v_locked_out = couple_splat_velocity_prior(
             v_dit=v_dit_ones,
@@ -1694,6 +1749,8 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             default_denoise_strength=0.75,
             return_denoise_map=True,
             aperture_overrides=[((0.375, 0.375, 0.625, 0.625), 0.65, 1.0)],
+            bn_mean=bn_mean_128,
+            bn_std=bn_std_128,
         )
         loop_target_fg = loop_can.clone()
         loop_target_fg[:, :, 12:20, 12:20] = text_target_gauss[:, :, 12:20, 12:20]
@@ -1708,7 +1765,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         assert loop_inpaint_mask is not None
         loop_dn_warped = warp_denoise_to_sigma_horizon(loop_dn, shift=5.0)
         assert isinstance(loop_dn_warped, torch.Tensor)
-
         loop_sched = BifurcatedFlowMatchScheduler(
             early_solver="heun",
             late_solver="ipndm",
@@ -1719,7 +1775,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         loop_sched.set_timesteps(12, device=dev)
         s0_loop = float(loop_sched.sigmas[0].item())
         lat_loop = (1.0 - s0_loop) * loop_can + s0_loop * loop_noise
-
         for p_idx, t_loop in enumerate(loop_sched.timesteps):
             cfg_l = loop_sched._step_configs[p_idx]
             s_eval = float(t_loop.item()) / float(loop_sched.num_train_timesteps)
@@ -1753,7 +1808,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 bool(torch.isfinite(lat_loop).all().item()),
                 f"Gate 5.D Non-finite latent state encountered at pass {p_idx}",
             )
-
         final_cell_rms = torch.sqrt(torch.mean(lat_loop[0] * lat_loop[0], dim=0))
         ext_rms = float(final_cell_rms[:2, :2].mean().item())
         box_int_rms = float(final_cell_rms[6:10, 6:10].mean().item())
@@ -1794,6 +1848,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             req.effective_reference_isolated_kv is True,
             f"edit_format={fmt} must enable reference_isolated_kv",
         )
+
     req_ait = GenerationRequest(prompt="test", edit_format="ai_toolkit_isolated")
     _assert(
         req_ait.effective_uncond_uses_references is False,
@@ -1807,7 +1862,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        f"  [+] Spatio-Visual Graph      : PorterDuffOcclusion + NonTransitiveIsoKV + Stage1FP32Upgrade + ClosedLoopRMS (rim={rim_loop_rms:.3f}, txt={carved_txt_rms:.3f}) Verified"
+        f"  [+] Spatio-Visual Graph      : PorterDuffOcclusion + NonTransitiveIsoKV + BN128SubPhase (err={bn_aware_err:.1e}) + ClosedLoopRMS (rim={rim_loop_rms:.3f}, txt={carved_txt_rms:.3f}) Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)

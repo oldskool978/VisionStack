@@ -85,6 +85,7 @@ class PipelineLifecycleMixin:
             self.transformer.clear_caches()
         if self.text_encoder is not None:
             self.text_encoder.clear_caches()
+            self.text_encoder.last_reanchor_telemetry = {}
         if self.vae is not None:
             self.vae.clear_caches()
         if torch.cuda.is_available():
@@ -200,7 +201,6 @@ class PipelineLifecycleMixin:
                 raise RuntimeError(
                     "CUDA execution requested but no compatible GPU detected."
                 )
-
             target_device = torch.device("cpu") if cpu_offload else self.device
 
             if (
@@ -413,6 +413,7 @@ class PipelineLifecycleMixin:
             lora_sd: Dict[str, torch.Tensor] = {}
             for sf in sf_files:
                 lora_sd.update(load_safetensors(str(sf), device="cpu"))
+
             fused = self.transformer.fuse_lora_state_dict(
                 lora_sd, scale=edit_lora_scale, lora_tag=lora_tag_str
             )

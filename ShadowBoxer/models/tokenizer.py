@@ -5,7 +5,6 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
-import stat
 import sys
 from typing import (
     AbstractSet,
@@ -28,15 +27,11 @@ import torch
 MODELS_DIR = Path(__file__).resolve().parent
 SHADOWBOXER_ROOT = MODELS_DIR.parent
 VIZTOKEN_STAGE_DIR = SHADOWBOXER_ROOT / "viztoken"
-VIZTOKEN_SIBLING_DIST = SHADOWBOXER_ROOT.parent / "VizToken" / "dist" / "bin"
-VIZINJECTOR_STAGE_DIR = SHADOWBOXER_ROOT / "vizinjector"
-VIZINJECTOR_SIBLING_DIST = SHADOWBOXER_ROOT.parent / "VizInjector" / "dist" / "bin"
 IS_WIN = sys.platform == "win32"
 _DLL_NAME = "viztoken.dll" if IS_WIN else "libviztoken.so"
 
 QWEN35_BASE_VOCAB_SIZE = 248044
 QWEN35_TOTAL_VOCAB_SIZE = 248320
-
 QWEN35_EOT_TOKEN_ID = 248044
 QWEN35_IM_START_TOKEN_ID = 248045
 QWEN35_IM_END_TOKEN_ID = 248046
@@ -129,7 +124,6 @@ def render_qwen35_chat_prompt(
         norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
         if norm_sys:
             sys_prefix = f"<|im_start|>system\n{norm_sys}<|im_end|>\n"
-
     if image_patch_counts:
         vis_prefix = "".join(
             f"{'Picture ' + str(idx) + ': ' if add_vision_id else ''}<|vision_start|>{'<|image_pad|>' * max(1, int(c))}<|vision_end|>"
@@ -137,7 +131,6 @@ def render_qwen35_chat_prompt(
         )
     else:
         vis_prefix = ""
-
     norm_trace = (
         unicodedata.normalize("NFC", thinking_trace).strip()
         if thinking_trace is not None
@@ -149,44 +142,11 @@ def render_qwen35_chat_prompt(
         think_suffix = (
             "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
         )
-
     return (
         f"{sys_prefix}<|im_start|>user\n{vis_prefix}{norm_prompt}<|im_end|>\n"
         f"<|im_start|>assistant\n{think_suffix}"
     )
 
-
-def _sync_sibling_dist_if_newer(sibling_dist: Path, stage_dir: Path) -> None:
-    if not sibling_dist.is_dir():
-        return
-    try:
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        for src_file in sibling_dist.iterdir():
-            if not src_file.is_file():
-                continue
-            dst_file = stage_dir / src_file.name
-            needs_copy = not dst_file.is_file()
-            if not needs_copy:
-                try:
-                    needs_copy = (
-                        src_file.stat().st_mtime_ns > dst_file.stat().st_mtime_ns
-                        or src_file.stat().st_size != dst_file.stat().st_size
-                    )
-                except OSError:
-                    needs_copy = True
-            if needs_copy:
-                if dst_file.exists():
-                    try:
-                        os.chmod(dst_file, stat.S_IWRITE | stat.S_IREAD)
-                    except Exception:
-                        pass
-                shutil.copy2(src_file, dst_file)
-    except Exception:
-        pass
-
-
-_sync_sibling_dist_if_newer(VIZTOKEN_SIBLING_DIST, VIZTOKEN_STAGE_DIR)
-_sync_sibling_dist_if_newer(VIZINJECTOR_SIBLING_DIST, VIZINJECTOR_STAGE_DIR)
 
 _VIZTOKEN_MOD: Optional[Any] = None
 
@@ -196,39 +156,26 @@ def _load_viztoken_module() -> Optional[Any]:
     if _VIZTOKEN_MOD is not None:
         return _VIZTOKEN_MOD
 
-    search_dirs = [
-        VIZTOKEN_STAGE_DIR,
-        VIZTOKEN_SIBLING_DIST,
-        SHADOWBOXER_ROOT.parent / "VizToken",
-    ]
-    for d in search_dirs:
-        py_cand = d / "viztoken.py"
-        dll_cand = d / _DLL_NAME
-        if not dll_cand.is_file() and (d / "dist" / "bin" / _DLL_NAME).is_file():
-            dll_cand = d / "dist" / "bin" / _DLL_NAME
-        if py_cand.is_file() and dll_cand.is_file():
-            try:
-                os.environ["VIZTOKEN_DLL_PATH"] = str(dll_cand.resolve())
-                ranks_cand = d / "qwen35.ranks.bin"
-                if (
-                    not ranks_cand.is_file()
-                    and (d / "dist" / "bin" / "qwen35.ranks.bin").is_file()
-                ):
-                    ranks_cand = d / "dist" / "bin" / "qwen35.ranks.bin"
-                if ranks_cand.is_file():
-                    os.environ["VIZTOKEN_RANKS_PATH"] = str(ranks_cand.resolve())
-                spec = importlib.util.spec_from_file_location(
-                    "_sb_viztoken", str(py_cand)
-                )
-                if spec is not None and spec.loader is not None:
-                    mod = importlib.util.module_from_spec(spec)
-                    sys.modules["_sb_viztoken"] = mod
-                    spec.loader.exec_module(mod)
-                    if hasattr(mod, "is_valid_qwen35_swiss5"):
-                        _VIZTOKEN_MOD = mod
-                        return _VIZTOKEN_MOD
-            except Exception:
-                continue
+    py_cand = VIZTOKEN_STAGE_DIR / "viztoken.py"
+    dll_cand = VIZTOKEN_STAGE_DIR / _DLL_NAME
+    if py_cand.is_file() and dll_cand.is_file():
+        try:
+            os.environ["VIZTOKEN_DLL_PATH"] = str(dll_cand.resolve())
+            ranks_cand = VIZTOKEN_STAGE_DIR / "qwen35.ranks.bin"
+            if ranks_cand.is_file():
+                os.environ["VIZTOKEN_RANKS_PATH"] = str(ranks_cand.resolve())
+            spec = importlib.util.spec_from_file_location(
+                "_sb_viztoken", str(py_cand)
+            )
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["_sb_viztoken"] = mod
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "is_valid_qwen35_swiss5"):
+                    _VIZTOKEN_MOD = mod
+                    return _VIZTOKEN_MOD
+        except Exception:
+            pass
 
     try:
         import viztoken as mod  # type: ignore
@@ -251,6 +198,7 @@ def find_common_prefix(
         tokens_a = tokens_a.detach().cpu().tolist()
     if hasattr(tokens_b, "detach"):
         tokens_b = tokens_b.detach().cpu().tolist()
+
     limit = min(len(tokens_a), len(tokens_b))
     for i in range(limit):
         if int(tokens_a[i]) != int(tokens_b[i]):
@@ -275,22 +223,18 @@ def compile_qwen_ranks_binary(
     if vt is not None and hasattr(vt, "is_valid_qwen35_swiss5"):
         if vt.is_valid_qwen35_swiss5(dest_bin):
             return dest_bin
-        for prebuilt in (
-            VIZTOKEN_STAGE_DIR / "qwen35.ranks.bin",
-            VIZTOKEN_SIBLING_DIST / "qwen35.ranks.bin",
-        ):
-            if prebuilt.is_file() and vt.is_valid_qwen35_swiss5(prebuilt):
-                if prebuilt.resolve() != dest_bin.resolve():
-                    dest_bin.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(prebuilt, dest_bin)
-                return dest_bin
+        prebuilt = VIZTOKEN_STAGE_DIR / "qwen35.ranks.bin"
+        if prebuilt.is_file() and vt.is_valid_qwen35_swiss5(prebuilt):
+            if prebuilt.resolve() != dest_bin.resolve():
+                dest_bin.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(prebuilt, dest_bin)
+            return dest_bin
 
     if vt is not None and hasattr(vt, "compile_qwen_ranks_binary"):
         try:
             return Path(vt.compile_qwen_ranks_binary(src, dest_bin))
         except FileNotFoundError:
             for fallback_tik in (
-                SHADOWBOXER_ROOT.parent / "VizToken" / "qwen35.tiktoken",
                 VIZTOKEN_STAGE_DIR / "qwen35.tiktoken",
                 SHADOWBOXER_ROOT / "qwen35.tiktoken",
             ):
@@ -352,14 +296,12 @@ def _resolve_ranks_or_tiktoken(
     bin_candidates.extend(
         [
             VIZTOKEN_STAGE_DIR / "qwen35.ranks.bin",
-            VIZTOKEN_SIBLING_DIST / "qwen35.ranks.bin",
             SHADOWBOXER_ROOT / "qwen35.ranks.bin",
         ]
     )
     tik_candidates.extend(
         [
             VIZTOKEN_STAGE_DIR / "qwen35.tiktoken",
-            SHADOWBOXER_ROOT.parent / "VizToken" / "qwen35.tiktoken",
             SHADOWBOXER_ROOT / "qwen35.tiktoken",
         ]
     )
@@ -466,7 +408,6 @@ class MOSSImageTokenizer:
         self.video_pad_id = QWEN35_VIDEO_PAD_ID
         self.think_start_id = QWEN35_THINK_START_ID
         self.think_end_id = QWEN35_THINK_END_ID
-
         if self._viztoken_active and hasattr(self._enc, "_chat_tail_trace_close"):
             self._trace_close_token_ids: List[int] = list(
                 self._enc._chat_tail_trace_close
@@ -714,6 +655,7 @@ class MOSSImageTokenizer:
     ) -> List[int]:
         norm_prompt = unicodedata.normalize("NFC", prompt).strip()
         toks: List[int] = []
+
         if system_prompt is not None:
             norm_sys = unicodedata.normalize("NFC", system_prompt).strip()
             if norm_sys:
@@ -751,6 +693,7 @@ class MOSSImageTokenizer:
             if norm_prompt
             else []
         )
+
         norm_trace = (
             unicodedata.normalize("NFC", thinking_trace).strip()
             if thinking_trace is not None

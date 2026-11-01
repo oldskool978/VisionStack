@@ -16,7 +16,6 @@ from schema import (
     bbox_to_normalized,
     extract_box_text_and_caption,
 )
-
 from .env import (
     HAS_VIZINJECTOR,
     ROOT_DIR,
@@ -107,7 +106,6 @@ def _resolve_unboxed_reference_dims(
     else:
         cap_w = int(req_w)
         cap_h = int(req_h)
-
     max_area = float(max(64 * 64, cap_w * cap_h))
     dims = _probe_image_dimensions(path)
     if dims is not None and dims[0] > 0 and dims[1] > 0:
@@ -174,6 +172,8 @@ def resample_packed_latents(
     packed_latents: torch.Tensor,
     target_h_lat: int,
     target_w_lat: int,
+    bn_mean: Optional[torch.Tensor] = None,
+    bn_std: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if packed_latents.ndim != 4:
         return packed_latents
@@ -190,14 +190,32 @@ def resample_packed_latents(
             align_corners=False,
         )
     orig_dtype = packed_latents.dtype
-    unpacked = _unpack_latents_2x2(packed_latents.float())
+    z_f32 = packed_latents.float()
+    use_bn = (
+        bn_mean is not None
+        and bn_std is not None
+        and bn_mean.numel() == c
+        and bn_std.numel() == c
+    )
+    if use_bn:
+        mean_dev = bn_mean.to(device=z_f32.device, dtype=torch.float32).view(
+            1, c, 1, 1
+        )
+        std_dev = bn_std.to(device=z_f32.device, dtype=torch.float32).view(
+            1, c, 1, 1
+        )
+        z_f32 = z_f32 * std_dev + mean_dev
+    unpacked = _unpack_latents_2x2(z_f32)
     resampled = F.interpolate(
         unpacked,
         size=(2 * th, 2 * tw),
         mode="bilinear",
         align_corners=False,
     )
-    return _pack_latents_2x2(resampled).to(dtype=orig_dtype)
+    repacked = _pack_latents_2x2(resampled)
+    if use_bn:
+        repacked = (repacked - mean_dev) / std_dev.clamp(min=1e-6)
+    return repacked.to(dtype=orig_dtype)
 
 
 def build_box_aperture_mask(
@@ -345,7 +363,6 @@ def splat_box_masks_to_canvas(
             m_dev = F.interpolate(
                 m_dev, size=(bh, bw), mode="bilinear", align_corners=False
             )
-
         if feather_box_edges and feather > 1e-4:
             yy = (
                 torch.arange(bh, device=target_dev, dtype=torch.float32).unsqueeze(1)
@@ -417,7 +434,6 @@ def build_box_denoise_horizon_map(
             is_inpaint or is_paste or has_explicit_dn or is_unreferenced_text
         ):
             continue
-
         bbox = item.get("bbox")
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
             continue
@@ -440,7 +456,6 @@ def build_box_denoise_horizon_map(
                 (y0, x0, y1, x1, text_dn, has_explicit_dn)
             )
             continue
-
         box_dn = (
             max(0.01, min(1.0, float(raw_dn))) if has_explicit_dn else fallback_dn
         )
@@ -450,6 +465,7 @@ def build_box_denoise_horizon_map(
 
     if not parsed_boxes and not deferred_text_boxes:
         return None
+
     has_non_uniform_base = any(
         has_exp and abs(dn - fallback_dn) > 1e-5
         for _, _, _, _, dn, _, has_exp in parsed_boxes
@@ -478,9 +494,13 @@ def build_box_denoise_horizon_map(
             area_frac = max(
                 1e-4, min(1.0, float((y1 - y0) * (x1 - x0)) / total_cells)
             )
-            priority = math.exp(
-                _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
-                + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((z_val - z_mean) / 4.0)
+            priority = (
+                1.0
+                if len(parsed_boxes) == 1
+                else math.exp(
+                    _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
+                    + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((z_val - z_mean) / 4.0)
+                )
             )
             dy = torch.maximum(
                 torch.maximum(float(y0) - yy, yy - float(y1)), torch.zeros_like(yy)
@@ -509,7 +529,7 @@ def build_box_denoise_horizon_map(
             accum_dn = accum_dn + w_hier * dn_i
             accum_w = accum_w + w_hier
 
-        safe_w = accum_w.clamp(min=1e-6)
+        safe_w = accum_w.clamp(min=1e-12)
         fg_dn = torch.where(
             accum_w > 1e-6,
             (accum_dn / safe_w).clamp(0.01, 1.0),
@@ -645,6 +665,8 @@ def splat_box_latents_to_canvas(
             ]
         ]
     ] = None,
+    bn_mean: Optional[torch.Tensor] = None,
+    bn_std: Optional[torch.Tensor] = None,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -653,7 +675,9 @@ def splat_box_latents_to_canvas(
     if has_base_canvas:
         canvas = base_canvas.to(device=device, dtype=torch.float32).clone()
         if canvas.shape[-2:] != (h_lat, w_lat):
-            canvas = resample_packed_latents(canvas, h_lat, w_lat)
+            canvas = resample_packed_latents(
+                canvas, h_lat, w_lat, bn_mean=bn_mean, bn_std=bn_std
+            )
     else:
         canvas = torch.zeros(
             (1, latent_channels, h_lat, w_lat), device=device, dtype=torch.float32
@@ -678,6 +702,7 @@ def splat_box_latents_to_canvas(
     w_work = w_lat * sub_scale
 
     canvas_work = _unpack_latents_2x2(canvas) if use_subphase else canvas
+
     accum_lat = torch.zeros(
         (1, c_work, h_work, w_work), device=device, dtype=torch.float32
     )
@@ -696,14 +721,14 @@ def splat_box_latents_to_canvas(
     union_alpha_work = torch.zeros(
         (1, 1, h_work, w_work), device=device, dtype=torch.float32
     )
-
     raw_feather = max(0.0, float(feather_radius_lat))
     total_cells = float(max(1, h_lat * w_lat))
+    num_entries = len(splat_entries)
     z_vals = [
         float(e[5]) if (len(e) > 5 and e[5] is not None) else 0.0
         for e in splat_entries
     ]
-    z_mean = (sum(z_vals) / float(len(z_vals))) if z_vals else 0.0
+    z_mean = (sum(z_vals) / float(num_entries)) if z_vals else 0.0
 
     prepared_layers: List[
         Tuple[
@@ -737,9 +762,13 @@ def splat_box_latents_to_canvas(
         bw = x1 - x0
 
         area_frac = max(1e-4, min(1.0, float(bh * bw) / total_cells))
-        priority = math.exp(
-            _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
-            + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((box_z - z_mean) / 4.0)
+        priority = (
+            1.0
+            if num_entries == 1
+            else math.exp(
+                _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
+                + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((box_z - z_mean) / 4.0)
+            )
         )
         eff_dn = (
             max(0.01, min(1.0, float(box_dn)))
@@ -763,7 +792,9 @@ def splat_box_latents_to_canvas(
 
         b_lat = box_lat_cpu.to(device=device, dtype=torch.float32)
         if b_lat.shape[-2:] != (bh, bw):
-            b_lat = resample_packed_latents(b_lat, bh, bw)
+            b_lat = resample_packed_latents(
+                b_lat, bh, bw, bn_mean=bn_mean, bn_std=bn_std
+            )
         b_work = _unpack_latents_2x2(b_lat) if use_subphase else b_lat
 
         sy0, sy1 = y0 * sub_scale, y1 * sub_scale
@@ -875,6 +906,7 @@ def splat_box_latents_to_canvas(
             torch.mean(b_work_i * b_work_i, dim=1, keepdim=True) + 1e-12
         )
         w_rms = w_hier * b_rms
+
         accum_lat[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
             accum_lat[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_hier * b_work_i
         )
@@ -892,22 +924,33 @@ def splat_box_latents_to_canvas(
         )
 
     union_alpha_work = union_alpha_work.clamp(0.0, 1.0)
-    safe_weight = accum_weight.clamp(min=1e-5)
+    safe_weight = accum_weight.clamp(min=1e-12)
     linear_fg = accum_lat / safe_weight
-    target_fg_rms = accum_rms_w1 / safe_weight
-    orth_fg_rms = torch.sqrt(accum_rms_w2.clamp(min=0.0)) / safe_weight
-    lin_fg_rms = torch.sqrt(
-        torch.mean(linear_fg * linear_fg, dim=1, keepdim=True) + 1e-12
-    )
-    denom_fg_rms = torch.maximum(orth_fg_rms, lin_fg_rms).clamp(min=1e-6)
-    cov_fg_gain = torch.where(
-        (accum_weight > 1e-5) & (target_fg_rms > 1e-5),
-        (target_fg_rms / denom_fg_rms).clamp(1.0, 1.41421356),
-        torch.ones_like(target_fg_rms),
-    )
-    norm_fg = torch.where(
-        accum_weight > 1e-6, linear_fg * cov_fg_gain, canvas_work
-    )
+
+    if num_layers > 1:
+        target_fg_rms = accum_rms_w1 / safe_weight
+        orth_fg_rms = torch.sqrt(accum_rms_w2.clamp(min=0.0)) / safe_weight
+        lin_fg_rms = torch.sqrt(
+            torch.mean(linear_fg * linear_fg, dim=1, keepdim=True) + 1e-12
+        )
+        denom_fg_rms = torch.maximum(orth_fg_rms, lin_fg_rms).clamp(min=1e-6)
+        multi_fg_active = (
+            (accum_weight > 1e-5)
+            & (target_fg_rms > 1e-5)
+            & (target_fg_rms > orth_fg_rms * (1.0 + 1e-5))
+        )
+        cov_fg_gain = torch.where(
+            multi_fg_active,
+            (target_fg_rms / denom_fg_rms).clamp(1.0, 1.41421356),
+            torch.ones_like(target_fg_rms),
+        )
+        norm_fg = torch.where(
+            accum_weight > 1e-6, linear_fg * cov_fg_gain, canvas_work
+        )
+    else:
+        norm_fg = torch.where(
+            accum_weight > 1e-6, linear_fg, canvas_work
+        )
 
     if has_base_canvas:
         lin_comp = (
@@ -931,8 +974,15 @@ def splat_box_latents_to_canvas(
             torch.mean(lin_comp * lin_comp, dim=1, keepdim=True) + 1e-12
         )
         denom_comp_rms = torch.maximum(s2_comp_rms, lin_comp_rms).clamp(min=1e-6)
+        in_feather_band = (
+            (union_alpha_work > 1e-5)
+            & (union_alpha_work < 1.0 - 1e-5)
+            & (bg_rms_final > 1e-5)
+            & (fg_rms_final > 1e-5)
+            & (accum_weight > 1e-5)
+        )
         cov_comp_gain = torch.where(
-            (bg_rms_final > 1e-5) & (fg_rms_final > 1e-5) & (accum_weight > 1e-5),
+            in_feather_band,
             (s1_comp / denom_comp_rms).clamp(1.0, 1.41421356),
             torch.ones_like(s1_comp),
         )
@@ -1072,7 +1122,6 @@ def couple_splat_velocity_prior(
     )
     psi = 0.5 * (1.0 - torch.cos(math.pi * tau))
     g_max = (1.0 - 0.38 * sigma_hand).clamp(0.35, 1.0)
-
     alpha_f32 = splat_union_alpha.to(dtype=torch.float32).clamp(0.0, 1.0)
     t_floor = (alpha_f32 / 1e-4).clamp(0.0, 1.0)
     floor_gate = t_floor * t_floor * (3.0 - 2.0 * t_floor)
@@ -1088,6 +1137,7 @@ def couple_splat_velocity_prior(
     sigma_eff = max(s_val, _CFL_SIGMA_FLOOR, _CFL_STEP_MULTIPLIER * dt_abs)
     lat_f32 = latents.float()
     splat_f32 = splat_canvas.float()
+
     if noise is not None and noise.shape == lat_f32.shape:
         noise_f32 = noise.float()
         z_bridge = (1.0 - s_val) * splat_f32 + s_val * noise_f32
@@ -1282,7 +1332,6 @@ def pack_vision_patches_32px(
             w_vis -= 32
         else:
             h_vis -= 32
-
     chw = _linear_resample_srgb_chw(srgb_chw, h_vis, w_vis)[0]
     grid_h = h_vis // 16
     grid_w = w_vis // 16
