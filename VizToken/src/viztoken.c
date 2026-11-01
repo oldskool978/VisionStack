@@ -43,13 +43,11 @@
 
 #define DEFAULT_TOTAL_VOCAB_SIZE QWEN35_TOTAL_VOCAB_SIZE
 #define DEFAULT_QWEN35_EOT_TOKEN_ID QWEN35_EOT_TOKEN_ID
-
 #define INF_RANK 0xFFFFFFFFU
 #define SLOT_NONE 0xFFFFFFFFU
 #define SLOT_SPECIAL_BIT 0x80000000U
 #define SSO_MAX_LEN 16U
 #define CTRL_EMPTY 0x80
-
 #define FLAT_MERGE_MAX_LEN 64U
 #define TLS_HEAP_MAX_LEN 2048U
 #define BPE_CACHE_SLOTS 2048U
@@ -411,7 +409,6 @@ static int viztok_mmap_open(viztok_mmap_t *vm, const char *path) {
     vm->ctrl = (const uint8_t *)(vm->base_addr + hdr->ctrl_offset);
     vm->slots = (const viztok_slot_t *)(vm->base_addr + hdr->slots_offset);
     vm->string_data = (const uint8_t *)(vm->base_addr + hdr->string_data_offset);
-
     if (hdr->regex_offset > 0 && hdr->regex_bytes > 0) {
         vm->regex_pattern = (const char *)(vm->base_addr + hdr->regex_offset);
         vm->regex_bytes = hdr->regex_bytes;
@@ -540,7 +537,7 @@ static const int8_t b64_table[256] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
     52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
     -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,18,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
     -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
     41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -560,7 +557,7 @@ static uint32_t b64_decode(const char *in, uint32_t in_len, uint8_t *out) {
     for (uint32_t i = 0; i < in_len; i++) {
         uint8_t c = (uint8_t)in[i];
         if (c == '=') break;
-        int8_t d = (c == 'R') ? 17 : b64_table[c];
+        int8_t d = b64_table[c];
         if (d < 0) continue;
         buf = (buf << 6) | (uint32_t)d;
         bits += 6;
@@ -649,6 +646,7 @@ static uint32_t populate_default_qwen35_specials(viztoken_special_disk_t *out_sp
     EMIT_SPEC35("<tts_text_eod>",        QWEN35_TTS_TEXT_EOD_ID);
     EMIT_SPEC35("<tts_text_bos_single>", QWEN35_TTS_TEXT_BOS_SINGLE_ID);
     EMIT_SPEC35("<|audio_pad|>",         QWEN35_AUDIO_PAD_ID);
+
     #undef EMIT_SPEC35
     return n;
 }
@@ -664,13 +662,13 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
     viztoken_telemetry_t *out_telemetry
 ) {
     clock_t t0 = clock();
-
 #if defined(_WIN32)
     FILE *f_in = open_file_utf8(in_tiktoken_path, L"rb");
 #else
     FILE *f_in = open_file_utf8(in_tiktoken_path, "rb");
 #endif
     if (!f_in) return -1;
+
     fseek(f_in, 0, SEEK_END);
     long f_size = ftell(f_in);
     fseek(f_in, 0, SEEK_SET);
@@ -692,6 +690,7 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
     uint8_t **tokens = (uint8_t **)malloc(sizeof(uint8_t *) * capacity_records);
     uint32_t *lengths = (uint32_t *)malloc(sizeof(uint32_t) * capacity_records);
     uint32_t *ranks = (uint32_t *)malloc(sizeof(uint32_t) * capacity_records);
+
     uint32_t count = 0;
     uint32_t max_len = 0;
     uint64_t total_heap_str_bytes = 0;
@@ -715,9 +714,10 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
         while (*cursor && *cursor != '\r' && *cursor != '\n') {
             cursor++;
         }
-        uint32_t rank = (uint32_t)strtoul(rank_str, NULL, 10);
 
+        uint32_t rank = (uint32_t)strtoul(rank_str, NULL, 10);
         uint32_t dec_len = b64_decode(token_b64, b64_len, decode_scratch);
+
         uint8_t *allocated = (uint8_t *)malloc(dec_len);
         memcpy(allocated, decode_scratch, dec_len);
 
@@ -753,8 +753,8 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
 
     viztok_slot_t *slots = (viztok_slot_t *)calloc(table_capacity, sizeof(viztok_slot_t));
     uint8_t *str_blob = total_heap_str_bytes > 0 ? (uint8_t *)malloc((size_t)total_heap_str_bytes) : NULL;
-    uint32_t current_heap_offset = 0;
 
+    uint32_t current_heap_offset = 0;
     uint32_t max_probe_groups = 0;
     uint64_t sum_probe_groups = 0;
     uint32_t *item_probes = (uint32_t *)malloc(sizeof(uint32_t) * count);
@@ -778,16 +778,17 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
         local_specials = (viztoken_special_disk_t *)malloc(sizeof(viztoken_special_disk_t) * specials_count);
         memcpy(local_specials, specials, sizeof(viztoken_special_disk_t) * specials_count);
     }
+
     for (uint32_t i = 0; i < effective_specials_count; i++) {
         if ((uint32_t)local_specials[i].id > max_seen_id) {
             max_seen_id = (uint32_t)local_specials[i].id;
         }
     }
-
     uint32_t total_vocab_calc = max_seen_id + 1;
     if (total_vocab_calc < DEFAULT_TOTAL_VOCAB_SIZE) {
         total_vocab_calc = DEFAULT_TOTAL_VOCAB_SIZE;
     }
+
     uint32_t *pre_id_to_slot = (uint32_t *)malloc((size_t)total_vocab_calc * sizeof(uint32_t));
     for (uint32_t i = 0; i < total_vocab_calc; i++) pre_id_to_slot[i] = SLOT_NONE;
 
@@ -919,7 +920,6 @@ VIZTOKEN_API int32_t viztoken_compile_vocab_v5(
 
     char tmp_bin_path[2048];
     snprintf(tmp_bin_path, sizeof(tmp_bin_path), "%s.tmp", out_bin_path);
-
 #if defined(_WIN32)
     FILE *f_out = open_file_utf8(tmp_bin_path, L"wb");
 #else
@@ -1088,8 +1088,8 @@ static viztok_regex_t *viztok_regex_init(const char *pattern) {
     int errcode = 0;
     PCRE2_SIZE erroffset = 0;
     uint32_t options = PCRE2_UTF | PCRE2_UCP;
-    const char *actual_pat = (pattern && pattern[0] != '\0') ? pattern : DEFAULT_QWEN35_PATTERN;
 
+    const char *actual_pat = (pattern && pattern[0] != '\0') ? pattern : DEFAULT_QWEN35_PATTERN;
     re->code = pcre2_compile(
         (PCRE2_SPTR)actual_pat,
         PCRE2_ZERO_TERMINATED,
@@ -1309,14 +1309,12 @@ static inline int32_t viztok_bpe_dynamic_heap(
         uint16_t key;
         memcpy(&key, piece + i, 2);
         uint32_t r = ctx->pair_ranks_2byte[key];
-
         nodes[i].byte_len = 1;
         nodes[i].prev = (int32_t)i - 1;
         nodes[i].next = (int32_t)(i + 1);
         nodes[i].pair_rank = r;
         nodes[i].token_id = ctx->byte_ranks[piece[i]];
         nodes[i].gen = 0;
-
         if (r != INF_RANK) {
             heap_push(heap, &heap_size, r, (int32_t)i, 0);
         }
@@ -1344,7 +1342,6 @@ static inline int32_t viztok_bpe_dynamic_heap(
         if (nodes[r].next >= 0) {
             nodes[nodes[r].next].prev = l;
         }
-
         nodes[l].gen++;
         nodes[r].gen++;
         nodes[r].pair_rank = INF_RANK;
@@ -1395,7 +1392,6 @@ static inline int32_t viztok_bpe_encode_chunk(
         out_ids[0] = (int32_t)ctx->byte_ranks[piece[0]];
         return 1;
     }
-
     if (len == 2) {
         uint16_t key;
         memcpy(&key, piece, 2);
@@ -1414,7 +1410,6 @@ static inline int32_t viztok_bpe_encode_chunk(
 
     if (len <= FLAT_MERGE_MAX_LEN) {
         uint64_t h = viztok_hash64(piece, len);
-
         if (len <= 24 && len <= ctx->vm.max_token_len) {
             uint32_t whole_rank = INF_RANK;
             if (viztok_swiss_lookup_with_hash(&ctx->vm, piece, len, h, &whole_rank)) {
@@ -1426,7 +1421,6 @@ static inline int32_t viztok_bpe_encode_chunk(
         uint32_t c_idx = (uint32_t)((h >> 32) & (BPE_CACHE_SLOTS - 1U));
         bpe_cache_slot_t *c_slot = &tls_bpe_cache[c_idx];
         uint64_t uid = ctx->regex->uid;
-
         if (c_slot->hash == h &&
             c_slot->ctx_uid == uid &&
             c_slot->byte_len == (uint16_t)len &&
@@ -1438,7 +1432,6 @@ static inline int32_t viztok_bpe_encode_chunk(
         }
 
         int32_t emitted = viztok_bpe_flat_merge(ctx, piece, len, out_ids, max_out);
-
         if (emitted > 0 && (uint32_t)emitted <= BPE_CACHE_MAX_TOKENS && max_out >= len) {
             c_slot->hash = h;
             c_slot->ctx_uid = uid;
@@ -1486,13 +1479,11 @@ static int viztok_hybrid_split_and_encode(
     while (start_offset < (PCRE2_SIZE)text_len && st->count < st->max_tokens) {
         if (fast_ascii) {
             uint8_t c0 = utf8_text[start_offset];
-
             if (is_ascii_digit(c0)) {
                 st->out_ids[st->count++] = (int32_t)ctx->byte_ranks[c0];
                 start_offset++;
                 continue;
             }
-
             if (is_ascii_alpha(c0) ||
                 (c0 < 0x80U && c0 != '\r' && c0 != '\n' && c0 != '\'' && !is_ascii_digit(c0) &&
                  start_offset + 1 < (PCRE2_SIZE)text_len && is_ascii_alpha(utf8_text[start_offset + 1]))) {
@@ -1514,7 +1505,6 @@ static int viztok_hybrid_split_and_encode(
                     continue;
                 }
             }
-
             if ((is_ascii_punct(c0) && c0 != '\'' &&
                  (start_offset + 1 == (PCRE2_SIZE)text_len ||
                   (utf8_text[start_offset + 1] < 0x80U && !is_ascii_alpha(utf8_text[start_offset + 1])))) ||
@@ -1681,7 +1671,6 @@ VIZTOKEN_API uint32_t viztoken_find_common_prefix(
         i += 8;
     }
 #endif
-
 #if defined(VIZTOK_HAS_SSE2)
     while (i + 4 <= limit) {
         __m128i va = _mm_loadu_si128((const __m128i *)(tokens_a + i));
@@ -1694,7 +1683,6 @@ VIZTOKEN_API uint32_t viztoken_find_common_prefix(
         i += 4;
     }
 #endif
-
     while (i < limit) {
         if (tokens_a[i] != tokens_b[i]) {
             return i;
@@ -1950,6 +1938,7 @@ VIZTOKEN_API int32_t viztoken_decode(
     if (out_text && max_bytes > 0) {
         out_text[written] = '\0';
     }
+
     return (int32_t)total_needed;
 }
 

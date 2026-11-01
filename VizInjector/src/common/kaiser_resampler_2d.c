@@ -94,6 +94,7 @@ void viz_solve_coupled_grid(
 
     uint32_t vae_w = 1024u;
     uint32_t vae_h = 1024u;
+
     if (framing == VIZ_FRAMING_NEVER_CROP) {
         uint64_t target_area = (req_w > 0u && req_h > 0u)
             ? ((uint64_t)req_w * (uint64_t)req_h)
@@ -216,11 +217,13 @@ static int build_polyphase_schedule_1d_f64(
     for (uint32_t d = 0; d < out_dim; ++d) {
         double d_center = (double)d + 0.5;
         float *w_row = weights + (size_t)d * max_taps;
+
         if (d_center < out_offset || d_center > (out_offset + active_out_span)) {
             start_idx[d] = 0;
             src_center[d] = -1.0f;
             continue;
         }
+
         double s_center = in_offset + (d_center - out_offset) * delta - 0.5;
         src_center[d] = (float)s_center;
 
@@ -244,6 +247,7 @@ static int build_polyphase_schedule_1d_f64(
             int32_t s = ideal_start + (int32_t)t;
             double dist = (double)s - s_center;
             if (fabs(dist) >= support) continue;
+
             double w = 0.0;
             if (delta >= 1.0) {
                 double ratio = dist / support;
@@ -262,12 +266,15 @@ static int build_polyphase_schedule_1d_f64(
             } else {
                 w = mitchell_netravali(dist);
             }
+
             int32_t eff_s = s;
             if (eff_s < 0) eff_s = 0;
             if (eff_s >= (int32_t)in_dim) eff_s = (int32_t)in_dim - 1;
+
             int32_t slot = eff_s - clamped_start;
             if (slot < 0) slot = 0;
             if (slot >= (int32_t)max_taps) slot = (int32_t)max_taps - 1;
+
             accum[slot] += w;
             w_sum += w;
         }
@@ -497,10 +504,12 @@ int viz_resample_2d_linear_rgba(
     if (!src_linear_rgba || !out_linear_rgba || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) {
         return -1;
     }
+
     VizPolyphaseSchedule1D sx, sy;
     if (viz_build_coupled_schedules_2d(src_w, src_h, dst_w, dst_h, framing, mtf_boost, &sx, &sy) != 0) {
         return -2;
     }
+
     if (sx.is_identity && sy.is_identity) {
         memcpy(out_linear_rgba, src_linear_rgba, (size_t)dst_w * (size_t)dst_h * 4u * sizeof(float));
         viz_free_polyphase_schedule_1d(&sx);
@@ -535,6 +544,7 @@ int viz_resample_2d_linear_rgba(
         for (uint32_t y = 0; y < src_h; ++y) {
             const float *src_row = src_linear_rgba + (size_t)y * (size_t)src_w * 4u;
             float *tmp_row = tmp + (size_t)y * (size_t)dst_w * 4u;
+
             for (uint32_t dx = 0; dx < dst_w; ++dx) {
                 float sc = sx.src_center[dx];
                 float *dst_px = tmp_row + (size_t)dx * 4u;
@@ -542,6 +552,7 @@ int viz_resample_2d_linear_rgba(
                     _mm_storeu_ps(dst_px, _mm_setzero_ps());
                     continue;
                 }
+
                 int32_t s0 = sx.start_idx[dx];
                 const float *w = sx.weights + (size_t)dx * taps_x;
                 __m128 v_acc;
@@ -553,6 +564,7 @@ int viz_resample_2d_linear_rgba(
                     __m256 acc1 = _mm256_setzero_ps();
                     __m256 raw0 = _mm256_setzero_ps();
                     __m256 raw1 = _mm256_setzero_ps();
+
                     for (uint32_t k = 0; k < taps_x; k += 4u) {
                         __m256 p01 = _mm256_loadu_ps(s_ptr + (size_t)k * 4u);
                         __m256 p23 = _mm256_loadu_ps(s_ptr + (size_t)(k + 2u) * 4u);
@@ -564,6 +576,7 @@ int viz_resample_2d_linear_rgba(
                         __m256 wa23 = _mm256_mul_ps(wk23, a23);
                         __m256 u01 = _mm256_blend_ps(p01, v_one256, 0x88);
                         __m256 u23 = _mm256_blend_ps(p23, v_one256, 0x88);
+
                         acc0 = _mm256_fmadd_ps(u01, wa01, acc0);
                         acc1 = _mm256_fmadd_ps(u23, wa23, acc1);
                         raw0 = _mm256_fmadd_ps(p01, wk01, raw0);
@@ -580,11 +593,13 @@ int viz_resample_2d_linear_rgba(
                         int32_t sx_idx = s0 + (int32_t)k;
                         if (sx_idx < 0) sx_idx = 0;
                         if (sx_idx >= (int32_t)src_w) sx_idx = (int32_t)src_w - 1;
+
                         __m128 p = _mm_loadu_ps(src_row + (size_t)sx_idx * 4u);
                         __m128 wk = _mm_set1_ps(w[k]);
                         __m128 a_bcast = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 3, 3, 3));
                         __m128 wa = _mm_mul_ps(wk, a_bcast);
                         __m128 p_unit_a = _mm_blend_ps(p, v_one128, 0x8);
+
                         v_acc = _mm_fmadd_ps(p_unit_a, wa, v_acc);
                         v_raw = _mm_fmadd_ps(p, wk, v_raw);
                     }
@@ -596,8 +611,10 @@ int viz_resample_2d_linear_rgba(
                 if (n0 >= (int32_t)src_w) n0 = (int32_t)src_w - 1;
                 if (n1 < 0) n1 = 0;
                 if (n1 >= (int32_t)src_w) n1 = (int32_t)src_w - 1;
+
                 __m128 p0 = _mm_loadu_ps(src_row + (size_t)n0 * 4u);
                 __m128 p1 = _mm_loadu_ps(src_row + (size_t)n1 * 4u);
+
                 _mm_storeu_ps(dst_px, finalize_rgba_128(v_acc, v_raw, p0, p1, v_tau128));
             }
         }
@@ -613,6 +630,7 @@ int viz_resample_2d_linear_rgba(
     }
 
     const float *tap_rows[64];
+
     for (uint32_t dy = 0; dy < dst_h; ++dy) {
         float sc = sy.src_center[dy];
         float *dst_row = out_linear_rgba + (size_t)dy * (size_t)dst_w * 4u;
@@ -620,6 +638,7 @@ int viz_resample_2d_linear_rgba(
             memset(dst_row, 0, (size_t)dst_w * 4u * sizeof(float));
             continue;
         }
+
         if (active_dx_start > 0u) {
             memset(dst_row, 0, (size_t)active_dx_start * 4u * sizeof(float));
         }
@@ -642,6 +661,7 @@ int viz_resample_2d_linear_rgba(
         if (n0 >= (int32_t)src_h) n0 = (int32_t)src_h - 1;
         if (n1 < 0) n1 = 0;
         if (n1 >= (int32_t)src_h) n1 = (int32_t)src_h - 1;
+
         const float *row_n0 = tmp + (size_t)n0 * (size_t)dst_w * 4u;
         const float *row_n1 = tmp + (size_t)n1 * (size_t)dst_w * 4u;
 
@@ -649,6 +669,7 @@ int viz_resample_2d_linear_rgba(
         for (; dx + 4u <= active_dx_end; dx += 4u) {
             size_t off0 = (size_t)dx * 4u;
             size_t off1 = off0 + 8u;
+
             __m256 acc0 = _mm256_setzero_ps();
             __m256 acc1 = _mm256_setzero_ps();
             __m256 raw0 = _mm256_setzero_ps();
@@ -665,6 +686,7 @@ int viz_resample_2d_linear_rgba(
                 __m256 wa1 = _mm256_mul_ps(wk, a1);
                 __m256 u0 = _mm256_blend_ps(p0, v_one256, 0x88);
                 __m256 u1 = _mm256_blend_ps(p1, v_one256, 0x88);
+
                 acc0 = _mm256_fmadd_ps(u0, wa0, acc0);
                 acc1 = _mm256_fmadd_ps(u1, wa1, acc1);
                 raw0 = _mm256_fmadd_ps(p0, wk, raw0);
@@ -675,6 +697,7 @@ int viz_resample_2d_linear_rgba(
             __m256 p1_0 = _mm256_loadu_ps(row_n1 + off0);
             __m256 p0_1 = _mm256_loadu_ps(row_n0 + off1);
             __m256 p1_1 = _mm256_loadu_ps(row_n1 + off1);
+
             _mm256_storeu_ps(dst_row + off0, finalize_rgba_256(acc0, raw0, p0_0, p1_0, v_tau256));
             _mm256_storeu_ps(dst_row + off1, finalize_rgba_256(acc1, raw1, p0_1, p1_1, v_tau256));
         }
@@ -685,6 +708,7 @@ int viz_resample_2d_linear_rgba(
                 _mm_storeu_ps(dst_row + off, _mm_setzero_ps());
                 continue;
             }
+
             __m128 v_acc = _mm_setzero_ps();
             __m128 v_raw = _mm_setzero_ps();
             for (uint32_t k = 0; k < taps_y; ++k) {
@@ -693,9 +717,11 @@ int viz_resample_2d_linear_rgba(
                 __m128 a_bcast = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 3, 3, 3));
                 __m128 wa = _mm_mul_ps(wk, a_bcast);
                 __m128 p_unit_a = _mm_blend_ps(p, v_one128, 0x8);
+
                 v_acc = _mm_fmadd_ps(p_unit_a, wa, v_acc);
                 v_raw = _mm_fmadd_ps(p, wk, v_raw);
             }
+
             __m128 p0 = _mm_loadu_ps(row_n0 + off);
             __m128 p1 = _mm_loadu_ps(row_n1 + off);
             _mm_storeu_ps(dst_row + off, finalize_rgba_128(v_acc, v_raw, p0, p1, v_tau128));
@@ -733,6 +759,9 @@ void viz_resample_majority_color_map_rgba8(
         &scale_x, &scale_y, &in_off_x, &in_off_y, &out_off_x, &out_off_y, &span_x, &span_y
     );
 
+    const double half_foot_y = 0.5 * fmax(1.0, scale_y);
+    const double half_foot_x = 0.5 * fmax(1.0, scale_x);
+
     for (uint32_t dy = 0; dy < dst_h; ++dy) {
         double dy_center = (double)dy + 0.5;
         if (dy_center < out_off_y || dy_center > (out_off_y + span_y)) {
@@ -745,14 +774,12 @@ void viz_resample_majority_color_map_rgba8(
             continue;
         }
 
-        double sy_lo = in_off_y + ((double)dy - out_off_y) * scale_y;
-        double sy_hi = in_off_y + ((double)(dy + 1u) - out_off_y) * scale_y;
+        double sy_center = in_off_y + (dy_center - out_off_y) * scale_y;
+        double sy_lo = sy_center - half_foot_y;
+        double sy_hi = sy_center + half_foot_y;
         int y0 = (int)floor(sy_lo);
         int y1 = (int)ceil(sy_hi);
-        if (y0 < 0) y0 = 0;
-        if (y0 >= (int)src_h) y0 = (int)src_h - 1;
         if (y1 <= y0) y1 = y0 + 1;
-        if (y1 > (int)src_h) y1 = (int)src_h;
 
         for (uint32_t dx = 0; dx < dst_w; ++dx) {
             size_t idx = (size_t)dy * dst_w + dx;
@@ -764,22 +791,33 @@ void viz_resample_majority_color_map_rgba8(
                 continue;
             }
 
-            double sx_lo = in_off_x + ((double)dx - out_off_x) * scale_x;
-            double sx_hi = in_off_x + ((double)(dx + 1u) - out_off_x) * scale_x;
+            double sx_center = in_off_x + (dx_center - out_off_x) * scale_x;
+            double sx_lo = sx_center - half_foot_x;
+            double sx_hi = sx_center + half_foot_x;
             int x0 = (int)floor(sx_lo);
             int x1 = (int)ceil(sx_hi);
-            if (x0 < 0) x0 = 0;
-            if (x0 >= (int)src_w) x0 = (int)src_w - 1;
             if (x1 <= x0) x1 = x0 + 1;
-            if (x1 > (int)src_w) x1 = (int)src_w;
 
-            uint32_t cand_rgb[16];
-            uint32_t cand_cnt[16];
+            uint32_t cand_rgb[32];
+            double cand_w[32];
+            double cand_dist2[32];
             int n_cand = 0;
 
             for (int sy = y0; sy < y1; ++sy) {
+                double ov_y = fmin(sy_hi, (double)(sy + 1)) - fmax(sy_lo, (double)sy);
+                if (ov_y <= 0.0) continue;
+                int csy = sy < 0 ? 0 : (sy >= (int)src_h ? (int)src_h - 1 : sy);
+                double dy_c = ((double)csy + 0.5) - sy_center;
+
                 for (int sx = x0; sx < x1; ++sx) {
-                    const uint8_t *p = src_rgba8 + ((size_t)sy * src_w + (size_t)sx) * 4u;
+                    double ov_x = fmin(sx_hi, (double)(sx + 1)) - fmax(sx_lo, (double)sx);
+                    if (ov_x <= 0.0) continue;
+                    int csx = sx < 0 ? 0 : (sx >= (int)src_w ? (int)src_w - 1 : sx);
+                    double dx_c = ((double)csx + 0.5) - sx_center;
+                    double w_area = ov_x * ov_y;
+                    double dist2 = dx_c * dx_c + dy_c * dy_c;
+
+                    const uint8_t *p = src_rgba8 + ((size_t)csy * src_w + (size_t)csx) * 4u;
                     uint32_t packed = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
                     int found = -1;
                     for (int c = 0; c < n_cand; ++c) {
@@ -789,21 +827,31 @@ void viz_resample_majority_color_map_rgba8(
                         }
                     }
                     if (found >= 0) {
-                        cand_cnt[found]++;
-                    } else if (n_cand < 16) {
+                        cand_w[found] += w_area;
+                        if (dist2 < cand_dist2[found]) {
+                            cand_dist2[found] = dist2;
+                        }
+                    } else if (n_cand < 32) {
                         cand_rgb[n_cand] = packed;
-                        cand_cnt[n_cand] = 1u;
+                        cand_w[n_cand] = w_area;
+                        cand_dist2[n_cand] = dist2;
                         n_cand++;
                     }
                 }
             }
 
-            uint32_t best_packed = cand_rgb[0];
-            uint32_t best_count = cand_cnt[0];
-            for (int c = 1; c < n_cand; ++c) {
-                if (cand_cnt[c] > best_count) {
-                    best_count = cand_cnt[c];
-                    best_packed = cand_rgb[c];
+            uint32_t best_packed = 0u;
+            if (n_cand > 0) {
+                best_packed = cand_rgb[0];
+                double best_w = cand_w[0];
+                double best_dist2 = cand_dist2[0];
+                for (int c = 1; c < n_cand; ++c) {
+                    if (cand_w[c] > best_w + 1e-9 ||
+                        (fabs(cand_w[c] - best_w) <= 1e-9 && cand_dist2[c] < best_dist2)) {
+                        best_w = cand_w[c];
+                        best_dist2 = cand_dist2[c];
+                        best_packed = cand_rgb[c];
+                    }
                 }
             }
 

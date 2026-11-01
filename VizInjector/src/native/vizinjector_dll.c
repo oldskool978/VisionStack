@@ -116,19 +116,22 @@ VIZINJECTOR_API int32_t vizinjector_process_rgbaf32(
 ) {
     if (!rgbaf32 || width == 0u || height == 0u || !out_result) return -1;
     size_t needed = (size_t)width * (size_t)height * 4u;
-    int32_t role = cfg ? cfg->input_role : VIZ_ROLE_PHOTO_REF;
+    float *lin_buf = acquire_dll_tls_f32(needed);
+    if (!lin_buf) return -2;
 
-    if (role == VIZ_ROLE_DEPTH_MAP || role == VIZ_ROLE_INPAINT_MASK || input_is_linear == 1) {
-        float *lin_buf = acquire_dll_tls_f32(needed);
-        if (!lin_buf) return -2;
+    int32_t role = cfg ? cfg->input_role : VIZ_ROLE_PHOTO_REF;
+    if (role == VIZ_ROLE_DEPTH_MAP || role == VIZ_ROLE_INPAINT_MASK) {
         clamp_f32_01_avx2(rgbaf32, needed, lin_buf);
         return vizinjector_core_process_linear_f32(lin_buf, width, height, cfg, out_result);
     }
 
-    float *lin_buf = acquire_dll_tls_f32(needed);
-    if (!lin_buf) return -2;
-    int aces_hdr = (input_is_linear >= 2) ? 1 : 0;
-    viz_ingest_rgbaf32_to_linear_f32(rgbaf32, width, height, aces_hdr, lin_buf);
+    int lin_mode = 0;
+    if (input_is_linear == 1) {
+        lin_mode = 2;
+    } else if (input_is_linear >= 2) {
+        lin_mode = 1;
+    }
+    viz_ingest_rgbaf32_to_linear_f32(rgbaf32, width, height, lin_mode, lin_buf);
     return vizinjector_core_process_linear_f32(lin_buf, width, height, cfg, out_result);
 }
 

@@ -119,16 +119,20 @@ static inline __m256 viz_srgb_to_lin_avx2(__m256 v_srgb, const float *lut) {
     __m256 v_valid = _mm256_cmp_ps(v_srgb, v_zero, _CMP_GT_OQ);
     __m256 v_pos = _mm256_and_ps(v_srgb, v_valid);
     __m256 v_clamped = _mm256_min_ps(v_one, v_pos);
+
     __m256 v_toe_thresh = _mm256_set1_ps(0.04045f);
     __m256 v_toe = _mm256_mul_ps(v_clamped, _mm256_set1_ps(1.0f / 12.92f));
+
     __m256 v_scaled = _mm256_mul_ps(v_clamped, _mm256_set1_ps((float)VIZ_SRGB_INTERP_LUT_SCALE));
     __m256i v_idx = _mm256_cvttps_epi32(v_scaled);
     __m256 v_idx_f = _mm256_cvtepi32_ps(v_idx);
     __m256 v_frac = _mm256_sub_ps(v_scaled, v_idx_f);
     __m256i v_idx1 = _mm256_add_epi32(v_idx, _mm256_set1_epi32(1));
+
     __m256 v_y0 = _mm256_i32gather_ps(lut, v_idx, 4);
     __m256 v_y1 = _mm256_i32gather_ps(lut, v_idx1, 4);
     __m256 v_lut_val = _mm256_fmadd_ps(v_frac, _mm256_sub_ps(v_y1, v_y0), v_y0);
+
     __m256 v_is_toe = _mm256_cmp_ps(v_clamped, v_toe_thresh, _CMP_LE_OQ);
     return _mm256_blendv_ps(v_lut_val, v_toe, v_is_toe);
 }
@@ -256,7 +260,6 @@ static inline void ingest_pixel_scalar(
         float sum_g = 0.0f;
         float sum_b = 0.0f;
         float sum_w = 0.0f;
-
         int ix = (int)x;
         int iy = (int)y;
         int max_x = (int)width - 1;
@@ -291,6 +294,7 @@ static inline void ingest_pixel_scalar(
             int oy1 = (iy + 8 <= max_y) ? (iy + 8) : max_y;
             int ox0 = (ix >= 8) ? (ix - 8) : 0;
             int ox1 = (ix + 8 <= max_x) ? (ix + 8) : max_x;
+
             for (int ny = oy0; ny <= oy1; ++ny) {
                 int dy = ny - iy;
                 int ady = dy < 0 ? -dy : dy;
@@ -429,7 +433,6 @@ void viz_ingest_rgba8_to_linear_f32(
 
                     __m256 diff_r = _mm256_blend_ps(_mm256_sub_ps(vf_p, vf_r), _mm256_setzero_ps(), 0x88);
                     __m256 diff_b = _mm256_blend_ps(_mm256_sub_ps(vf_p, vf_b), _mm256_setzero_ps(), 0x88);
-
                     __m256 sq_r = _mm256_mul_ps(diff_r, diff_r);
                     __m256 sq_b = _mm256_mul_ps(diff_b, diff_b);
 
@@ -456,7 +459,6 @@ void viz_ingest_rgba8_to_linear_f32(
 
                     __m256 lut_exact = _mm256_i32gather_ps(g_srgb_u8_to_lin_lut, idx_p, 4);
                     __m256 has_gate = _mm256_cmp_ps(gate, _mm256_setzero_ps(), _CMP_GT_OQ);
-
                     if (_mm256_movemask_ps(has_gate) != 0) {
                         __m256 dither = hash_tpdf_dither_2px_avx2(x, y, seed);
                         __m256 s_dithered = _mm256_fmadd_ps(dither, gate, vf_p);
@@ -498,7 +500,6 @@ static inline void ingest_pixel_rgba16_scalar(
         float sum_g = 0.0f;
         float sum_b = 0.0f;
         float sum_w = 0.0f;
-
         int ix = (int)x;
         int iy = (int)y;
         int max_x = (int)width - 1;
@@ -533,6 +534,7 @@ static inline void ingest_pixel_rgba16_scalar(
             int oy1 = (iy + 8 <= max_y) ? (iy + 8) : max_y;
             int ox0 = (ix >= 8) ? (ix - 8) : 0;
             int ox1 = (ix + 8 <= max_x) ? (ix + 8) : max_x;
+
             for (int ny = oy0; ny <= oy1; ++ny) {
                 int dy = ny - iy;
                 int ady = dy < 0 ? -dy : dy;
@@ -622,6 +624,21 @@ static inline float aces_tonemap_channel(float x) {
     return (mapped > 1.0f) ? 1.0f : mapped;
 }
 
+static inline float clamp_unit_channel(float x) {
+    if (!(x > 0.0f)) return 0.0f;
+    return (x > 1.0f) ? 1.0f : x;
+}
+
+static inline float convert_f32_channel_to_linear(float x, int input_is_linear) {
+    if (input_is_linear == 0) {
+        return viz_srgb_to_linear_f32(x);
+    }
+    if (input_is_linear == 1) {
+        return aces_tonemap_channel(x);
+    }
+    return clamp_unit_channel(x);
+}
+
 static inline __m256 aces_tonemap_avx2(__m256 x) {
     __m256 v_zero = _mm256_setzero_ps();
     __m256 v_one = _mm256_set1_ps(1.0f);
@@ -638,6 +655,105 @@ static inline __m256 aces_tonemap_avx2(__m256 x) {
     return _mm256_min_ps(v_one, _mm256_div_ps(num, den));
 }
 
+static inline void ingest_pixel_rgbaf32_scalar(
+    const float *src_rgbaf32,
+    const float *row_src,
+    float *row_dst,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    int input_is_linear
+) {
+    const float alpha_thresh = 1.0f / 255.0f;
+    const float *p = row_src + (size_t)x * 4u;
+    float *dst = row_dst + (size_t)x * 4u;
+
+    if (!(p[3] > alpha_thresh)) {
+        float sum_r = 0.0f;
+        float sum_g = 0.0f;
+        float sum_b = 0.0f;
+        float sum_w = 0.0f;
+        int ix = (int)x;
+        int iy = (int)y;
+        int max_x = (int)width - 1;
+        int max_y = (int)height - 1;
+
+        int y0 = (iy >= 2) ? (iy - 2) : 0;
+        int y1 = (iy + 2 <= max_y) ? (iy + 2) : max_y;
+        int x0 = (ix >= 2) ? (ix - 2) : 0;
+        int x1 = (ix + 2 <= max_x) ? (ix + 2) : max_x;
+
+        for (int ny = y0; ny <= y1; ++ny) {
+            int dy = ny - iy;
+            int ady = dy < 0 ? -dy : dy;
+            const float *nrow = src_rgbaf32 + (size_t)ny * (size_t)width * 4u;
+            for (int nx = x0; nx <= x1; ++nx) {
+                const float *np = nrow + (size_t)nx * 4u;
+                if (np[3] > alpha_thresh) {
+                    int dx = nx - ix;
+                    int dist = (dx < 0 ? -dx : dx) + ady;
+                    if (dist < 1) dist = 1;
+                    float np_a = (np[3] > 1.0f) ? 1.0f : np[3];
+                    float w = np_a / (float)dist;
+                    sum_r += convert_f32_channel_to_linear(np[0], input_is_linear) * w;
+                    sum_g += convert_f32_channel_to_linear(np[1], input_is_linear) * w;
+                    sum_b += convert_f32_channel_to_linear(np[2], input_is_linear) * w;
+                    sum_w += w;
+                }
+            }
+        }
+
+        if (sum_w <= 1e-6f) {
+            int oy0 = (iy >= 8) ? (iy - 8) : 0;
+            int oy1 = (iy + 8 <= max_y) ? (iy + 8) : max_y;
+            int ox0 = (ix >= 8) ? (ix - 8) : 0;
+            int ox1 = (ix + 8 <= max_x) ? (ix + 8) : max_x;
+
+            for (int ny = oy0; ny <= oy1; ++ny) {
+                int dy = ny - iy;
+                int ady = dy < 0 ? -dy : dy;
+                const float *nrow = src_rgbaf32 + (size_t)ny * (size_t)width * 4u;
+                for (int nx = ox0; nx <= ox1; ++nx) {
+                    int dx = nx - ix;
+                    int adx = dx < 0 ? -dx : dx;
+                    if (adx <= 2 && ady <= 2) {
+                        continue;
+                    }
+                    const float *np = nrow + (size_t)nx * 4u;
+                    if (np[3] > alpha_thresh) {
+                        int dist = adx + ady;
+                        float np_a = (np[3] > 1.0f) ? 1.0f : np[3];
+                        float w = np_a / (float)dist;
+                        sum_r += convert_f32_channel_to_linear(np[0], input_is_linear) * w;
+                        sum_g += convert_f32_channel_to_linear(np[1], input_is_linear) * w;
+                        sum_b += convert_f32_channel_to_linear(np[2], input_is_linear) * w;
+                        sum_w += w;
+                    }
+                }
+            }
+        }
+
+        if (sum_w > 1e-6f) {
+            float inv_w = 1.0f / sum_w;
+            dst[0] = sum_r * inv_w;
+            dst[1] = sum_g * inv_w;
+            dst[2] = sum_b * inv_w;
+        } else {
+            dst[0] = 0.0f;
+            dst[1] = 0.0f;
+            dst[2] = 0.0f;
+        }
+        dst[3] = 0.0f;
+        return;
+    }
+
+    dst[0] = convert_f32_channel_to_linear(p[0], input_is_linear);
+    dst[1] = convert_f32_channel_to_linear(p[1], input_is_linear);
+    dst[2] = convert_f32_channel_to_linear(p[2], input_is_linear);
+    dst[3] = clamp_unit_channel(p[3]);
+}
+
 void viz_ingest_rgbaf32_to_linear_f32(
     const float *src_rgbaf32,
     uint32_t width,
@@ -647,49 +763,39 @@ void viz_ingest_rgbaf32_to_linear_f32(
 ) {
     viz_colorspace_init_tables();
     const float *interp_lut = g_srgb_to_lin_interp_lut;
-    const size_t count = (size_t)width * (size_t)height;
+    const float alpha_thresh = 1.0f / 255.0f;
     const __m256 v_zero = _mm256_setzero_ps();
     const __m256 v_one = _mm256_set1_ps(1.0f);
-    size_t i = 0;
 
-    if (input_is_linear) {
-        for (; i + 2u <= count; i += 2u) {
-            __m256 v_in = _mm256_loadu_ps(src_rgbaf32 + i * 4u);
-            __m256 v_rgb = aces_tonemap_avx2(v_in);
-            __m256 v_a_pos = _mm256_and_ps(v_in, _mm256_cmp_ps(v_in, v_zero, _CMP_GT_OQ));
-            __m256 v_a = _mm256_min_ps(v_one, v_a_pos);
-            _mm256_storeu_ps(out_linear_rgba + i * 4u, _mm256_blend_ps(v_rgb, v_a, 0x88));
-        }
-    } else {
-        for (; i + 2u <= count; i += 2u) {
-            __m256 v_in = _mm256_loadu_ps(src_rgbaf32 + i * 4u);
-            __m256 v_rgb = viz_srgb_to_lin_avx2(v_in, interp_lut);
-            __m256 v_a_pos = _mm256_and_ps(v_in, _mm256_cmp_ps(v_in, v_zero, _CMP_GT_OQ));
-            __m256 v_a = _mm256_min_ps(v_one, v_a_pos);
-            _mm256_storeu_ps(out_linear_rgba + i * 4u, _mm256_blend_ps(v_rgb, v_a, 0x88));
-        }
-    }
+    for (uint32_t y = 0; y < height; ++y) {
+        const float *row_src = src_rgbaf32 + (size_t)y * (size_t)width * 4u;
+        float *row_dst = out_linear_rgba + (size_t)y * (size_t)width * 4u;
+        uint32_t x = 0;
 
-    for (; i < count; ++i) {
-        float r = src_rgbaf32[i * 4u + 0u];
-        float g = src_rgbaf32[i * 4u + 1u];
-        float b = src_rgbaf32[i * 4u + 2u];
-        float a = src_rgbaf32[i * 4u + 3u];
-        if (!input_is_linear) {
-            r = viz_srgb_to_linear_f32(r);
-            g = viz_srgb_to_linear_f32(g);
-            b = viz_srgb_to_linear_f32(b);
-        } else {
-            r = aces_tonemap_channel(r);
-            g = aces_tonemap_channel(g);
-            b = aces_tonemap_channel(b);
+        while (x + 2u <= width) {
+            const float *p = row_src + (size_t)x * 4u;
+            if (__builtin_expect(p[3] > alpha_thresh && p[7] > alpha_thresh, 1)) {
+                __m256 v_in = _mm256_loadu_ps(p);
+                __m256 v_pos = _mm256_and_ps(v_in, _mm256_cmp_ps(v_in, v_zero, _CMP_GT_OQ));
+                __m256 v_clamped = _mm256_min_ps(v_one, v_pos);
+                __m256 v_rgb;
+                if (input_is_linear == 0) {
+                    v_rgb = viz_srgb_to_lin_avx2(v_in, interp_lut);
+                } else if (input_is_linear == 1) {
+                    v_rgb = aces_tonemap_avx2(v_in);
+                } else {
+                    v_rgb = v_clamped;
+                }
+                _mm256_storeu_ps(row_dst + (size_t)x * 4u, _mm256_blend_ps(v_rgb, v_clamped, 0x88));
+                x += 2u;
+            } else {
+                ingest_pixel_rgbaf32_scalar(src_rgbaf32, row_src, row_dst, x, y, width, height, input_is_linear);
+                x += 1u;
+            }
         }
-        if (!(a > 0.0f)) a = 0.0f;
-        if (a > 1.0f) a = 1.0f;
-        out_linear_rgba[i * 4u + 0u] = r;
-        out_linear_rgba[i * 4u + 1u] = g;
-        out_linear_rgba[i * 4u + 2u] = b;
-        out_linear_rgba[i * 4u + 3u] = a;
+        for (; x < width; ++x) {
+            ingest_pixel_rgbaf32_scalar(src_rgbaf32, row_src, row_dst, x, y, width, height, input_is_linear);
+        }
     }
 }
 
@@ -716,7 +822,6 @@ int viz_parse_exif_orientation(const uint8_t *bytes, size_t len) {
         if (marker == 0xDA || marker == 0xD9) break;
         uint16_t seg_len = (uint16_t)(((uint16_t)bytes[pos + 2] << 8) | bytes[pos + 3]);
         if (seg_len < 2 || pos + 2 + seg_len > len) break;
-
         if (marker == 0xE1 && seg_len >= 14 && memcmp(bytes + pos + 4, "Exif\0\0", 6) == 0) {
             const uint8_t *tiff = bytes + pos + 10;
             size_t tiff_len = seg_len - 8;
@@ -724,7 +829,6 @@ int viz_parse_exif_orientation(const uint8_t *bytes, size_t len) {
             if (tiff[0] == 'I' && tiff[1] == 'I') le = 1;
             else if (tiff[0] == 'M' && tiff[1] == 'M') le = 0;
             else return 1;
-
             uint32_t ifd_off = read_u32_end(tiff + 4, le);
             if (ifd_off + 2 > tiff_len) return 1;
             uint16_t entries = read_u16_end(tiff + ifd_off, le);
