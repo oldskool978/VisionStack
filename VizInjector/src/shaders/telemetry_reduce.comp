@@ -1,0 +1,91 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InPlanarVae {
+    float vae_rgb[];
+};
+
+layout(std430, set = 0, binding = 1) buffer OutTelemetryBuffer {
+    uint hist_bins[256];
+    vec4 wg_sums[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+shared uint s_hist[256];
+shared float s_luma[18][18];
+shared vec4 s_moments[256];
+
+float fetch_luma_clamped(int x, int y, uint plane) {
+    uint cx = uint(clamp(x, 0, int(pc.width) - 1));
+    uint cy = uint(clamp(y, 0, int(pc.height) - 1));
+    uint idx = cy * pc.width + cx;
+    float r = clamp(vae_rgb[0u * plane + idx] * 0.5 + 0.5, 0.0, 1.0);
+    float g = clamp(vae_rgb[1u * plane + idx] * 0.5 + 0.5, 0.0, 1.0);
+    float b = clamp(vae_rgb[2u * plane + idx] * 0.5 + 0.5, 0.0, 1.0);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+void main() {
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16u + lx;
+
+    s_hist[tid] = 0u;
+
+    uint plane = pc.width * pc.height;
+    int base_x = int(gl_WorkGroupID.x * 16u) - 1;
+    int base_y = int(gl_WorkGroupID.y * 16u) - 1;
+
+    for (uint idx = tid; idx < 324u; idx += 256u) {
+        uint ty = idx / 18u;
+        uint tx = idx - ty * 18u;
+        s_luma[ty][tx] = fetch_luma_clamped(base_x + int(tx), base_y + int(ty), plane);
+    }
+
+    barrier();
+
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    vec4 local_m = vec4(0.0);
+
+    if (x < pc.width && y < pc.height) {
+        float luma = s_luma[ly + 1u][lx + 1u];
+        uint bin = min(255u, uint(roundEven(luma * 255.0)));
+        atomicAdd(s_hist[bin], 1u);
+
+        float lap = 0.0;
+        if (x >= 1u && x + 1u < pc.width && y >= 1u && y + 1u < pc.height) {
+            lap = s_luma[ly][lx + 1u]
+                + s_luma[ly + 2u][lx + 1u]
+                + s_luma[ly + 1u][lx]
+                + s_luma[ly + 1u][lx + 2u]
+                - 4.0 * luma;
+        }
+        local_m = vec4(luma, luma * luma, lap, lap * lap);
+    }
+
+    s_moments[tid] = local_m;
+    barrier();
+
+    uint bin_cnt = s_hist[tid];
+    if (bin_cnt > 0u) {
+        atomicAdd(hist_bins[tid], bin_cnt);
+    }
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_moments[tid] += s_moments[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        wg_sums[wg_id] = s_moments[0];
+    }
+}
