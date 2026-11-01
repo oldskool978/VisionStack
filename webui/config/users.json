@@ -1,0 +1,34 @@
+{
+  "users": {
+    "administrator": {
+      "display_name": "Administrator",
+      "daily_quota": 999,
+      "assigned_theme": "obsidian_gold",
+      "custom_permissions": [
+        "admin",
+        "unlimited_quota"
+      ]
+    },
+    "admin": {
+      "display_name": "Administrator",
+      "daily_quota": 999,
+      "assigned_theme": "obsidian_gold",
+      "custom_permissions": [
+        "admin",
+        "unlimited_quota"
+      ]
+    },
+    "studio": {
+      "display_name": "Studio Creator",
+      "daily_quota": 50,
+      "assigned_theme": "cyber_neon",
+      "custom_permissions": []
+    },
+    "guest": {
+      "display_name": "Guest Explorer",
+      "daily_quota": 10,
+      "assigned_theme": "sky_peace",
+      "custom_permissions": []
+    }
+  }
+}
