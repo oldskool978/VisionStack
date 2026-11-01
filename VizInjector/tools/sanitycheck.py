@@ -7,9 +7,13 @@ import math
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
+import threading
 import time
+from typing import List, Tuple
+import zlib
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BIN_DIR = ROOT_DIR / "bin"
@@ -19,6 +23,7 @@ CACHE_DIR = ROOT_DIR / ".forge_cache"
 IS_WIN = sys.platform == "win32"
 
 HERMETIC_PYTHON_EXE = BIN_DIR / "python" / ("python.exe" if IS_WIN else "bin/python")
+
 if __name__ == "__main__" and "--clean" in sys.argv:
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     shutil.rmtree(DIST_DIR, ignore_errors=True)
@@ -58,6 +63,112 @@ from python import (
 CLI_EXE = DIST_BIN / ("vizinjector-cli.exe" if IS_WIN else "vizinjector-cli")
 DLL_PATH = DIST_BIN / ("vizinjector.dll" if IS_WIN else "libvizinjector.so")
 SPV_HEADER = ROOT_DIR / "src" / "vulkan" / "shaders_spv.h"
+
+
+def _snap_multiple_f64(val: float, mult: int, min_v: int, max_v: int) -> int:
+    raw = math.floor(float(val) / float(mult) + 0.5)
+    if raw < 0.0:
+        raw = 0.0
+    snapped = int(raw) * int(mult)
+    if snapped < min_v:
+        snapped = min_v
+    if snapped > max_v:
+        snapped = (max_v // mult) * mult
+    return int(snapped)
+
+
+def _solve_coupled_grid_f64(
+    src_w: int,
+    src_h: int,
+    req_w: int,
+    req_h: int,
+    max_vit_patches: int,
+    edit_mode_384_vit: bool,
+    framing: str,
+) -> Tuple[int, int, int, int]:
+    sw = src_w if src_w > 0 else 1024
+    sh = src_h if src_h > 0 else 1024
+    src_aspect = float(sw) / float(sh)
+    fm = str(framing or "inscribed").lower()
+    if fm == "cover_crop":
+        fm = "inscribed"
+
+    if fm == "never_crop":
+        target_area = (req_w * req_h) if (req_w > 0 and req_h > 0) else (1024 * 1024)
+        raw_h = math.sqrt(float(target_area) / src_aspect)
+        raw_w = raw_h * src_aspect
+        vae_w = _snap_multiple_f64(raw_w, 16, 64, 2048)
+        vae_h = _snap_multiple_f64(raw_h, 16, 64, 2048)
+    else:
+        vae_w = _snap_multiple_f64(float(req_w if req_w > 0 else sw), 16, 16, 4096)
+        vae_h = _snap_multiple_f64(float(req_h if req_h > 0 else sh), 16, 16, 4096)
+
+    basis_w = vae_w if fm in ("inscribed", "stretch") else sw
+    basis_h = vae_h if fm in ("inscribed", "stretch") else sh
+    basis_aspect = float(basis_w) / float(basis_h)
+
+    if edit_mode_384_vit:
+        if basis_w >= basis_h:
+            vit_w = 384
+            vit_h = _snap_multiple_f64(384.0 / basis_aspect, 32, 64, 384)
+        else:
+            vit_h = 384
+            vit_w = _snap_multiple_f64(384.0 * basis_aspect, 32, 64, 384)
+    else:
+        eff_max_patches = max_vit_patches if max_vit_patches > 0 else 2304
+        max_px = eff_max_patches * 256
+        area_basis = float(basis_w) * float(basis_h)
+        scale = math.sqrt(float(max_px) / area_basis) if area_basis > 0.0 else 1.0
+        vit_w = _snap_multiple_f64(float(basis_w) * scale, 32, 32, 2048)
+        vit_h = _snap_multiple_f64(float(basis_h) * scale, 32, 32, 2048)
+        while (vit_w // 16) * (vit_h // 16) > eff_max_patches and vit_w > 32 and vit_h > 32:
+            if vit_w >= vit_h:
+                vit_w -= 32
+            else:
+                vit_h -= 32
+
+    return vae_w, vae_h, vit_w, vit_h
+
+
+def _encode_png16_rgba_bytes(rgba16: np.ndarray) -> bytes:
+    assert rgba16.ndim == 3 and rgba16.shape[2] == 4 and rgba16.dtype == np.uint16
+    h, w, _ = rgba16.shape
+    be_u16 = np.ascontiguousarray(rgba16, dtype=">u2")
+    raw_rows = bytearray()
+    for y in range(h):
+        raw_rows.append(0)
+        raw_rows.extend(be_u16[y].tobytes())
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 16, 6, 0, 0, 0)
+    idat = zlib.compress(bytes(raw_rows), level=6)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _encode_radiance_hdr_bytes(rgb_f32: np.ndarray) -> bytes:
+    assert rgb_f32.ndim == 3 and rgb_f32.shape[2] == 3
+    h, w, _ = rgb_f32.shape
+    header = f"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {h} +X {w}\n".encode("ascii")
+    rgbe = np.zeros((h, w, 4), dtype=np.uint8)
+    max_c = np.max(rgb_f32, axis=-1)
+    mask = max_c > 1e-32
+    mant, exp = np.frexp(np.where(mask, max_c, 1.0))
+    scale = np.where(mask, (mant * 256.0) / np.maximum(max_c, 1e-32), 0.0)
+    rgbe[..., 0] = np.clip(rgb_f32[..., 0] * scale, 0.0, 255.0).astype(np.uint8)
+    rgbe[..., 1] = np.clip(rgb_f32[..., 1] * scale, 0.0, 255.0).astype(np.uint8)
+    rgbe[..., 2] = np.clip(rgb_f32[..., 2] * scale, 0.0, 255.0).astype(np.uint8)
+    rgbe[..., 3] = np.where(mask, np.clip(exp + 128, 0, 255), 0).astype(np.uint8)
+    if rgbe[0, 0, 0] == 2 and rgbe[0, 0, 1] == 2:
+        rgbe[0, 0, 0] = 3
+    return header + rgbe.tobytes()
 
 
 def audit_gate_1_binaries_and_sysroot() -> VizInjectorClient:
@@ -103,7 +214,7 @@ def audit_gate_1_binaries_and_sysroot() -> VizInjectorClient:
 
 def audit_gate_2_radiometric_math_and_isotropy(client: VizInjectorClient) -> None:
     print(
-        "\n--- Gate 2: Radiometric Kaiser-Sinc, Partition of Unity, De-Ringing & Isotropy Audit ---"
+        "\n--- Gate 2: Radiometric Kaiser-Sinc, Partition of Unity, De-Ringing & High-Bit-Depth/HDR Audit ---"
     )
     rng = np.random.default_rng(42)
     ident_rgb = rng.integers(0, 256, size=(256, 256, 3), dtype=np.uint8)
@@ -206,10 +317,78 @@ def audit_gate_2_radiometric_math_and_isotropy(client: VizInjectorClient) -> Non
         f"  [+] Isotropic Framing Lock   : 900x600 -> 512x512 Circle Anisotropy = {anisotropy:.5f} (<0.01)"
     )
 
+    rgba16 = np.zeros((64, 64, 4), dtype=np.uint16)
+    ramp16 = np.linspace(16384, 49152, 64, dtype=np.uint16)
+    rgba16[:, :, 0] = ramp16[None, :]
+    rgba16[:, :, 1] = ramp16[:, None]
+    rgba16[:, :, 2] = 32768
+    rgba16[:, :, 3] = 65535
+    rgba16[:8, :8, :3] = 0
+    rgba16[:8, :8, 3] = 0
+    png16_bytes = _encode_png16_rgba_bytes(rgba16)
+    b_png16 = client.condition_image(
+        png16_bytes,
+        VizInjectorRequest(
+            target_width=64,
+            target_height=64,
+            deband_8bit=False,
+            mtf_boost=0.0,
+        ),
+    )
+    assert b_png16.vae_tensor is not None and torch.isfinite(b_png16.vae_tensor).all()
+    row_srgb = (b_png16.vae_tensor[0, 0, 32, :].numpy() * 0.5 + 0.5) * 65535.0
+    max_16bit_err = float(np.max(np.abs(row_srgb - ramp16.astype(np.float32))))
+    assert float(b_png16.vae_tensor[0, 1, 2, 2].item()) > -0.90, (
+        "16-bit PNG 2-tier 8px boundary propagation failed to reach 6px transparent corner"
+    )
+    b_png16_depth = client.condition_image(
+        png16_bytes,
+        VizInjectorRequest(
+            target_width=64,
+            target_height=64,
+            input_role="depth_map",
+        ),
+    )
+    assert (
+        max_16bit_err < 1.5
+        and b_png16_depth.vae_tensor is not None
+        and torch.isfinite(b_png16_depth.vae_tensor).all()
+    ), f"16-bit PNG radiometric precision loss: max_err={max_16bit_err:.3f} / 65535"
+
+    hdr_rgb = np.zeros((64, 64, 3), dtype=np.float32)
+    hdr_x = np.linspace(0.1, 8.0, 64, dtype=np.float32)
+    hdr_rgb[:, :, 0] = hdr_x[None, :]
+    hdr_rgb[:, :, 1] = 0.5
+    hdr_rgb[:, :, 2] = 0.25
+    hdr_bytes = _encode_radiance_hdr_bytes(hdr_rgb)
+    b_hdr = client.condition_image(
+        hdr_bytes,
+        VizInjectorRequest(
+            target_width=64,
+            target_height=64,
+            emit_vit_branch=False,
+            emit_mask_branch=False,
+            mtf_boost=0.0,
+        ),
+    )
+    assert (
+        b_hdr.vae_tensor is not None
+        and torch.isfinite(b_hdr.vae_tensor).all()
+        and float(b_hdr.vae_tensor.min().item()) >= -1.0
+        and float(b_hdr.vae_tensor.max().item()) <= 1.0
+    ), "32-bit Radiance HDR ACES ingestion out of bounds or non-finite"
+    hdr_row_r = b_hdr.vae_tensor[0, 0, 32, :].numpy()
+    assert bool(np.all(np.diff(hdr_row_r) >= -1e-4)) and float(hdr_row_r[-1]) > float(
+        hdr_row_r[8]
+    ), "ACES HDR tonemapping failed monotonic highlight roll-off"
+    print(
+        f"  [+] 16-Bit PNG & 32-Bit HDR  : 16-bit Max Drift = {max_16bit_err:.2f}/65535 | Pade [2/2] ACES Highlight Roll-Off Verified"
+    )
+
 
 def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
     print(
-        "\n--- Gate 3: Vulkan/AVX2 Parity, 1440p Dynamic Growth, Control Roles & OpenMOSS Routing ---"
+        "\n--- Gate 3: Vulkan/AVX2 Parity, Cross-Domain Numerical Isomorphism & Contention Soak ---"
     )
     y_grid, x_grid = np.meshgrid(
         np.linspace(0, 1, 384, dtype=np.float32),
@@ -243,6 +422,7 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         )
         b_vk = client.condition_rgba8(synth_rgba, req_vk)
         b_cpu = client.condition_rgba8(synth_rgba, req_cpu)
+
         mae_vae = float(
             torch.mean(torch.abs(b_vk.vae_tensor - b_cpu.vae_tensor)).item()
         )
@@ -263,6 +443,112 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
     ), f"GPU vs CPU telemetry drift: vk={t_vk} vs cpu={t_cpu}"
     print(
         f"  [+] Vulkan vs. C11 AVX2      : VAE MAE = {mae_vae:.6f}, ViT 5D Patch MAE = {mae_vit:.6f} | GPU Telemetry Parity Verified"
+    )
+
+    iso_h, iso_w = 128, 192
+    iso_patches = (iso_h // 16) * (iso_w // 16)
+    yy_iso, xx_iso = np.meshgrid(
+        np.arange(iso_h, dtype=np.int32),
+        np.arange(iso_w, dtype=np.int32),
+        indexing="ij",
+    )
+    iso_rgb = np.stack(
+        [
+            ((yy_iso * 7 + xx_iso * 3) & 0xFF).astype(np.uint8),
+            ((yy_iso * 11 + xx_iso * 5 + 40) & 0xFF).astype(np.uint8),
+            ((yy_iso * 13 + xx_iso * 17 + 90) & 0xFF).astype(np.uint8),
+        ],
+        axis=-1,
+    )
+    b_iso_vk = client.condition_rgba8(
+        iso_rgb,
+        VizInjectorRequest(
+            target_width=iso_w,
+            target_height=iso_h,
+            max_vit_patches=iso_patches,
+            edit_mode_384_vit=False,
+            framing_mode="inscribed",
+            input_role="photo_ref",
+            deband_8bit=False,
+            mtf_boost=0.0,
+            prefer_vulkan=True,
+        ),
+    )
+    b_iso_cpu = client.condition_rgba8(
+        iso_rgb,
+        VizInjectorRequest(
+            target_width=iso_w,
+            target_height=iso_h,
+            max_vit_patches=iso_patches,
+            edit_mode_384_vit=False,
+            framing_mode="inscribed",
+            input_role="photo_ref",
+            deband_8bit=False,
+            mtf_boost=0.0,
+            prefer_vulkan=False,
+        ),
+    )
+    x_9d = b_iso_vk.vae_tensor.unsqueeze(1).expand(1, 2, 3, iso_h, iso_w)
+    canonical_9d = (
+        x_9d.reshape(1, 2, 3, iso_h // 32, 2, 16, iso_w // 32, 2, 16)
+        .permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        .contiguous()
+        .view(iso_patches, 3, 2, 16, 16)
+    )
+    vk_9d_err = float((b_iso_vk.vit_patches - canonical_9d).abs().max().item())
+    cpu_9d_err = float((b_iso_cpu.vit_patches - canonical_9d).abs().max().item())
+    assert (
+        vk_9d_err == 0.0 and cpu_9d_err < 1e-5
+    ), f"9D spatial-merge patchification isomorphism failed: vk={vk_9d_err}, cpu={cpu_9d_err}"
+
+    src_geoms = [
+        (1920, 1080),
+        (1080, 1920),
+        (1024, 768),
+        (640, 360),
+        (512, 512),
+        (773, 519),
+    ]
+    tgt_geoms = [(1024, 1024), (768, 1024), (512, 512)]
+    framing_modes = ["inscribed", "cover_crop", "contain", "stretch", "never_crop"]
+    grid_checks = 0
+    for sw, sh in src_geoms:
+        dummy_src = np.zeros((sh, sw, 4), dtype=np.uint8)
+        for tw, th in tgt_geoms:
+            for fm in framing_modes:
+                for max_p in (576, 2304):
+                    edit_384 = bool(max_p <= 576)
+                    exp_vae_w, exp_vae_h, exp_vit_w, exp_vit_h = _solve_coupled_grid_f64(
+                        sw, sh, tw, th, max_p, edit_384, fm
+                    )
+                    c_bundle = client.condition_rgba8(
+                        dummy_src,
+                        VizInjectorRequest(
+                            target_width=tw,
+                            target_height=th,
+                            max_vit_patches=max_p,
+                            edit_mode_384_vit=edit_384,
+                            framing_mode=fm,
+                            input_role="photo_ref",
+                            emit_vae_branch=False,
+                            emit_mask_branch=False,
+                            emit_vit_branch=True,
+                            prefer_vulkan=True,
+                        ),
+                    )
+                    assert c_bundle.meta.vae_size == (
+                        exp_vae_w,
+                        exp_vae_h,
+                    ) and c_bundle.meta.vit_size == (
+                        exp_vit_w,
+                        exp_vit_h,
+                    ), (
+                        f"Cross-domain binary64 dual-grid mismatch for src={(sw, sh)}, tgt={(tw, th)}, fm={fm}, p={max_p}: "
+                        f"expected vae={(exp_vae_w, exp_vae_h)} vit={(exp_vit_w, exp_vit_h)}, got vae={c_bundle.meta.vae_size} vit={c_bundle.meta.vit_size}"
+                    )
+                    grid_checks += 1
+    print(
+        f"  [+] Cross-Domain Isomorphism : {grid_checks}/{grid_checks} Binary64 Dual-Grid Matrices | 9D Patch Err: VK={vk_9d_err:.1e}, AVX2={cpu_9d_err:.1e}"
     )
 
     prime_rgba = np.zeros((519, 773, 4), dtype=np.uint8)
@@ -337,15 +623,86 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         torch.max(torch.abs(b_cut_vk.latent_mask - b_cut_cpu.latent_mask)).item()
     )
     border_val = float(b_cut_vk.vae_tensor[0, 0, 16, 16].item())
+    b_cut_1to1_vk = client.condition_rgba8(
+        cutout,
+        VizInjectorRequest(
+            target_width=128,
+            target_height=128,
+            deband_8bit=False,
+            mtf_boost=0.0,
+            emit_vit_branch=False,
+            prefer_vulkan=True,
+        ),
+    )
+    b_cut_1to1_cpu = client.condition_rgba8(
+        cutout,
+        VizInjectorRequest(
+            target_width=128,
+            target_height=128,
+            deband_8bit=False,
+            mtf_boost=0.0,
+            emit_vit_branch=False,
+            prefer_vulkan=False,
+        ),
+    )
+    ring_6px_vk = float(b_cut_1to1_vk.vae_tensor[0, 0, 64, 26].item())
+    ring_6px_cpu = float(b_cut_1to1_cpu.vae_tensor[0, 0, 64, 26].item())
+
+    area_counts = [0, 1, 2, 3, 4, 8, 16, 32, 62, 63, 64, 65, 66, 128, 192, 256]
+    cut_area_rgba = np.zeros((64, 64, 4), dtype=np.uint8)
+    cut_area_rgba[..., :3] = 200
+    for c_idx, k_cnt in enumerate(area_counts):
+        cy_c, cx_c = divmod(c_idx, 4)
+        cell_a = np.zeros(256, dtype=np.uint8)
+        cell_a[:k_cnt] = 255
+        cut_area_rgba[
+            cy_c * 16 : (cy_c + 1) * 16, cx_c * 16 : (cx_c + 1) * 16, 3
+        ] = cell_a.reshape(16, 16)
+    b_area_vk = client.condition_rgba8(
+        cut_area_rgba,
+        VizInjectorRequest(
+            target_width=64,
+            target_height=64,
+            deband_8bit=False,
+            mtf_boost=0.0,
+            emit_vit_branch=False,
+            prefer_vulkan=True,
+        ),
+    )
+    b_area_cpu = client.condition_rgba8(
+        cut_area_rgba,
+        VizInjectorRequest(
+            target_width=64,
+            target_height=64,
+            deband_8bit=False,
+            mtf_boost=0.0,
+            emit_vit_branch=False,
+            prefer_vulkan=False,
+        ),
+    )
+    expected_area = np.array(area_counts, dtype=np.float32) / 256.0
+    area_err_vk = float(
+        np.max(np.abs(b_area_vk.latent_mask.view(-1).numpy() - expected_area))
+    )
+    area_err_cpu = float(
+        np.max(np.abs(b_area_cpu.latent_mask.view(-1).numpy() - expected_area))
+    )
     assert (
         border_val > 0.85
+        and ring_6px_vk > 0.95
+        and abs(ring_6px_vk - ring_6px_cpu) < 1e-4
         and cut_mae < 1e-4
         and cut_mask_mae < 1e-6
+        and area_err_vk < 1e-6
+        and area_err_cpu < 1e-6
         and float(b_cut_vk.latent_mask[0, 0, 1, 1].item()) == 1.0
         and float(b_cut_vk.latent_mask[0, 0, 0, 0].item()) == 0.0
-    ), f"Cutout alpha propagation or unblurred coverage error: border={border_val:.4f}, vk_cpu_mae={cut_mae:.6f}, mask_mae={cut_mask_mae:.6f}"
+    ), (
+        f"Cutout 2-tier 8px propagation or Mode 2 area integral failed: "
+        f"border={border_val:.4f}, 6px_ring={ring_6px_vk:.4f}, area_err_vk={area_err_vk:.2e}"
+    )
     print(
-        f"  [+] Cutout Alpha Propagation : Boundary luminance = {border_val:.4f} | Unblurred Cutout Coverage & Vulkan/CPU MAE = {cut_mae:.6f}"
+        f"  [+] Cutout 8px & Area-Int    : 6px Outer Ring = {ring_6px_vk:.4f} | Mode 2 Area-Integral Err = {area_err_vk:.1e} | VK/CPU MAE = {cut_mae:.6f}"
     )
 
     cmap = np.zeros((256, 256, 4), dtype=np.uint8)
@@ -451,6 +808,50 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         == 0.0
     ), f"Vulkan depth_map parity or monotonic channel lock failed: mae={depth_mae}"
 
+    ramp_mask_rgba = np.zeros((256, 256, 4), dtype=np.uint8)
+    ramp_mask_rgba[..., 3] = 255
+    for cell_id in range(256):
+        cy_cell, cx_cell = divmod(cell_id, 16)
+        cell_r = np.zeros(256, dtype=np.uint8)
+        cell_r[: cell_id + 1] = 255
+        ramp_mask_rgba[
+            cy_cell * 16 : (cy_cell + 1) * 16,
+            cx_cell * 16 : (cx_cell + 1) * 16,
+            0,
+        ] = cell_r.reshape(16, 16)
+    b_ramp_vk = client.condition_rgba8(
+        ramp_mask_rgba,
+        VizInjectorRequest(
+            target_width=256,
+            target_height=256,
+            input_role="inpaint_mask",
+            mask_feather_radius=0.0,
+            prefer_vulkan=True,
+        ),
+    )
+    b_ramp_cpu = client.condition_rgba8(
+        ramp_mask_rgba,
+        VizInjectorRequest(
+            target_width=256,
+            target_height=256,
+            input_role="inpaint_mask",
+            mask_feather_radius=0.0,
+            prefer_vulkan=False,
+        ),
+    )
+    ramp_vals_vk = b_ramp_vk.latent_mask.view(-1).numpy()
+    ramp_vals_cpu = b_ramp_cpu.latent_mask.view(-1).numpy()
+    avg_k = np.arange(1, 257, dtype=np.float32) / 256.0
+    expected_agm = 0.45 * avg_k + 0.55 * np.sqrt(avg_k)
+    agm_err_vk = float(np.max(np.abs(ramp_vals_vk - expected_agm)))
+    agm_err_cpu = float(np.max(np.abs(ramp_vals_cpu - expected_agm)))
+    assert (
+        bool(np.all(np.diff(ramp_vals_vk) > 0.0))
+        and bool(np.all(np.diff(ramp_vals_cpu) > 0.0))
+        and agm_err_vk < 1e-6
+        and agm_err_cpu < 1e-6
+    ), f"Mode 4 C-infinity AGM mask monotonicity failed: vk_err={agm_err_vk:.2e}, cpu_err={agm_err_cpu:.2e}"
+
     stroke_mask = np.zeros((1024, 1024, 4), dtype=np.uint8)
     for i in range(128, 896):
         stroke_mask[i, i : i + 2, :3] = 255
@@ -525,7 +926,7 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         f"active={active_cells}, fth_active={fth_active_cells}, no_erosion={no_erosion}, mae={mask_mae}"
     )
     print(
-        f"  [+] Depth & Inpaint Vulkan   : Depth MAE = {depth_mae:.6f} | 2px Stroke Dilation Envelope Verified ({active_cells} -> {fth_active_cells} cells, 0 erosion)"
+        f"  [+] Depth & C-Inf AGM Mask   : Depth MAE = {depth_mae:.6f} | 256/256 Strictly Monotonic Steps (Err={agm_err_vk:.1e}) | 2px Dilation ({active_cells} -> {fth_active_cells} cells)"
     )
 
     req_edit = VizInjectorRequest(
@@ -604,6 +1005,62 @@ def audit_gate_3_vulkan_parity_and_edgecases(client: VizInjectorClient) -> None:
         f"  [+] OpenMOSS Edit Routing    : VAE={b_edit.meta.vae_size}, ViT={b_edit.meta.vit_size} ({b_edit.llm_tokens} LLM tok default / {b_edit_384.llm_tokens} tok @ 576p)"
     )
 
+    ref_vk_256 = client.condition_rgba8(
+        synth_rgba,
+        VizInjectorRequest(
+            target_width=256,
+            target_height=256,
+            prefer_vulkan=True,
+            deband_8bit=True,
+        ),
+    )
+    ref_cpu_256 = client.condition_rgba8(
+        synth_rgba,
+        VizInjectorRequest(
+            target_width=256,
+            target_height=256,
+            prefer_vulkan=False,
+            deband_8bit=True,
+        ),
+    )
+    soak_errors: List[str] = []
+
+    def _soak_worker(tid: int) -> None:
+        use_vk = (tid % 2) == 0
+        req_w = VizInjectorRequest(
+            target_width=256,
+            target_height=256,
+            prefer_vulkan=use_vk,
+            deband_8bit=True,
+        )
+        expected = ref_vk_256 if use_vk else ref_cpu_256
+        for _ in range(16):
+            out_w = client.condition_rgba8(synth_rgba, req_w)
+            if out_w.vae_tensor is None or out_w.vit_patches is None:
+                soak_errors.append(f"Thread {tid} returned None tensor")
+                return
+            diff_vae = float(
+                (out_w.vae_tensor - expected.vae_tensor).abs().max().item()
+            )
+            diff_vit = float(
+                (out_w.vit_patches - expected.vit_patches).abs().max().item()
+            )
+            if diff_vae > 0.0 or diff_vit > 0.0:
+                soak_errors.append(
+                    f"Thread {tid} (vk={use_vk}) race drift: vae={diff_vae}, vit={diff_vit}"
+                )
+                return
+
+    threads = [threading.Thread(target=_soak_worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not soak_errors, f"Multithreaded Vulkan/AVX2 contention failure: {soak_errors[0]}"
+    print(
+        "  [+] Multithreaded Contention : 8 Threads x 16 Interleaved Vulkan/AVX2 Passes = 0.0 Bit-Exact Drift"
+    )
+
 
 def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
     print(
@@ -636,6 +1093,7 @@ def audit_gate_4_cli_and_vizj_container(client: VizInjectorClient) -> None:
         raise RuntimeError(
             f"CLI invocation failed with code {proc.returncode}:\n{proc.stderr}"
         )
+
     assert (
         test_vizj.exists() and test_vizj.stat().st_size > 144
     ), ".vizj wire container was not created"

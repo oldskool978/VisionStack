@@ -2,7 +2,49 @@
 #include "vizinjector_dll.h"
 #include "../common/colorspace_srgb.h"
 #include "../vulkan/vk_compute_engine.h"
+#include <immintrin.h>
 #include <stdlib.h>
+
+#if defined(_MSC_VER)
+#define VIZ_DLL_TLS __declspec(thread)
+#else
+#define VIZ_DLL_TLS __thread
+#endif
+
+static VIZ_DLL_TLS float *g_tls_dll_lin = NULL;
+static VIZ_DLL_TLS size_t g_tls_dll_lin_cap = 0;
+
+static float *acquire_dll_tls_f32(size_t needed_floats) {
+    if (needed_floats <= g_tls_dll_lin_cap && g_tls_dll_lin != NULL) {
+        return g_tls_dll_lin;
+    }
+    size_t alloc_floats = (needed_floats + 4095u) & ~(size_t)4095u;
+    float *next_buf = (float *)realloc(g_tls_dll_lin, alloc_floats * sizeof(float));
+    if (!next_buf) {
+        return NULL;
+    }
+    g_tls_dll_lin = next_buf;
+    g_tls_dll_lin_cap = alloc_floats;
+    return next_buf;
+}
+
+static void clamp_f32_01_avx2(const float *src, size_t count, float *dst) {
+    const __m256 v_zero = _mm256_setzero_ps();
+    const __m256 v_one = _mm256_set1_ps(1.0f);
+    size_t i = 0;
+    for (; i + 8u <= count; i += 8u) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        __m256 valid = _mm256_cmp_ps(v, v_zero, _CMP_GT_OQ);
+        __m256 clamped = _mm256_min_ps(v_one, _mm256_and_ps(v, valid));
+        _mm256_storeu_ps(dst + i, clamped);
+    }
+    for (; i < count; ++i) {
+        float v = src[i];
+        if (!(v > 0.0f)) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        dst[i] = v;
+    }
+}
 
 VIZINJECTOR_API int32_t vizinjector_init_backend(int32_t prefer_vulkan) {
     viz_colorspace_init_tables();
@@ -41,6 +83,63 @@ VIZINJECTOR_API int32_t vizinjector_process_rgba8(
     VizInjectorOutput *out_result
 ) {
     return vizinjector_core_process_rgba8(rgba8, width, height, cfg, out_result);
+}
+
+VIZINJECTOR_API int32_t vizinjector_process_rgba16(
+    const uint16_t *rgba16,
+    uint32_t width,
+    uint32_t height,
+    const VizInjectorConfig *cfg,
+    VizInjectorOutput *out_result
+) {
+    if (!rgba16 || width == 0u || height == 0u || !out_result) return -1;
+    size_t needed = (size_t)width * (size_t)height * 4u;
+    float *lin_buf = acquire_dll_tls_f32(needed);
+    if (!lin_buf) return -2;
+
+    int32_t role = cfg ? cfg->input_role : VIZ_ROLE_PHOTO_REF;
+    if (role == VIZ_ROLE_DEPTH_MAP || role == VIZ_ROLE_INPAINT_MASK) {
+        viz_ingest_scalar_rgba16_to_f32(rgba16, width, height, lin_buf);
+    } else {
+        viz_ingest_rgba16_to_linear_f32(rgba16, width, height, lin_buf);
+    }
+    return vizinjector_core_process_linear_f32(lin_buf, width, height, cfg, out_result);
+}
+
+VIZINJECTOR_API int32_t vizinjector_process_rgbaf32(
+    const float *rgbaf32,
+    uint32_t width,
+    uint32_t height,
+    int32_t input_is_linear,
+    const VizInjectorConfig *cfg,
+    VizInjectorOutput *out_result
+) {
+    if (!rgbaf32 || width == 0u || height == 0u || !out_result) return -1;
+    size_t needed = (size_t)width * (size_t)height * 4u;
+    int32_t role = cfg ? cfg->input_role : VIZ_ROLE_PHOTO_REF;
+
+    if (role == VIZ_ROLE_DEPTH_MAP || role == VIZ_ROLE_INPAINT_MASK || input_is_linear == 1) {
+        float *lin_buf = acquire_dll_tls_f32(needed);
+        if (!lin_buf) return -2;
+        clamp_f32_01_avx2(rgbaf32, needed, lin_buf);
+        return vizinjector_core_process_linear_f32(lin_buf, width, height, cfg, out_result);
+    }
+
+    float *lin_buf = acquire_dll_tls_f32(needed);
+    if (!lin_buf) return -2;
+    int aces_hdr = (input_is_linear >= 2) ? 1 : 0;
+    viz_ingest_rgbaf32_to_linear_f32(rgbaf32, width, height, aces_hdr, lin_buf);
+    return vizinjector_core_process_linear_f32(lin_buf, width, height, cfg, out_result);
+}
+
+VIZINJECTOR_API int32_t vizinjector_process_linear_f32(
+    const float *linear_rgba,
+    uint32_t width,
+    uint32_t height,
+    const VizInjectorConfig *cfg,
+    VizInjectorOutput *out_result
+) {
+    return vizinjector_core_process_linear_f32(linear_rgba, width, height, cfg, out_result);
 }
 
 VIZINJECTOR_API int32_t vizinjector_postprocess_vae_to_rgb8(

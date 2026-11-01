@@ -37,6 +37,7 @@ from schema import (
     get_active_engine_defaults,
     has_custom_default_preset,
     normalize_box_label,
+    scale_layout_items_to_canvas,
 )
 
 DEFAULT_CONFIG_PATH = ROOT_DIR / DEFAULT_PRESET_FILENAME
@@ -85,6 +86,20 @@ def build_default_request() -> GenerationRequest:
         if (isinstance(raw_ls, str) and raw_ls.strip())
         else None
     )
+    req_w = int(d.get("width", 1024))
+    req_h = int(d.get("height", 1024))
+    coords_px = bool(d.get("layout_coords_are_pixels", True))
+    if "layout_items" in d and d["layout_items"]:
+        init_items = [dict(b) for b in d["layout_items"] if isinstance(b, dict)]
+    else:
+        init_items = scale_layout_items_to_canvas(
+            DEFAULT_LAYOUT_ITEMS,
+            height=req_h,
+            width=req_w,
+            src_height=1024,
+            src_width=1024,
+            coords_are_pixels=coords_px,
+        )
     raw_kwargs: Dict[str, Any] = {
         "prompt": str(d.get("prompt", DEFAULT_POSITIVE_PROMPT)),
         "negative_prompt": str(d.get("negative_prompt", "")),
@@ -94,8 +109,8 @@ def build_default_request() -> GenerationRequest:
         "model_variant": str(d.get("model_variant", "sft")),
         "prompt_mode": str(d.get("prompt_mode", "natural")),
         "layout_summary": eff_ls,
-        "layout_items": [dict(b) for b in d.get("layout_items", DEFAULT_LAYOUT_ITEMS)],
-        "layout_coords_are_pixels": bool(d.get("layout_coords_are_pixels", True)),
+        "layout_items": init_items,
+        "layout_coords_are_pixels": coords_px,
         "preserve_canvas_outside_boxes": bool(
             d.get("preserve_canvas_outside_boxes", False)
         ),
@@ -105,8 +120,8 @@ def build_default_request() -> GenerationRequest:
             d.get("composite_box_images_to_init", False)
         ),
         "enable_thinking": bool(d.get("enable_thinking", True)),
-        "width": int(d.get("width", 1024)),
-        "height": int(d.get("height", 1024)),
+        "width": req_w,
+        "height": req_h,
         "num_inference_steps": int(d.get("num_inference_steps", 50)),
         "shift": float(d.get("shift", 5.0)),
         "use_v2_grid": bool(d.get("use_v2_grid", True)),
@@ -175,7 +190,14 @@ def load_or_create_initial_request(
             if not req.prompt.strip():
                 req.prompt = DEFAULT_POSITIVE_PROMPT
             if not req.layout_items:
-                req.layout_items = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
+                req.layout_items = scale_layout_items_to_canvas(
+                    DEFAULT_LAYOUT_ITEMS,
+                    height=req.height,
+                    width=req.width,
+                    src_height=1024,
+                    src_width=1024,
+                    coords_are_pixels=req.layout_coords_are_pixels,
+                )
             req.validate()
             return req, f"ShadowBoxer/{target.name} (Active File)"
         except Exception as e:
@@ -218,7 +240,14 @@ def _apply_box_denoise_spec(req: GenerationRequest, spec_str: str) -> None:
     if not s:
         return
     if not req.layout_items:
-        req.layout_items = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
+        req.layout_items = scale_layout_items_to_canvas(
+            DEFAULT_LAYOUT_ITEMS,
+            height=req.height,
+            width=req.width,
+            src_height=1024,
+            src_width=1024,
+            coords_are_pixels=req.layout_coords_are_pixels,
+        )
     parts = [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]
     for part in parts:
         sep = ":" if ":" in part else ("=" if "=" in part else None)
@@ -264,7 +293,14 @@ def _apply_box_denoise_spec(req: GenerationRequest, spec_str: str) -> None:
 
 def _interactive_edit_boxes(req: GenerationRequest) -> None:
     if not req.layout_items:
-        req.layout_items = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
+        req.layout_items = scale_layout_items_to_canvas(
+            DEFAULT_LAYOUT_ITEMS,
+            height=req.height,
+            width=req.width,
+            src_height=1024,
+            src_width=1024,
+            coords_are_pixels=req.layout_coords_are_pixels,
+        )
     while True:
         print("\n" + "-" * 92)
         print("PER-BOX SPATIO-TEMPORAL OVERRIDES & COLLABORATIVE ROLES:")
@@ -557,6 +593,7 @@ def stage_test_input_files(
     p_init = dest_dir / "init_canvas.png"
     p_mask = dest_dir / "inpaint_mask.png"
     p_ctrl = dest_dir / "control_map.png"
+
     out_map = {
         "ref_a": p_ref_a,
         "ref_b": p_ref_b,
@@ -739,8 +776,8 @@ def run_permutation_suite(
     staged = stage_test_input_files(force=False)
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     active_base = base_req if base_req is not None else build_default_request()
-    w = width_override or active_base.width
-    h = height_override or active_base.height
+    w = max(256, min(2048, (int(width_override or active_base.width) // 16) * 16))
+    h = max(256, min(2048, (int(height_override or active_base.height) // 16) * 16))
     eff_steps = (
         steps_override
         if steps_override is not None
@@ -753,6 +790,25 @@ def run_permutation_suite(
 
     models_info = {m["variant"]: m["cached"] for m in engine.list_available_models()}
     has_base = bool(models_info.get("base", False))
+
+    if active_base.layout_items:
+        base_layout_items = scale_layout_items_to_canvas(
+            active_base.layout_items,
+            height=h,
+            width=w,
+            src_height=active_base.height,
+            src_width=active_base.width,
+            coords_are_pixels=active_base.layout_coords_are_pixels,
+        )
+    else:
+        base_layout_items = scale_layout_items_to_canvas(
+            DEFAULT_LAYOUT_ITEMS,
+            height=h,
+            width=w,
+            src_height=1024,
+            src_width=1024,
+            coords_are_pixels=True,
+        )
 
     base_clean = _clone_request(
         active_base,
@@ -785,12 +841,17 @@ def run_permutation_suite(
         edit_lora_scale=0.0,
         box_attn_isolation=0.0,
         composite_box_images_to_init=False,
-        layout_items=list(active_base.layout_items)
-        if active_base.layout_items
-        else [dict(b) for b in DEFAULT_LAYOUT_ITEMS],
+        layout_items=base_layout_items,
     )
 
-    v06_horizon_boxes = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
+    v06_horizon_boxes = scale_layout_items_to_canvas(
+        DEFAULT_LAYOUT_ITEMS,
+        height=h,
+        width=w,
+        src_height=1024,
+        src_width=1024,
+        coords_are_pixels=True,
+    )
     v06_horizon_boxes[0] = dict(
         v06_horizon_boxes[0], inpaint_box=True, denoise_strength=0.45
     )
@@ -798,11 +859,11 @@ def run_permutation_suite(
         v06_horizon_boxes[1], inpaint_box=True, denoise_strength=0.80
     )
 
-    v11_spatiovisual_boxes: List[Dict[str, Any]] = [
+    v11_canonical_1024_boxes: List[Dict[str, Any]] = [
         {
             "label": "object",
             "caption": "A sleek brushed-steel refrigerator door with a small yellow sticky note",
-            "bbox": [0, 0, h, int(round(w * 0.5625))],
+            "bbox": [0, 0, 1024, 576],
             "image_path": str(staged["ref_a"]),
             "input_role": "photo_ref",
             "paste_to_canvas": True,
@@ -814,7 +875,7 @@ def run_permutation_suite(
         {
             "label": "object",
             "caption": "Structural depth guide for the left refrigerator panel",
-            "bbox": [0, 0, h, int(round(w * 0.5625))],
+            "bbox": [0, 0, 1024, 576],
             "image_path": str(staged["control"]),
             "input_role": "depth_map",
             "isolate_box_attn": 0.85,
@@ -824,12 +885,7 @@ def run_permutation_suite(
         {
             "label": "object",
             "caption": "A glowing citrus medallion cutout on a warm walnut counter",
-            "bbox": [
-                int(round(h * 0.4375)),
-                int(round(w * 0.50)),
-                h,
-                w,
-            ],
+            "bbox": [448, 512, 1024, 1024],
             "image_path": str(staged["ref_c"]),
             "input_role": "photo_ref",
             "paste_to_canvas": True,
@@ -842,17 +898,20 @@ def run_permutation_suite(
             "label": "text",
             "caption": "Handwritten crisp black marker text on a small yellow sticky note",
             "text": "SOVEREIGN V11 CONVERGED",
-            "bbox": [
-                int(round(h * 0.25)),
-                int(round(w * 0.109375)),
-                int(round(h * 0.50)),
-                int(round(w * 0.453125)),
-            ],
+            "bbox": [256, 112, 512, 464],
             "denoise_strength": 0.95,
             "z_order": 5,
             "enabled": True,
         },
     ]
+    v11_spatiovisual_boxes = scale_layout_items_to_canvas(
+        v11_canonical_1024_boxes,
+        height=h,
+        width=w,
+        src_height=1024,
+        src_width=1024,
+        coords_are_pixels=True,
+    )
 
     vectors: List[Tuple[str, GenerationRequest]] = [
         (
@@ -1112,6 +1171,7 @@ def run_custom_sweep(engine: MOSSImageEngine, base_req: GenerationRequest) -> No
         if raw_cfgs
         else [2.5, 3.5]
     )
+
     SWEEPS_DIR.mkdir(parents=True, exist_ok=True)
     total = len(shifts) * len(cfgs)
     idx = 0
@@ -1231,7 +1291,14 @@ def interactive_loop(
                     else "natural"
                 )
                 if not req.layout_items:
-                    req.layout_items = [dict(b) for b in DEFAULT_LAYOUT_ITEMS]
+                    req.layout_items = scale_layout_items_to_canvas(
+                        DEFAULT_LAYOUT_ITEMS,
+                        height=req.height,
+                        width=req.width,
+                        src_height=1024,
+                        src_width=1024,
+                        coords_are_pixels=req.layout_coords_are_pixels,
+                    )
             elif cmd == "2":
                 new_p = input("Enter Positive Prompt (Blank to keep current): ").strip()
                 if new_p:
@@ -1247,12 +1314,22 @@ def interactive_loop(
                 if ms_in:
                     req.max_sequence_length = max(64, min(32768, int(ms_in)))
             elif cmd == "5":
+                old_w, old_h = req.width, req.height
                 w_in = input(f"Enter Width (Current: {req.width}): ").strip()
                 h_in = input(f"Enter Height (Current: {req.height}): ").strip()
                 if w_in:
-                    req.width = max(64, (int(w_in) // 16) * 16)
+                    req.width = max(256, min(2048, (int(w_in) // 16) * 16))
                 if h_in:
-                    req.height = max(64, (int(h_in) // 16) * 16)
+                    req.height = max(256, min(2048, (int(h_in) // 16) * 16))
+                if (req.width, req.height) != (old_w, old_h) and req.layout_items:
+                    req.layout_items = scale_layout_items_to_canvas(
+                        req.layout_items,
+                        height=req.height,
+                        width=req.width,
+                        src_height=old_h,
+                        src_width=old_w,
+                        coords_are_pixels=req.layout_coords_are_pixels,
+                    )
             elif cmd == "6":
                 st_in = input(
                     f"Enter Inference Steps (Current: {req.num_inference_steps}): "
@@ -1595,8 +1672,8 @@ def main() -> None:
     cfg_path = Path(args.config) if args.config else None
     if cfg_path is not None and not cfg_path.is_absolute():
         cfg_path = ROOT_DIR / cfg_path
-
     req, banner_tag = load_or_create_initial_request(cfg_path)
+    orig_w, orig_h = req.width, req.height
 
     if args.prompt is not None:
         req.prompt = args.prompt
@@ -1618,9 +1695,18 @@ def main() -> None:
         req.model_variant = args.model_variant
         req.repo_id = None
     if args.width is not None:
-        req.width = args.width
+        req.width = max(256, min(2048, (int(args.width) // 16) * 16))
     if args.height is not None:
-        req.height = args.height
+        req.height = max(256, min(2048, (int(args.height) // 16) * 16))
+    if (req.width, req.height) != (orig_w, orig_h) and req.layout_items:
+        req.layout_items = scale_layout_items_to_canvas(
+            req.layout_items,
+            height=req.height,
+            width=req.width,
+            src_height=orig_h,
+            src_width=orig_w,
+            coords_are_pixels=req.layout_coords_are_pixels,
+        )
     if args.steps is not None:
         req.num_inference_steps = args.steps
     if args.seed is not None:

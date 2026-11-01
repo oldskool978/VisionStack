@@ -177,6 +177,7 @@ class PipelineStagesMixin:
             deband_8bit=bool(request.deband_8bit),
             seed=int(request.seed or 42),
         )
+
         want_tier2_export = bool(
             request.export_vizj_path
             and int(request.export_vizj_tier) == VIZJ_TIER_DUAL_LATENT
@@ -340,10 +341,9 @@ class PipelineStagesMixin:
                     dec_rgb = self.vae.decode_packed_latents(
                         packed_lat.to(device=self.vae.device, non_blocking=True)
                     )
-                    recon_pils, _ = self.vizinjector.postprocess_to_pil(
-                        dec_rgb, apply_bayer_dither=False
-                    )
+                    dec_rgb_cpu = _evacuate_to_cpu(dec_rgb)
                     del dec_rgb
+                    assert dec_rgb_cpu is not None
                     self._trim_reserved_vram(force=False, required_headroom_gb=3.80)  # type: ignore[attr-defined]
                     vit_upgrade_req = VizInjectorRequest(
                         target_width=eff_w,
@@ -363,8 +363,9 @@ class PipelineStagesMixin:
                         soft_knee_tau=request.soft_knee_tau,
                     )
                     vit_bundle = self.vizinjector.condition_image(
-                        recon_pils[0], vit_upgrade_req
+                        dec_rgb_cpu, vit_upgrade_req
                     )
+                    del dec_rgb_cpu
                     vit_patches_cpu = _evacuate_to_cpu(vit_bundle.vit_patches)
                     grid_thw_cpu = _evacuate_to_cpu(vit_bundle.grid_thw)
                     eff_llm_tokens = int(vit_bundle.llm_tokens)
@@ -390,7 +391,6 @@ class PipelineStagesMixin:
                     del img_splits
                     self.text_encoder.visual.clear_caches()
                     self._trim_reserved_vram(force=False, required_headroom_gb=3.80)  # type: ignore[attr-defined]
-
                 if vit_embeds is not None:
                     eff_llm_tokens = int(vit_embeds.shape[0])
                 elif vit_patches_cpu is None:
@@ -415,7 +415,7 @@ class PipelineStagesMixin:
                     resample=Image.Resampling.BILINEAR,
                 )
                 m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
-                mask_t = (
+                mask_t = _evacuate_to_cpu(
                     torch.from_numpy(m_arr).unsqueeze(0).unsqueeze(0).contiguous()
                 )
                 rec = CachedReferenceRecord(
@@ -570,13 +570,13 @@ class PipelineStagesMixin:
                                     device=self.vae.device, non_blocking=True
                                 )
                             )
-                            recon_pils, _ = self.vizinjector.postprocess_to_pil(
-                                dec_rgb, apply_bayer_dither=False
-                            )
+                            dec_rgb_cpu = _evacuate_to_cpu(dec_rgb)
                             del dec_rgb
+                            assert dec_rgb_cpu is not None
                             v_bundle = self.vizinjector.condition_image(
-                                recon_pils[0], v_req
+                                dec_rgb_cpu, v_req
                             )
+                            del dec_rgb_cpu
                         if (
                             v_bundle.grid_thw is not None
                             and v_bundle.llm_tokens > 0
@@ -616,6 +616,7 @@ class PipelineStagesMixin:
             and (thinking_trace is None or not str(thinking_trace).strip())
         )
         eff_enable_thinking = True if do_speculative_cot else bool(enable_thinking)
+
         tok_list = self.tokenizer.encode_chat(
             prompt=prompt,
             enable_thinking=eff_enable_thinking,
@@ -625,7 +626,6 @@ class PipelineStagesMixin:
             thinking_trace=thinking_trace if not is_negative else None,
             add_vision_id=add_vision_id,
         )
-
         base_vision_signature = tuple(vision_sig_list)
         vision_signature = (
             base_vision_signature + (("spec_cot", int(speculative_cot_tokens)),)
@@ -760,6 +760,7 @@ class PipelineStagesMixin:
 
         input_ids = torch.tensor([tok_list], dtype=torch.long, device=te_device)
         attention_mask = torch.ones_like(input_ids, device=te_device)
+
         inputs_embeds: Optional[torch.Tensor] = None
         if pre_vit_embeds is not None and image_grid_thw is not None:
             base_embeds = self.text_encoder.get_input_embeddings()(input_ids)
@@ -869,6 +870,7 @@ class PipelineStagesMixin:
             pixel_values,
             image_grid_thw,
         )
+
         if use_cache:
             pinned_hidden = self.embed_cache.insert(
                 tok_list, hidden_cpu, vision_signature=vision_signature
@@ -882,6 +884,7 @@ class PipelineStagesMixin:
                 )
             self.memory_guard.sync_pinned_baseline()
         del hybrid_state
+
         hidden_out = hidden_cpu.to(device=out_device, non_blocking=True)
         mask_out = torch.ones(
             (1, hidden_out.shape[1]), dtype=torch.bool, device=out_device
@@ -983,7 +986,7 @@ class PipelineStagesMixin:
                         resample=Image.Resampling.BILINEAR,
                     )
                     m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
-                    paint_mask_cpu = (
+                    paint_mask_cpu = _evacuate_to_cpu(
                         torch.from_numpy(m_arr).unsqueeze(0).unsqueeze(0).contiguous()
                     )
 
@@ -1067,6 +1070,7 @@ class PipelineStagesMixin:
                     force_vit=emits_vit,
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
+
                 vae_sz = (
                     (
                         int(r_rec.packed_latents.shape[3]) * 16,
@@ -1161,6 +1165,7 @@ class PipelineStagesMixin:
                     )
                 ):
                     ref_records_for_prompt.append(r_rec)
+
                 if (
                     request.export_vizj_path
                     and self.vizinjector is not None
@@ -1463,6 +1468,7 @@ class PipelineStagesMixin:
             h_lat,
             w_lat,
         )
+
         k_init, k_sde, _ = derive_stage_keys(explicit_seed)
         noise = philox_randn(
             shape=shape,
@@ -1496,6 +1502,7 @@ class PipelineStagesMixin:
             if request.mask_feather_radius is not None
             else 1.25
         )
+
         splat_boxes = [e[1] for e in vis_state.splat_entries]
         default_carve_iso = max(
             DEFAULT_BOX_REF_ISOLATION,
@@ -1806,6 +1813,7 @@ class PipelineStagesMixin:
         active_ref_z_orders = (
             vis_state.ref_z_orders_list if active_ref_latents is not None else None
         )
+
         if request.uncond_uses_references is not None:
             uncond_uses_refs = bool(request.uncond_uses_references)
             uncond_ref_latents = active_ref_latents if uncond_uses_refs else None
@@ -1877,9 +1885,11 @@ class PipelineStagesMixin:
         uncond_fg_carveouts = (
             active_fg_carveouts if bool(uncond_ref_latents) else None
         )
+
         ref_zero_t = request.effective_reference_zero_timestep
         ref_iso_kv = request.effective_reference_isolated_kv
         box_feather_lat = eff_feather_lat
+
         use_cuda_events = self.device.type == "cuda" and torch.cuda.is_available()
         step_events = (
             [torch.cuda.Event(), torch.cuda.Event()] if use_cuda_events else []
@@ -1945,7 +1955,6 @@ class PipelineStagesMixin:
                 step_progress=step_frac,
                 depth=depth,
             )
-
             if do_slg and do_step_cfg and (eff_slg_skip & eff_uncond_skip):
                 ortho_slg: Set[int] = set()
                 for l_idx in eff_slg_skip:
@@ -2115,6 +2124,7 @@ class PipelineStagesMixin:
                 effective_cb("dit", pass_index + 1, num_passes)
 
         dit_elapsed = time.perf_counter() - dit_t0
+
         if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
             early_steps = active_scheduler._early_steps
             late_steps = active_scheduler._late_steps
@@ -2131,6 +2141,7 @@ class PipelineStagesMixin:
         latents_cpu = _evacuate_to_cpu(latents)
         assert latents_cpu is not None
         self.transformer.clear_transient_caches()
+
         del (
             latents,
             timesteps,
@@ -2198,6 +2209,7 @@ class PipelineStagesMixin:
     ) -> GenerationResponse:
         assert self.transformer is not None
         assert self.vae is not None
+
         if cpu_offload:
             self.transformer.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=4.40)  # type: ignore[attr-defined]
@@ -2218,6 +2230,7 @@ class PipelineStagesMixin:
         assert decoded_cpu is not None
         del decoded_gpu
         self._sync_device()  # type: ignore[attr-defined]
+
         if cpu_offload:
             self.vae.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)  # type: ignore[attr-defined]
@@ -2238,7 +2251,6 @@ class PipelineStagesMixin:
                 pil_images[0]
             )
         del decoded_cpu
-
         effective_cb("vae", len(pil_images), len(pil_images))
         if reporter is not None:
             reporter.close()

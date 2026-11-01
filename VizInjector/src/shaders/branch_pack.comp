@@ -1,5 +1,4 @@
 #version 450
-
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer InLinearBuffer {
@@ -34,23 +33,23 @@ void main() {
         if (x >= lat_w || y >= lat_h) {
             return;
         }
-        bool use_red = (pc.mode == 4u);
+        bool is_inpaint_mask = (pc.mode == 4u);
         float sum_v = 0.0;
         float max_v = 0.0;
         for (uint dy = 0u; dy < 16u; ++dy) {
             uint row_base = (y * 16u + dy) * pc.width + x * 16u;
             for (uint dx = 0u; dx < 16u; ++dx) {
                 vec4 px = lin_img[row_base + dx];
-                float v = clamp(use_red ? px.r : px.a, 0.0, 1.0);
+                float v = clamp(is_inpaint_mask ? px.r : px.a, 0.0, 1.0);
                 sum_v += v;
                 max_v = max(max_v, v);
             }
         }
         float avg = sum_v * (1.0 / 256.0);
-        if (avg > 0.01 && avg < 0.25 && max_v > 0.75) {
-            avg = 0.65 * avg + 0.35 * max_v;
-        }
-        out_planar[y * lat_w + x] = clamp(avg, 0.0, 1.0);
+        float out_m = is_inpaint_mask
+            ? (0.45 * avg + 0.55 * sqrt(max(0.0, avg * max_v)))
+            : avg;
+        out_planar[y * lat_w + x] = clamp(out_m, 0.0, 1.0);
         return;
     }
 
@@ -85,6 +84,7 @@ void main() {
     } else {
         uint grid_w = pc.width / 16u;
         uint merge = 2u;
+
         uint gh_m = (y / 16u) / merge;
         uint m_y = (y / 16u) % merge;
         uint py = y % 16u;

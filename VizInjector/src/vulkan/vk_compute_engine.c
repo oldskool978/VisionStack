@@ -6,6 +6,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+static SRWLOCK g_vk_lock = SRWLOCK_INIT;
+static inline void vk_engine_lock(void) { AcquireSRWLockExclusive(&g_vk_lock); }
+static inline void vk_engine_unlock(void) { ReleaseSRWLockExclusive(&g_vk_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_vk_lock = PTHREAD_MUTEX_INITIALIZER;
+static inline void vk_engine_lock(void) { pthread_mutex_lock(&g_vk_lock); }
+static inline void vk_engine_unlock(void) { pthread_mutex_unlock(&g_vk_lock); }
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -122,17 +140,14 @@ typedef struct {
     uint32_t cached_vit_h;
     VizFramingMode cached_framing;
     float cached_mtf_boost;
-
     VizPolyphaseSchedule1D vae_sx;
     VizPolyphaseSchedule1D vae_sy;
     VizPolyphaseSchedule1D vit_sx;
     VizPolyphaseSchedule1D vit_sy;
-
     uint32_t off_idx_vae_x;
     uint32_t off_idx_vae_y;
     uint32_t off_idx_vit_x;
     uint32_t off_idx_vit_y;
-
     uint32_t off_w_vae_x;
     uint32_t off_w_vae_y;
     uint32_t off_w_vit_x;
@@ -142,6 +157,8 @@ typedef struct {
 } VizVkEngineState;
 
 static VizVkEngineState g_vk = {0};
+
+static void viz_vk_shutdown_unlocked(void);
 
 static int find_memory_type(
     VkPhysicalDevice phys_dev,
@@ -417,7 +434,7 @@ static int create_shader_and_pipeline(
     return 0;
 }
 
-int viz_vk_init(void) {
+static int viz_vk_init_unlocked(void) {
     if (g_vk.initialized) return 0;
     memset(&g_vk, 0, sizeof(g_vk));
 
@@ -440,12 +457,12 @@ int viz_vk_init(void) {
     uint32_t dev_count = 0;
     vkEnumeratePhysicalDevices(g_vk.instance, &dev_count, NULL);
     if (dev_count == 0u) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -2;
     }
-
     VkPhysicalDevice *devs = (VkPhysicalDevice *)calloc(dev_count, sizeof(VkPhysicalDevice));
     vkEnumeratePhysicalDevices(g_vk.instance, &dev_count, devs);
+
     g_vk.phys_dev = devs[0];
     for (uint32_t i = 0; i < dev_count; ++i) {
         VkPhysicalDeviceProperties props;
@@ -475,7 +492,7 @@ int viz_vk_init(void) {
     }
     free(qprops);
     if (!found_qf) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -3;
     }
 
@@ -492,7 +509,7 @@ int viz_vk_init(void) {
         .pQueueCreateInfos = &qinfo
     };
     if (vkCreateDevice(g_vk.phys_dev, &dinfo, NULL, &g_vk.device) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -4;
     }
     vkGetDeviceQueue(g_vk.device, g_vk.queue_family_idx, 0u, &g_vk.compute_queue);
@@ -511,7 +528,7 @@ int viz_vk_init(void) {
         .pBindings = b_two
     };
     if (vkCreateDescriptorSetLayout(g_vk.device, &dsl2_info, NULL, &g_vk.dsl_two) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -5;
     }
 
@@ -529,7 +546,7 @@ int viz_vk_init(void) {
         .pBindings = b_five
     };
     if (vkCreateDescriptorSetLayout(g_vk.device, &dsl5_info, NULL, &g_vk.dsl_five) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -6;
     }
 
@@ -549,7 +566,7 @@ int viz_vk_init(void) {
             g_spv_telemetry_reduce, sizeof(g_spv_telemetry_reduce),
             g_vk.dsl_two, sizeof(VizPushTelem),
             &g_vk.sm_telem, &g_vk.pl_telem, &g_vk.pipe_telem) != 0) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -7;
     }
 
@@ -564,7 +581,7 @@ int viz_vk_init(void) {
         .pPoolSizes = &pool_size
     };
     if (vkCreateDescriptorPool(g_vk.device, &dp_info, NULL, &g_vk.dpool) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -8;
     }
 
@@ -588,7 +605,7 @@ int viz_vk_init(void) {
         .pSetLayouts = layouts
     };
     if (vkAllocateDescriptorSets(g_vk.device, &ds_alloc, dsets) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -9;
     }
     g_vk.ds_ingest = dsets[0];
@@ -621,7 +638,7 @@ int viz_vk_init(void) {
         create_vk_buffer(init_vit_floats * sizeof(float), cached_flags, wc_flags, 1, &g_vk.buf_vit_out) != 0 ||
         create_vk_buffer(max_mask_floats * sizeof(float), cached_flags, wc_flags, 1, &g_vk.buf_mask_out) != 0 ||
         create_vk_buffer(VIZ_VK_TELEM_BYTES, cached_flags, wc_flags, 1, &g_vk.buf_telem) != 0) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -10;
     }
 
@@ -633,7 +650,7 @@ int viz_vk_init(void) {
         .queueFamilyIndex = g_vk.queue_family_idx
     };
     if (vkCreateCommandPool(g_vk.device, &cp_create, NULL, &g_vk.cmd_pool) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -11;
     }
 
@@ -644,7 +661,7 @@ int viz_vk_init(void) {
         .commandBufferCount = 1u
     };
     if (vkAllocateCommandBuffers(g_vk.device, &cb_alloc, &g_vk.cmd_buf) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -12;
     }
 
@@ -652,7 +669,7 @@ int viz_vk_init(void) {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     };
     if (vkCreateFence(g_vk.device, &finfo, NULL, &g_vk.fence) != VK_SUCCESS) {
-        viz_vk_shutdown();
+        viz_vk_shutdown_unlocked();
         return -13;
     }
 
@@ -660,11 +677,21 @@ int viz_vk_init(void) {
     return 0;
 }
 
+int viz_vk_init(void) {
+    vk_engine_lock();
+    int rc = viz_vk_init_unlocked();
+    vk_engine_unlock();
+    return rc;
+}
+
 int viz_vk_is_available(void) {
+    vk_engine_lock();
     if (!g_vk.initialized) {
-        viz_vk_init();
+        viz_vk_init_unlocked();
     }
-    return g_vk.initialized ? 1 : 0;
+    int avail = g_vk.initialized ? 1 : 0;
+    vk_engine_unlock();
+    return avail;
 }
 
 const char *viz_vk_device_name(void) {
@@ -672,16 +699,21 @@ const char *viz_vk_device_name(void) {
 }
 
 int viz_vk_is_mapped_ptr(const void *ptr) {
-    if (!g_vk.initialized || !ptr) return 0;
-    return (ptr == g_vk.buf_vae_out.mapped ||
-            ptr == g_vk.buf_vit_out.mapped ||
-            ptr == g_vk.buf_mask_out.mapped) ? 1 : 0;
+    if (!ptr) return 0;
+    vk_engine_lock();
+    int is_mapped = (g_vk.initialized &&
+                     (ptr == g_vk.buf_vae_out.mapped ||
+                      ptr == g_vk.buf_vit_out.mapped ||
+                      ptr == g_vk.buf_mask_out.mapped)) ? 1 : 0;
+    vk_engine_unlock();
+    return is_mapped;
 }
 
-void viz_vk_shutdown(void) {
+static void viz_vk_shutdown_unlocked(void) {
     if (g_vk.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(g_vk.device);
     }
+
     viz_free_polyphase_schedule_1d(&g_vk.vae_sx);
     viz_free_polyphase_schedule_1d(&g_vk.vae_sy);
     viz_free_polyphase_schedule_1d(&g_vk.vit_sx);
@@ -724,7 +756,14 @@ void viz_vk_shutdown(void) {
 
     if (g_vk.device != VK_NULL_HANDLE) vkDestroyDevice(g_vk.device, NULL);
     if (g_vk.instance != VK_NULL_HANDLE) vkDestroyInstance(g_vk.instance, NULL);
+
     memset(&g_vk, 0, sizeof(g_vk));
+}
+
+void viz_vk_shutdown(void) {
+    vk_engine_lock();
+    viz_vk_shutdown_unlocked();
+    vk_engine_unlock();
 }
 
 static int ensure_cached_schedules(
@@ -860,25 +899,32 @@ static void feather_mask_grid_2d(
         memcpy(out_latent_mask, raw_mask, (size_t)lat_w * (size_t)lat_h * sizeof(float));
         return;
     }
+
     int rad = (int)ceilf(feather_radius_cells + 0.5f);
     if (rad > 7) rad = 7;
 
     int tap_kx[225];
     int tap_ky[225];
+    float tap_akx[225];
+    float tap_aky[225];
     float tap_w[225];
     int num_taps = 0;
 
     for (int ky = -rad; ky <= rad; ++ky) {
-        float dy = fmaxf(0.0f, fabsf((float)ky) - 0.5f);
+        float aky = fabsf((float)ky);
+        float dy = fmaxf(0.0f, aky - 0.5f);
         for (int kx = -rad; kx <= rad; ++kx) {
             if (kx == 0 && ky == 0) continue;
-            float dx = fmaxf(0.0f, fabsf((float)kx) - 0.5f);
+            float akx = fabsf((float)kx);
+            float dx = fmaxf(0.0f, akx - 0.5f);
             float dist = sqrtf(dx * dx + dy * dy);
             if (dist < feather_radius_cells) {
                 float w = 0.5f * (1.0f + cosf((float)M_PI * dist / feather_radius_cells));
                 if (w > 1e-6f) {
                     tap_kx[num_taps] = kx;
                     tap_ky[num_taps] = ky;
+                    tap_akx[num_taps] = akx;
+                    tap_aky[num_taps] = aky;
                     tap_w[num_taps] = w;
                     num_taps++;
                 }
@@ -886,20 +932,33 @@ static void feather_mask_grid_2d(
         }
     }
 
+    const float pi_over_feather = (float)M_PI / feather_radius_cells;
     for (uint32_t ly = 0; ly < lat_h; ++ly) {
         for (uint32_t lx = 0; lx < lat_w; ++lx) {
             float max_env = raw_mask[(size_t)ly * lat_w + lx];
             if (max_env < 1.0f) {
                 for (int t = 0; t < num_taps; ++t) {
-                    float w = tap_w[t];
-                    if (w <= max_env) continue;
+                    float w_max = tap_w[t];
+                    if (w_max <= max_env) continue;
                     int ny = (int)ly + tap_ky[t];
                     int nx = (int)lx + tap_kx[t];
                     if (ny < 0) ny = 0;
                     if (ny >= (int)lat_h) ny = (int)lat_h - 1;
                     if (nx < 0) nx = 0;
                     if (nx >= (int)lat_w) nx = (int)lat_w - 1;
-                    float cand = raw_mask[(size_t)ny * lat_w + (size_t)nx] * w;
+                    float m = raw_mask[(size_t)ny * lat_w + (size_t)nx];
+                    if (m <= max_env || m * w_max <= max_env) continue;
+                    float cand;
+                    if (m >= 0.9999f) {
+                        cand = m * w_max;
+                    } else {
+                        float r_occ = 0.5f * sqrtf(m);
+                        float dx = fmaxf(0.0f, tap_akx[t] - r_occ);
+                        float dy = fmaxf(0.0f, tap_aky[t] - r_occ);
+                        float dist = sqrtf(dx * dx + dy * dy);
+                        if (dist >= feather_radius_cells) continue;
+                        cand = m * 0.5f * (1.0f + cosf(dist * pi_over_feather));
+                    }
                     if (cand > max_env) {
                         max_env = cand;
                     }
@@ -990,18 +1049,30 @@ int viz_vk_condition_image_rgba8(
     float *out_latent_mask_f32,
     VizPerceptualTelemetry *out_telemetry
 ) {
-    if (!viz_vk_is_available() || !src_rgba8) return -1;
+    if (!src_rgba8) return -1;
+
+    vk_engine_lock();
+
+    if (!g_vk.initialized) {
+        viz_vk_init_unlocked();
+    }
+    if (!g_vk.initialized) {
+        vk_engine_unlock();
+        return -1;
+    }
+
     if (src_w > VIZ_VK_MAX_DIM || src_h > VIZ_VK_MAX_DIM ||
         vae_w > VIZ_VK_MAX_DIM || vae_h > VIZ_VK_MAX_DIM ||
         vit_w > VIZ_VK_MAX_DIM || vit_h > VIZ_VK_MAX_DIM) {
+        vk_engine_unlock();
         return -2;
     }
-
     if (ensure_dynamic_pixel_buffers(src_w, src_h, vae_w, vae_h, vit_w, vit_h) != 0) {
+        vk_engine_unlock();
         return -3;
     }
-
     if (ensure_cached_schedules(src_w, src_h, vae_w, vae_h, vit_w, vit_h, framing, mtf_boost) != 0) {
+        vk_engine_unlock();
         return -4;
     }
 
@@ -1177,9 +1248,11 @@ int viz_vk_condition_image_rgba8(
         .pCommandBuffers = &g_vk.cmd_buf
     };
     if (vkQueueSubmit(g_vk.compute_queue, 1u, &sinfo, g_vk.fence) != VK_SUCCESS) {
+        vk_engine_unlock();
         return -5;
     }
     if (vkWaitForFences(g_vk.device, 1u, &g_vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        vk_engine_unlock();
         return -6;
     }
 
@@ -1217,5 +1290,7 @@ int viz_vk_condition_image_rgba8(
         float eff_feather = (input_role == 3) ? mask_feather_radius : 0.0f;
         feather_mask_grid_2d((const float *)g_vk.buf_mask_out.mapped, lat_w, lat_h, eff_feather, out_latent_mask_f32);
     }
+
+    vk_engine_unlock();
     return 0;
 }

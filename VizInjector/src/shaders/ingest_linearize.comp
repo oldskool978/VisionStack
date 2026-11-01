@@ -1,5 +1,4 @@
 #version 450
-
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer InRawBuffer {
@@ -69,18 +68,23 @@ void main() {
     if (px.a <= (1.0 / 255.0)) {
         vec3 acc_lin = vec3(0.0);
         float acc_w = 0.0;
-        int y0 = max(0, int(y) - 2);
-        int y1 = min(int(pc.height) - 1, int(y) + 2);
-        int x0 = max(0, int(x) - 2);
-        int x1 = min(int(pc.width) - 1, int(x) + 2);
+        int ix = int(x);
+        int iy = int(y);
+        int max_x = int(pc.width) - 1;
+        int max_y = int(pc.height) - 1;
+
+        int y0 = max(0, iy - 2);
+        int y1 = min(max_y, iy + 2);
+        int x0 = max(0, ix - 2);
+        int x1 = min(max_x, ix + 2);
 
         for (int ny = y0; ny <= y1; ++ny) {
-            int ady = abs(ny - int(y));
+            int ady = abs(ny - iy);
             uint row_off = uint(ny) * pc.width;
             for (int nx = x0; nx <= x1; ++nx) {
                 vec4 np = unpack_rgba8(raw_rgba[row_off + uint(nx)]);
                 if (np.a > (1.0 / 255.0)) {
-                    int dist = max(1, abs(nx - int(x)) + ady);
+                    int dist = max(1, abs(nx - ix) + ady);
                     float w = np.a / float(dist);
                     acc_lin += vec3(
                         srgb_to_linear(np.r),
@@ -88,6 +92,34 @@ void main() {
                         srgb_to_linear(np.b)
                     ) * w;
                     acc_w += w;
+                }
+            }
+        }
+
+        if (acc_w <= 1e-6) {
+            int oy0 = max(0, iy - 8);
+            int oy1 = min(max_y, iy + 8);
+            int ox0 = max(0, ix - 8);
+            int ox1 = min(max_x, ix + 8);
+            for (int ny = oy0; ny <= oy1; ++ny) {
+                int ady = abs(ny - iy);
+                uint row_off = uint(ny) * pc.width;
+                for (int nx = ox0; nx <= ox1; ++nx) {
+                    int adx = abs(nx - ix);
+                    if (adx <= 2 && ady <= 2) {
+                        continue;
+                    }
+                    vec4 np = unpack_rgba8(raw_rgba[row_off + uint(nx)]);
+                    if (np.a > (1.0 / 255.0)) {
+                        int dist = adx + ady;
+                        float w = np.a / float(dist);
+                        acc_lin += vec3(
+                            srgb_to_linear(np.r),
+                            srgb_to_linear(np.g),
+                            srgb_to_linear(np.b)
+                        ) * w;
+                        acc_w += w;
+                    }
                 }
             }
         }
@@ -102,6 +134,7 @@ void main() {
         uint by = min(y + 1u, pc.height - 1u);
         vec4 px_r = unpack_rgba8(raw_rgba[y * pc.width + rx]);
         vec4 px_b = unpack_rgba8(raw_rgba[by * pc.width + x]);
+
         float grad = max(length(px.rgb - px_r.rgb), length(px.rgb - px_b.rgb));
         float gate = clamp(1.0 - (grad * 16.0), 0.0, 1.0);
         if (gate > 0.0) {

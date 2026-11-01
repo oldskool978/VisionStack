@@ -41,6 +41,7 @@ from models.modeling_qwen35 import (
     _PromptSuffixDrafter,
     _STRICTLY_UPPER_MASK_CACHE,
     _attach_shifted_continuation,
+    _causal_conv1d_fn,
     _chunk_gated_delta_rule,
     _recurrent_gated_delta_rule,
     _shannon_entropy_bits,
@@ -71,15 +72,26 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         and qwen35_pkg.Qwen3_5Model is Qwen3_5Model,
         "models.qwen35 subpackage failed to expose canonical Qwen3_5Model",
     )
-
     _assert(
         _resolve_target_tensor_dtype(
             "language_model.layers.0.linear_attn.dt_bias",
             torch.ones(4, dtype=torch.float32),
             torch.bfloat16,
         )
+        == torch.float32
+        and _resolve_target_tensor_dtype(
+            "language_model.layers.0.linear_attn.A_log",
+            torch.ones(4, dtype=torch.float32),
+            torch.bfloat16,
+        )
+        == torch.float32
+        and _resolve_target_tensor_dtype(
+            "rope.bands",
+            torch.ones(4, dtype=torch.bfloat16),
+            torch.bfloat16,
+        )
         == torch.float32,
-        "_resolve_target_tensor_dtype failed to preserve dt_bias in FP32",
+        "_resolve_target_tensor_dtype failed to preserve SSM/RoPE parameters in FP32",
     )
 
     cfg = MOSSImageConfig(
@@ -163,6 +175,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             == 0.0,
             "_RoPE.get_text_rope diverged from get_expanded_rope text slice",
         )
+
         phase_l16 = dit.rope._compute_phase(
             8, 8, 16, dev, ref_shapes=[(8, 8), (6, 6)]
         )
@@ -497,7 +510,11 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and abs(float(bias_frac[0, 0, q_m0, k_opaque_16].item()) - (-17.0)) < 1e-4
             and -17.0 < float(bias_frac[0, 0, q_m1e6, k_opaque_16].item()) < -16.95
             and abs(float(bias_frac[0, 0, q_m025, k_opaque_16].item()) - (-8.5)) < 1e-4
-            and abs(float(bias_frac[0, 0, q_m025, k_half_16].item()) - (-8.5 + expected_half_q)) < 1e-4
+            and abs(
+                float(bias_frac[0, 0, q_m025, k_half_16].item())
+                - (-8.5 + expected_half_q)
+            )
+            < 1e-4
             and float(bias_frac[0, 0, q_m050, k_opaque_16].item()) < -15.0,
             "Fractional cutout root-shaping or compounded foreground carve-out failed micro-floor continuity / bounds",
         )
@@ -575,6 +592,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             b2_diff <= 0.03125 and b2_mae < 1e-3,
             f"Homogeneous B=2 vectorized DiT batch diverged from B=1 execution: max={b2_diff}, mae={b2_mae}",
         )
+
         mask_het = torch.ones((2, 16), device=dev, dtype=torch.bool)
         mask_het[1, 11:] = False
         out_het_1 = dit(
@@ -661,7 +679,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             len(dit._box_aperture_bias_cache) >= 2,
             "Box aperture bias cache was not populated",
         )
-
         _assert(dit._mod_seq_buf is not None, "_mod_seq_buf was not allocated")
         buf_ptr_1 = dit._mod_seq_buf.data_ptr()
         _assert(
@@ -708,7 +725,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         ).sample
 
         t_step_2 = torch.tensor([250.0], device=dev)
-        out2 = dit(
+        _ = dit(
             lat,
             t_step_2,
             txt,
@@ -738,7 +755,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             len(dit._box_aperture_bias_cache) == 0,
             "clear_caches must flush _box_aperture_bias_cache",
         )
-
     print(
         f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap + Tier1ATextRoPE + FgCarveOut4DRoPE + HetBatch (diff={het_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
     )
@@ -891,6 +907,16 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             f"Gate 3.A Vision bilinear pos_embed or 2D axial RoPE failed: pe_err={pe_interp_err}",
         )
 
+        g_thw_multi = torch.tensor([[1, 4, 4], [1, 4, 6]], dtype=torch.long, device=dev)
+        pix_multi = torch.randn((40, 3, 2, 16, 16), device=dev, dtype=dtype)
+        feat_splits = qwen.get_image_features(pix_multi, g_thw_multi)
+        _assert(
+            len(feat_splits) == 2
+            and feat_splits[0].shape == (4, 128)
+            and feat_splits[1].shape == (6, 128),
+            f"Multi-image cu_seqlens vision split failed: {[tuple(s.shape) for s in feat_splits]}",
+        )
+
         ent_uniform = _shannon_entropy_bits(
             torch.zeros((1, 1024), device=dev, dtype=torch.float32)
         )
@@ -931,6 +957,30 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and q_vid_out.rope_deltas is not None
             and int(q_vid_out.rope_deltas.item()) == -4,
             f"Video forward pass failed: shape={q_vid_out.last_hidden_state.shape}, delta={q_vid_out.rope_deltas}",
+        )
+
+        conv_x = torch.randn((1, 64, 16), device=dev, dtype=torch.float32)
+        conv_w = torch.randn((64, 4), device=dev, dtype=torch.float32)
+        conv_full, conv_final_full = _causal_conv1d_fn(
+            conv_x, conv_w, activation="silu", return_final_state=True
+        )
+        conv_pfx, conv_state_mid = _causal_conv1d_fn(
+            conv_x[:, :, :10], conv_w, activation="silu", return_final_state=True
+        )
+        conv_sfx, conv_final_sfx = _causal_conv1d_fn(
+            conv_x[:, :, 10:],
+            conv_w,
+            activation="silu",
+            conv_state=conv_state_mid,
+            return_final_state=True,
+        )
+        conv_diff = max(
+            float((conv_full - torch.cat([conv_pfx, conv_sfx], dim=-1)).abs().max().item()),
+            float((conv_final_full - conv_final_sfx).abs().max().item()),
+        )
+        _assert(
+            conv_diff < 1e-6,
+            f"Causal Conv1d state continuation drift: {conv_diff}",
         )
 
         ut = (
@@ -1234,7 +1284,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
     qwen_d03.enable_mtp(device=dev, dtype=dtype)
     with torch.no_grad():
         qwen_d03.lm_head.weight.copy_(qwen.language_model.embed_tokens.weight)
-
     with (
         tempfile.TemporaryDirectory() as tmpdir_q,
         tempfile.TemporaryDirectory() as tmpdir_q_stripped,
@@ -1365,7 +1414,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
                 mm_g_out.last_hidden_state[:, -1, :]
             ).float()
         mm_greedy_hidden = torch.cat(mm_greedy_chunks, dim=1)
-
         mm_mtp_ids, mm_mtp_hidden = qwen_d03.reanchor_speculative_generate(
             in_ids,
             max_new_tokens=4,
@@ -1492,7 +1540,18 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             vae._bn_stats_cache is not None,
             "Flux2AutoencoderKL failed to populate _bn_stats_cache",
         )
-        z_clamped = subphase_radial_clamp(z_pack * 10.0, max_sigma=4.5)
+        z_outlier = z_pack * 10.0
+        z_outlier[:, 0:4, 8, 8] = torch.tensor(
+            [12.0, 24.0, -12.0, 36.0], device=dev, dtype=torch.float32
+        )
+        ratios_before = z_outlier[0, 0:4, 8, 8] / z_outlier[0, 0, 8, 8]
+        z_clamped = subphase_radial_clamp(z_outlier, max_sigma=4.5)
+        ratios_after = z_clamped[0, 0:4, 8, 8] / z_clamped[0, 0, 8, 8]
+        subphase_ratio_err = float((ratios_before - ratios_after).abs().max().item())
+        _assert(
+            subphase_ratio_err < 1e-6,
+            f"subphase_radial_clamp distorted 2x2 sub-phase ratio: {subphase_ratio_err}",
+        )
         dec_out = vae.decode_packed_latents(z_clamped)
         vae.clear_caches()
         _assert(

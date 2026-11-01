@@ -69,89 +69,25 @@ static int is_high_bit_depth_or_hdr_memory(const uint8_t *file_bytes, size_t fil
     return is_png16_memory(file_bytes, file_len) || is_hdr_memory(file_bytes, file_len);
 }
 
-static void ingest_scalar_rgba16_to_f32_avx2(
-    const uint16_t *src_rgba16,
-    uint32_t width,
-    uint32_t height,
-    float *out_linear_rgba
+static void ingest_scalar_f32_clamp01_avx2(
+    const float *src_f32,
+    size_t num_floats,
+    float *out_f32
 ) {
-    const size_t num_pixels = (size_t)width * (size_t)height;
-    const __m256 inv65535 = _mm256_set1_ps(1.0f / 65535.0f);
+    const __m256 v_zero = _mm256_setzero_ps();
+    const __m256 v_one = _mm256_set1_ps(1.0f);
     size_t i = 0;
-    for (; i + 2u <= num_pixels; i += 2u) {
-        __m128i words = _mm_loadu_si128((const __m128i *)(src_rgba16 + i * 4u));
-        __m256i ints = _mm256_cvtepu16_epi32(words);
-        __m256 scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(ints), inv65535);
-        _mm256_storeu_ps(out_linear_rgba + i * 4u, scaled);
+    for (; i + 8u <= num_floats; i += 8u) {
+        __m256 v = _mm256_loadu_ps(src_f32 + i);
+        __m256 valid = _mm256_cmp_ps(v, v_zero, _CMP_GT_OQ);
+        __m256 clamped = _mm256_min_ps(v_one, _mm256_and_ps(v, valid));
+        _mm256_storeu_ps(out_f32 + i, clamped);
     }
-    for (; i < num_pixels; ++i) {
-        const uint16_t *s = src_rgba16 + i * 4u;
-        float *d = out_linear_rgba + i * 4u;
-        d[0] = (float)s[0] * (1.0f / 65535.0f);
-        d[1] = (float)s[1] * (1.0f / 65535.0f);
-        d[2] = (float)s[2] * (1.0f / 65535.0f);
-        d[3] = (float)s[3] * (1.0f / 65535.0f);
-    }
-}
-
-static void ingest_srgb_rgba16_with_alpha_prop(
-    const uint16_t *src_rgba16,
-    uint32_t width,
-    uint32_t height,
-    float *out_linear_rgba
-) {
-    const float inv65535 = 1.0f / 65535.0f;
-    for (uint32_t y = 0; y < height; ++y) {
-        const uint16_t *row_src = src_rgba16 + (size_t)y * (size_t)width * 4u;
-        float *row_dst = out_linear_rgba + (size_t)y * (size_t)width * 4u;
-        for (uint32_t x = 0; x < width; ++x) {
-            const uint16_t *p = row_src + (size_t)x * 4u;
-            float *dst = row_dst + (size_t)x * 4u;
-            if (p[3] <= 257u) {
-                float sum_r = 0.0f;
-                float sum_g = 0.0f;
-                float sum_b = 0.0f;
-                float sum_w = 0.0f;
-                int y0 = (y >= 2u) ? ((int)y - 2) : 0;
-                int y1 = (y + 2u < height) ? ((int)y + 2) : ((int)height - 1);
-                int x0 = (x >= 2u) ? ((int)x - 2) : 0;
-                int x1 = (x + 2u < width) ? ((int)x + 2) : ((int)width - 1);
-                for (int ny = y0; ny <= y1; ++ny) {
-                    int dy = ny - (int)y;
-                    int ady = dy < 0 ? -dy : dy;
-                    const uint16_t *nrow = src_rgba16 + (size_t)ny * (size_t)width * 4u;
-                    for (int nx = x0; nx <= x1; ++nx) {
-                        const uint16_t *np = nrow + (size_t)nx * 4u;
-                        if (np[3] > 257u) {
-                            int dx = nx - (int)x;
-                            int dist = (dx < 0 ? -dx : dx) + ady;
-                            if (dist < 1) dist = 1;
-                            float w = ((float)np[3] * inv65535) / (float)dist;
-                            sum_r += viz_srgb_to_linear_f32((float)np[0] * inv65535) * w;
-                            sum_g += viz_srgb_to_linear_f32((float)np[1] * inv65535) * w;
-                            sum_b += viz_srgb_to_linear_f32((float)np[2] * inv65535) * w;
-                            sum_w += w;
-                        }
-                    }
-                }
-                if (sum_w > 1e-6f) {
-                    float inv_w = 1.0f / sum_w;
-                    dst[0] = sum_r * inv_w;
-                    dst[1] = sum_g * inv_w;
-                    dst[2] = sum_b * inv_w;
-                } else {
-                    dst[0] = 0.0f;
-                    dst[1] = 0.0f;
-                    dst[2] = 0.0f;
-                }
-                dst[3] = 0.0f;
-            } else {
-                dst[0] = viz_srgb_to_linear_f32((float)p[0] * inv65535);
-                dst[1] = viz_srgb_to_linear_f32((float)p[1] * inv65535);
-                dst[2] = viz_srgb_to_linear_f32((float)p[2] * inv65535);
-                dst[3] = (float)p[3] * inv65535;
-            }
-        }
+    for (; i < num_floats; ++i) {
+        float v = src_f32[i];
+        if (!(v > 0.0f)) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        out_f32[i] = v;
     }
 }
 
@@ -164,6 +100,7 @@ static int decode_high_bit_depth_to_tls(
     uint32_t *out_h
 ) {
     int is_scalar_role = (input_role == VIZ_ROLE_DEPTH_MAP || input_role == VIZ_ROLE_INPAINT_MASK);
+
     if (is_png16_memory(file_bytes, file_len)) {
         spng_ctx *ctx = spng_ctx_new(0);
         if (!ctx) return -1;
@@ -179,9 +116,9 @@ static int decode_high_bit_depth_to_tls(
                         float *lin = acquire_tls_f32(&g_tls_src_lin, &g_tls_src_lin_cap, needed);
                         if (lin) {
                             if (is_scalar_role) {
-                                ingest_scalar_rgba16_to_f32_avx2(rgba16, ihdr.width, ihdr.height, lin);
+                                viz_ingest_scalar_rgba16_to_f32(rgba16, ihdr.width, ihdr.height, lin);
                             } else {
-                                ingest_srgb_rgba16_with_alpha_prop(rgba16, ihdr.width, ihdr.height, lin);
+                                viz_ingest_rgba16_to_linear_f32(rgba16, ihdr.width, ihdr.height, lin);
                             }
                             free(rgba16);
                             spng_ctx_free(ctx);
@@ -206,10 +143,7 @@ static int decode_high_bit_depth_to_tls(
             float *lin = acquire_tls_f32(&g_tls_src_lin, &g_tls_src_lin_cap, needed);
             if (lin) {
                 if (is_scalar_role) {
-                    for (size_t i = 0; i < needed; ++i) {
-                        float v = hdr_px[i];
-                        lin[i] = fminf(1.0f, fmaxf(0.0f, v));
-                    }
+                    ingest_scalar_f32_clamp01_avx2(hdr_px, needed, lin);
                 } else {
                     viz_ingest_rgbaf32_to_linear_f32(hdr_px, (uint32_t)w, (uint32_t)h, 1, lin);
                 }
@@ -222,6 +156,7 @@ static int decode_high_bit_depth_to_tls(
         }
         if (hdr_px) stbi_image_free(hdr_px);
     }
+
     return -1;
 }
 
@@ -320,6 +255,7 @@ static int build_wire_vizj_from_branches(
         free(rgba8);
         return -2;
     }
+
     viz_postprocess_vae_f32_to_rgb8(out->vae_planar_f32, out->vae_width, out->vae_height, 0, rgb8);
     for (size_t i = 0; i < px_count; ++i) {
         rgba8[i * 4u + 0u] = rgb8[i * 3u + 0u];
@@ -430,7 +366,6 @@ int32_t vizinjector_core_process_linear_f32(
     if (cfg.emit_vae_branch || cfg.emit_mask_branch) {
         vae_lin = acquire_tls_f32(&g_tls_vae_lin, &g_tls_vae_lin_cap, (size_t)vae_w * (size_t)vae_h * 4u);
         if (!vae_lin) return -2;
-
         if (viz_resample_2d_linear_rgba(src_linear_rgba, src_w, src_h, vae_w, vae_h, (VizFramingMode)cfg.framing_mode, mtf, knee, vae_lin) != 0) {
             return -3;
         }
@@ -475,6 +410,7 @@ int32_t vizinjector_core_process_linear_f32(
         uint32_t grid_w = vit_w / 16u;
         uint32_t num_patches = grid_h * grid_w;
         size_t vit_floats = (size_t)num_patches * 3u * 2u * 256u;
+
         out->vit_patches_f32 = acquire_tls_f32(&g_tls_out_vit, &g_tls_out_vit_cap, vit_floats);
         if (!out->vit_patches_f32) {
             vizinjector_core_free_output(out);
@@ -549,13 +485,16 @@ int32_t vizinjector_core_process_rgba8(
             out->vae_planar_f32 = acquire_tls_f32(&g_tls_out_vae, &g_tls_out_vae_cap, vae_floats);
             if (!out->vae_planar_f32) return -2;
             out->vae_Floats = (uint32_t)vae_floats;
+
             viz_resample_majority_color_map_rgba8(src_rgba8, src_w, src_h, vae_w, vae_h, (VizFramingMode)cfg.framing_mode, out->vae_planar_f32);
+
             VizPerceptualTelemetry telem;
             viz_compute_perceptual_telemetry(out->vae_planar_f32, vae_w, vae_h, &telem);
             out->mean_luminance = telem.mean_luminance;
             out->rms_contrast = telem.rms_contrast;
             out->shannon_entropy_bits = telem.shannon_entropy_bits;
             out->laplacian_sharpness = telem.laplacian_sharpness;
+
             if (cfg.emit_wire_vizj) {
                 build_wire_vizj_from_branches(&cfg, out);
             }
@@ -581,6 +520,16 @@ int32_t vizinjector_core_process_rgba8(
 
         out->vae_planar_f32 = NULL;
         out->vit_patches_f32 = NULL;
+        out->latent_mask_f32 = NULL;
+
+        if (vae_floats > 0u) {
+            out->vae_planar_f32 = acquire_tls_f32(&g_tls_out_vae, &g_tls_out_vae_cap, vae_floats);
+            if (!out->vae_planar_f32) return -2;
+        }
+        if (vit_floats > 0u) {
+            out->vit_patches_f32 = acquire_tls_f32(&g_tls_out_vit, &g_tls_out_vit_cap, vit_floats);
+            if (!out->vit_patches_f32) return -2;
+        }
         if (m_floats > 0u) {
             out->latent_mask_f32 = acquire_tls_f32(&g_tls_out_mask, &g_tls_out_mask_cap, m_floats);
             if (!out->latent_mask_f32) return -2;

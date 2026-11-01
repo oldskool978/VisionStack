@@ -24,6 +24,7 @@ from .schema import (
 HERE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = HERE_DIR.parent
 IS_WIN = sys.platform == "win32"
+
 _DLL_NAME = "vizinjector.dll" if IS_WIN else "libvizinjector.so"
 _VIZJ_MAGIC = b"VIZJ_CONTAINER01"
 _VIZJ_HEADER_SIZE = 144
@@ -36,6 +37,18 @@ VIZJ_DTYPE_FP32 = 0
 VIZJ_DTYPE_BF16 = 1
 VIZJ_DTYPE_FP16 = 2
 VIZJ_DTYPE_UINT8_WEBP = 3
+
+
+def _empty_host_tensor(
+    shape: Tuple[int, ...], dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    with torch.inference_mode(False):
+        if torch.cuda.is_available():
+            try:
+                return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+            except Exception:
+                pass
+        return torch.empty(shape, dtype=dtype, device="cpu")
 
 
 class CVizPerceptualTelemetry(ctypes.Structure):
@@ -313,6 +326,38 @@ class VizInjectorClient:
         ]
         self.lib.vizinjector_process_rgba8.restype = ctypes.c_int32
 
+        self._has_high_depth_exports = hasattr(
+            self.lib, "vizinjector_process_rgba16"
+        ) and hasattr(self.lib, "vizinjector_process_rgbaf32")
+        if self._has_high_depth_exports:
+            self.lib.vizinjector_process_rgba16.argtypes = [
+                ctypes.POINTER(ctypes.c_uint16),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(CVizInjectorConfig),
+                ctypes.POINTER(CVizInjectorOutput),
+            ]
+            self.lib.vizinjector_process_rgba16.restype = ctypes.c_int32
+
+            self.lib.vizinjector_process_rgbaf32.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_int32,
+                ctypes.POINTER(CVizInjectorConfig),
+                ctypes.POINTER(CVizInjectorOutput),
+            ]
+            self.lib.vizinjector_process_rgbaf32.restype = ctypes.c_int32
+
+            self.lib.vizinjector_process_linear_f32.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(CVizInjectorConfig),
+                ctypes.POINTER(CVizInjectorOutput),
+            ]
+            self.lib.vizinjector_process_linear_f32.restype = ctypes.c_int32
+
         self.lib.vizinjector_postprocess_vae_to_rgb8.argtypes = [
             ctypes.POINTER(ctypes.c_float),
             ctypes.c_uint32,
@@ -406,7 +451,7 @@ class VizInjectorClient:
         try:
             vae_tensor: Optional[torch.Tensor] = None
             if out.vae_planar_f32 and out.vae_Floats > 0:
-                vae_tensor = torch.empty(
+                vae_tensor = _empty_host_tensor(
                     (1, 3, int(out.vae_height), int(out.vae_width)),
                     dtype=torch.float32,
                 )
@@ -420,7 +465,7 @@ class VizInjectorClient:
             grid_thw: Optional[torch.Tensor] = None
             if out.vit_patches_f32 and out.vit_Floats > 0:
                 n_p = int(out.vit_num_patches)
-                vit_patches = torch.empty(
+                vit_patches = _empty_host_tensor(
                     (n_p, 3, 2, 16, 16), dtype=torch.float32
                 )
                 ctypes.memmove(
@@ -428,20 +473,21 @@ class VizInjectorClient:
                     out.vit_patches_f32,
                     int(out.vit_Floats) * 4,
                 )
-                grid_thw = torch.tensor(
-                    [
+                with torch.inference_mode(False):
+                    grid_thw = torch.tensor(
                         [
-                            int(out.grid_thw[0]),
-                            int(out.grid_thw[1]),
-                            int(out.grid_thw[2]),
-                        ]
-                    ],
-                    dtype=torch.long,
-                )
+                            [
+                                int(out.grid_thw[0]),
+                                int(out.grid_thw[1]),
+                                int(out.grid_thw[2]),
+                            ]
+                        ],
+                        dtype=torch.long,
+                    )
 
             latent_mask: Optional[torch.Tensor] = None
             if out.latent_mask_f32 and out.mask_Floats > 0:
-                latent_mask = torch.empty(
+                latent_mask = _empty_host_tensor(
                     (1, 1, int(out.mask_height), int(out.mask_width)),
                     dtype=torch.float32,
                 )
@@ -555,15 +601,23 @@ class VizInjectorClient:
         request: Optional[VizInjectorRequest] = None,
     ) -> ConditionedVisionBundle:
         req = request if request is not None else VizInjectorRequest()
-        if rgba_array.ndim != 3 or rgba_array.shape[2] not in (3, 4):
+        if rgba_array.dtype == np.uint16:
+            return self.condition_rgba16(rgba_array, req)
+        if np.issubdtype(rgba_array.dtype, np.floating):
+            return self.condition_rgbaf32(rgba_array, req, input_is_linear=0)
+        if rgba_array.ndim == 2:
+            rgba_array = np.stack([rgba_array, rgba_array, rgba_array], axis=-1)
+        if rgba_array.ndim != 3 or rgba_array.shape[2] not in (1, 3, 4):
             raise ValueError(
-                f"Expected HxWx3 or HxWx4 uint8 array, got {rgba_array.shape}"
+                f"Expected HxWx1, HxWx3, or HxWx4 array, got {rgba_array.shape}"
             )
         h, w, ch = rgba_array.shape
+        if ch == 1:
+            rgba_array = np.repeat(rgba_array, 3, axis=2)
+            ch = 3
         if ch == 3:
             alpha = np.full((h, w, 1), 255, dtype=np.uint8)
             rgba_array = np.concatenate([rgba_array, alpha], axis=2)
-
         contig = np.ascontiguousarray(rgba_array, dtype=np.uint8)
         c_ptr = contig.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         c_cfg = self._build_c_config(req)
@@ -577,20 +631,174 @@ class VizInjectorClient:
             )
         return self._harvest_c_output(c_out, req)
 
+    def condition_rgba16(
+        self,
+        rgba16_array: np.ndarray,
+        request: Optional[VizInjectorRequest] = None,
+    ) -> ConditionedVisionBundle:
+        req = request if request is not None else VizInjectorRequest()
+        if rgba16_array.ndim == 2:
+            rgba16_array = np.stack(
+                [rgba16_array, rgba16_array, rgba16_array], axis=-1
+            )
+        if rgba16_array.ndim != 3 or rgba16_array.shape[2] not in (1, 3, 4):
+            raise ValueError(
+                f"Expected HxWx1, HxWx3, or HxWx4 uint16 array, got {rgba16_array.shape}"
+            )
+        h, w, ch = rgba16_array.shape
+        if ch == 1:
+            rgba16_array = np.repeat(rgba16_array, 3, axis=2)
+            ch = 3
+        if ch == 3:
+            alpha = np.full((h, w, 1), 65535, dtype=np.uint16)
+            rgba16_array = np.concatenate([rgba16_array, alpha], axis=2)
+        contig = np.ascontiguousarray(rgba16_array, dtype=np.uint16)
+        if not self._has_high_depth_exports:
+            u8_fallback = np.right_shift(contig, 8).astype(np.uint8)
+            return self.condition_rgba8(u8_fallback, req)
+        c_ptr = contig.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        c_cfg = self._build_c_config(req)
+        c_out = CVizInjectorOutput()
+        rc = self.lib.vizinjector_process_rgba16(
+            c_ptr, w, h, ctypes.byref(c_cfg), ctypes.byref(c_out)
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"VizInjector native RGBA16 conditioning failed with code {rc}"
+            )
+        return self._harvest_c_output(c_out, req)
+
+    def condition_rgbaf32(
+        self,
+        rgbaf32_array: np.ndarray,
+        request: Optional[VizInjectorRequest] = None,
+        input_is_linear: int = 0,
+    ) -> ConditionedVisionBundle:
+        req = request if request is not None else VizInjectorRequest()
+        if rgbaf32_array.ndim == 2:
+            rgbaf32_array = np.stack(
+                [rgbaf32_array, rgbaf32_array, rgbaf32_array], axis=-1
+            )
+        if rgbaf32_array.ndim != 3 or rgbaf32_array.shape[2] not in (1, 3, 4):
+            raise ValueError(
+                f"Expected HxWx1, HxWx3, or HxWx4 float32 array, got {rgbaf32_array.shape}"
+            )
+        h, w, ch = rgbaf32_array.shape
+        if ch == 1:
+            rgbaf32_array = np.repeat(rgbaf32_array, 3, axis=2)
+            ch = 3
+        if ch == 3:
+            alpha = np.ones((h, w, 1), dtype=np.float32)
+            rgbaf32_array = np.concatenate(
+                [rgbaf32_array.astype(np.float32, copy=False), alpha], axis=2
+            )
+        contig = np.ascontiguousarray(rgbaf32_array, dtype=np.float32)
+        if not self._has_high_depth_exports:
+            u8_fallback = np.clip(np.round(contig * 255.0), 0.0, 255.0).astype(
+                np.uint8
+            )
+            return self.condition_rgba8(u8_fallback, req)
+        c_ptr = contig.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        c_cfg = self._build_c_config(req)
+        c_out = CVizInjectorOutput()
+        rc = self.lib.vizinjector_process_rgbaf32(
+            c_ptr,
+            w,
+            h,
+            int(input_is_linear),
+            ctypes.byref(c_cfg),
+            ctypes.byref(c_out),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"VizInjector native RGBAf32 conditioning failed with code {rc}"
+            )
+        return self._harvest_c_output(c_out, req)
+
+    def condition_tensor(
+        self,
+        tensor: torch.Tensor,
+        request: Optional[VizInjectorRequest] = None,
+        input_is_linear: int = 0,
+        value_range: str = "minus1_to_1",
+    ) -> ConditionedVisionBundle:
+        req = request if request is not None else VizInjectorRequest()
+        t = tensor.detach()
+        if t.ndim == 4:
+            if t.shape[0] != 1:
+                raise ValueError(
+                    f"condition_tensor expects batch size 1 for 4D tensors, got {tuple(t.shape)}"
+                )
+            t = t[0]
+        if t.ndim == 2:
+            t = t.unsqueeze(-1).expand(-1, -1, 3)
+        elif t.ndim == 3:
+            if t.shape[0] in (1, 3, 4) and t.shape[2] not in (1, 3, 4):
+                t = t.permute(1, 2, 0)
+        else:
+            raise ValueError(
+                f"Unsupported tensor shape for conditioning: {tuple(t.shape)}"
+            )
+
+        if t.dtype == torch.uint8:
+            return self.condition_rgba8(t.cpu().contiguous().numpy(), req)
+
+        t_f32 = t.to(device="cpu", dtype=torch.float32).contiguous()
+        v_mode = str(value_range or "minus1_to_1").strip().lower()
+        eff_req = req.model_copy(update={"deband_8bit": False})
+        if int(input_is_linear) == 0:
+            if v_mode in ("0_to_255", "uint8", "[0,255]") or float(t_f32.max().item()) > 1.5:
+                t_f32 = (t_f32 * (1.0 / 255.0)).clamp(0.0, 1.0)
+            elif v_mode in ("0_to_1", "unit", "[0,1]") and float(t_f32.min().item()) >= -1e-3:
+                t_f32 = t_f32.clamp(0.0, 1.0)
+            else:
+                if t_f32.shape[2] == 4:
+                    rgb = (t_f32[..., :3] * 0.5 + 0.5).clamp(0.0, 1.0)
+                    alpha = t_f32[..., 3:4].clamp(0.0, 1.0)
+                    t_f32 = torch.cat([rgb, alpha], dim=-1)
+                else:
+                    t_f32 = (t_f32 * 0.5 + 0.5).clamp(0.0, 1.0)
+        return self.condition_rgbaf32(
+            t_f32.numpy(), eff_req, input_is_linear=input_is_linear
+        )
+
     def condition_image(
         self,
-        source: Union[str, Path, bytes, np.ndarray, Image.Image],
+        source: Union[str, Path, bytes, np.ndarray, Image.Image, torch.Tensor],
         request: Optional[VizInjectorRequest] = None,
         **kwargs: Any,
     ) -> ConditionedVisionBundle:
+        tensor_value_range = str(kwargs.pop("value_range", "minus1_to_1"))
+        tensor_is_linear = int(kwargs.pop("input_is_linear", 0))
         req = (
             request.model_copy(update=kwargs)
             if request is not None
             else VizInjectorRequest(**kwargs)
         )
+        if isinstance(source, torch.Tensor):
+            return self.condition_tensor(
+                source,
+                req,
+                input_is_linear=tensor_is_linear,
+                value_range=tensor_value_range,
+            )
         if isinstance(source, np.ndarray):
+            if source.dtype == np.uint16:
+                return self.condition_rgba16(source, req)
+            if np.issubdtype(source.dtype, np.floating):
+                return self.condition_rgbaf32(
+                    source, req, input_is_linear=tensor_is_linear
+                )
             return self.condition_rgba8(source, req)
         if isinstance(source, Image.Image):
+            if source.mode in ("I;16", "I;16L", "I;16B", "I"):
+                arr16 = np.asarray(source, dtype=np.uint16)
+                return self.condition_rgba16(arr16, req)
+            if source.mode == "F":
+                arr_f = np.asarray(source, dtype=np.float32)
+                return self.condition_rgbaf32(
+                    arr_f, req, input_is_linear=tensor_is_linear
+                )
             return self.condition_rgba8(
                 np.asarray(source.convert("RGBA"), dtype=np.uint8), req
             )
@@ -626,7 +834,13 @@ class VizInjectorClient:
     def latentize(
         self,
         source: Union[
-            str, Path, bytes, np.ndarray, Image.Image, ConditionedVisionBundle
+            str,
+            Path,
+            bytes,
+            np.ndarray,
+            Image.Image,
+            torch.Tensor,
+            ConditionedVisionBundle,
         ],
         vae_module: Optional[Any] = None,
         vision_module: Optional[Any] = None,
@@ -649,7 +863,7 @@ class VizInjectorClient:
         if bundle.vae_tensor is not None and active_vae is not None:
             vae_dev = next(active_vae.parameters()).device
             vae_dtype = next(active_vae.parameters()).dtype
-            inp = bundle.vae_tensor.to(device=vae_dev, dtype=vae_dtype)
+            inp = bundle.vae_tensor.to(device=vae_dev, dtype=vae_dtype, non_blocking=True)
             raw_lat = active_vae.encode_to_packed_latents(inp)
             bundle.packed_latents = subphase_radial_clamp(
                 raw_lat, max_sigma=req.latent_clamp_sigma
@@ -662,8 +876,8 @@ class VizInjectorClient:
         ):
             vis_dev = next(vision_module.parameters()).device
             vis_dtype = next(vision_module.parameters()).dtype
-            p_in = bundle.vit_patches.to(device=vis_dev, dtype=vis_dtype)
-            g_in = bundle.grid_thw.to(device=vis_dev)
+            p_in = bundle.vit_patches.to(device=vis_dev, dtype=vis_dtype, non_blocking=True)
+            g_in = bundle.grid_thw.to(device=vis_dev, non_blocking=True)
             vis_out = vision_module(p_in, g_in)
             bundle.vit_embeds = vis_out.pooler_output.detach()
 
@@ -806,6 +1020,7 @@ class VizInjectorClient:
         req = request if request is not None else VizInjectorRequest()
         in_arr = np.frombuffer(container_bytes, dtype=np.uint8)
         in_ptr = in_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
         hdr = CVizContainerHeader()
         vae_ptr = ctypes.c_void_p()
         vit_ptr = ctypes.c_void_p()
@@ -854,16 +1069,20 @@ class VizInjectorClient:
         packed_latents: Optional[torch.Tensor] = None
         if vae_ptr.value and hdr.vae_bytes > 0 and lat_h > 0 and lat_w > 0:
             if hdr.vae_dtype == VIZJ_DTYPE_BF16:
-                t_bf16 = torch.empty(
-                    (1, 128, lat_h, lat_w), dtype=torch.bfloat16
-                )
-                if t_bf16.numel() * t_bf16.element_size() == int(hdr.vae_bytes):
-                    ctypes.memmove(
-                        t_bf16.data_ptr(), vae_ptr.value, int(hdr.vae_bytes)
+                with torch.inference_mode(False):
+                    t_bf16 = torch.empty(
+                        (1, 128, lat_h, lat_w), dtype=torch.bfloat16, device="cpu"
                     )
-                    packed_latents = t_bf16.float()
+                    if t_bf16.numel() * t_bf16.element_size() == int(hdr.vae_bytes):
+                        ctypes.memmove(
+                            t_bf16.data_ptr(), vae_ptr.value, int(hdr.vae_bytes)
+                        )
+                        packed_latents = _empty_host_tensor(
+                            (1, 128, lat_h, lat_w), dtype=torch.float32
+                        )
+                        packed_latents.copy_(t_bf16)
             else:
-                packed_latents = torch.empty(
+                packed_latents = _empty_host_tensor(
                     (1, 128, lat_h, lat_w), dtype=torch.float32
                 )
                 if packed_latents.numel() * packed_latents.element_size() == int(
@@ -889,7 +1108,9 @@ class VizInjectorClient:
             n_tok = max(1, n_tok)
             embed_dim = int(hdr.vit_bytes) // (2 * n_tok)
             if embed_dim > 0:
-                vit_embeds = torch.empty((n_tok, embed_dim), dtype=torch.bfloat16)
+                vit_embeds = _empty_host_tensor(
+                    (n_tok, embed_dim), dtype=torch.bfloat16
+                )
                 ctypes.memmove(
                     vit_embeds.data_ptr(), vit_ptr.value, int(hdr.vit_bytes)
                 )
@@ -900,7 +1121,7 @@ class VizInjectorClient:
 
         latent_mask: Optional[torch.Tensor] = None
         if mask_ptr.value and hdr.mask_bytes > 0 and lat_h > 0 and lat_w > 0:
-            latent_mask = torch.empty(
+            latent_mask = _empty_host_tensor(
                 (1, 1, lat_h, lat_w), dtype=torch.float32
             )
             if latent_mask.numel() * latent_mask.element_size() == int(hdr.mask_bytes):
@@ -918,10 +1139,11 @@ class VizInjectorClient:
             vit_h = int(hdr.grid_thw[1]) * 16
             vit_w = int(hdr.grid_thw[2]) * 16
 
-        grid_thw = torch.tensor(
-            [[int(hdr.grid_thw[0]), int(hdr.grid_thw[1]), int(hdr.grid_thw[2])]],
-            dtype=torch.long,
-        )
+        with torch.inference_mode(False):
+            grid_thw = torch.tensor(
+                [[int(hdr.grid_thw[0]), int(hdr.grid_thw[1]), int(hdr.grid_thw[2])]],
+                dtype=torch.long,
+            )
         telem = VizInjectorTelemetry(
             mean_luminance=float(hdr.mean_luminance),
             rms_contrast=float(hdr.rms_contrast),
@@ -969,6 +1191,7 @@ class VizInjectorClient:
             raise ValueError(
                 f"Expected 3-channel RGB tensor, got shape {decoded_tensor.shape}"
             )
+
         cpu_f32 = (
             decoded_tensor.detach()
             .to(device="cpu", dtype=torch.float32)
@@ -976,6 +1199,7 @@ class VizInjectorClient:
         )
         pil_list: List[Image.Image] = []
         telem_list: List[VizInjectorTelemetry] = []
+
         for i in range(b):
             sample = cpu_f32[i].contiguous()
             out_rgb8 = np.empty((h, w, 3), dtype=np.uint8)

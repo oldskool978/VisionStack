@@ -16,13 +16,53 @@ from schema import (
     bbox_to_normalized,
     extract_box_text_and_caption,
 )
-from .env import _canonicalize_device
+
+from .env import (
+    HAS_VIZINJECTOR,
+    ROOT_DIR,
+    VizInjectorClient,
+    VizInjectorRequest,
+    _canonicalize_device,
+    _pin_cpu_tensor,
+)
 
 _AI_TOOLKIT_MAX_REF_DIM = 768
 _HIERARCHICAL_SPLAT_GAMMA = 4.0
 _HIERARCHICAL_SPLAT_Z_GAMMA = 2.5
 _CFL_SIGMA_FLOOR = 0.12
 _CFL_STEP_MULTIPLIER = 1.85
+
+_FALLBACK_VIZ_CLIENT: Optional[Any] = None
+
+
+def _get_shared_viz_client() -> Optional[Any]:
+    global _FALLBACK_VIZ_CLIENT
+    if not HAS_VIZINJECTOR or VizInjectorClient is None:
+        return None
+    if _FALLBACK_VIZ_CLIENT is None or getattr(_FALLBACK_VIZ_CLIENT, "_closed", False):
+        try:
+            import sys
+
+            local_dll = ROOT_DIR / "vizinjector" / (
+                "vizinjector.dll" if sys.platform == "win32" else "libvizinjector.so"
+            )
+            _FALLBACK_VIZ_CLIENT = VizInjectorClient(
+                lib_path=local_dll if local_dll.is_file() else None,
+                prefer_vulkan=True,
+            )
+        except Exception:
+            _FALLBACK_VIZ_CLIENT = None
+    return _FALLBACK_VIZ_CLIENT
+
+
+def _layer_dominates(
+    z_j: float, area_j: float, z_i: float, area_i: float
+) -> bool:
+    if z_j > z_i + 1e-4:
+        return True
+    if abs(z_j - z_i) <= 1e-4 and area_j < area_i - 1e-5:
+        return True
+    return False
 
 
 def _probe_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
@@ -67,6 +107,7 @@ def _resolve_unboxed_reference_dims(
     else:
         cap_w = int(req_w)
         cap_h = int(req_h)
+
     max_area = float(max(64 * 64, cap_w * cap_h))
     dims = _probe_image_dimensions(path)
     if dims is not None and dims[0] > 0 and dims[1] > 0:
@@ -252,7 +293,6 @@ def splat_box_masks_to_canvas(
     target_dev = _canonicalize_device(device)
     eff_h = max(1, int(h_lat))
     eff_w = max(1, int(w_lat))
-
     if base_mask is not None:
         canvas_mask = base_mask.to(device=target_dev, dtype=torch.float32).clone()
         if canvas_mask.ndim == 2:
@@ -351,7 +391,6 @@ def build_box_denoise_horizon_map(
 
     parsed_boxes: List[Tuple[int, int, int, int, float, float, bool]] = []
     deferred_text_boxes: List[Tuple[int, int, int, int, float, bool]] = []
-
     for item in layout_items:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
@@ -378,6 +417,7 @@ def build_box_denoise_horizon_map(
             is_inpaint or is_paste or has_explicit_dn or is_unreferenced_text
         ):
             continue
+
         bbox = item.get("bbox")
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
             continue
@@ -390,7 +430,6 @@ def build_box_denoise_horizon_map(
         x0 = max(0, min(w_lat - 1, int(round(ux0 * w_lat))))
         y1 = max(y0 + 1, min(h_lat, int(round(uy1 * h_lat))))
         x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
-
         if is_unreferenced_text:
             text_dn = (
                 max(0.01, min(1.0, float(raw_dn)))
@@ -411,7 +450,6 @@ def build_box_denoise_horizon_map(
 
     if not parsed_boxes and not deferred_text_boxes:
         return None
-
     has_non_uniform_base = any(
         has_exp and abs(dn - fallback_dn) > 1e-5
         for _, _, _, _, dn, _, has_exp in parsed_boxes
@@ -435,6 +473,7 @@ def build_box_denoise_horizon_map(
             (h_lat, w_lat), device=target_dev, dtype=torch.float32
         )
 
+        box_records: List[Tuple[float, float, float, float, torch.Tensor]] = []
         for y0, x0, y1, x1, box_dn, z_val, _ in parsed_boxes:
             area_frac = max(
                 1e-4, min(1.0, float((y1 - y0) * (x1 - x0)) / total_cells)
@@ -456,10 +495,19 @@ def build_box_denoise_horizon_map(
                 w_inside = 0.5 * (
                     1.0 + torch.cos(math.pi * (dist / raw_feather).clamp(0.0, 1.0))
                 )
-            w_hier = w_inside * priority
-            accum_dn = accum_dn + w_hier * box_dn
-            accum_w = accum_w + w_hier
+            box_records.append((area_frac, z_val, priority, box_dn, w_inside))
             union_alpha = torch.maximum(union_alpha, w_inside)
+
+        num_b = len(box_records)
+        for i, (area_i, z_i, prio_i, dn_i, w_in_i) in enumerate(box_records):
+            eff_w_in = w_in_i
+            if num_b > 1:
+                for j, (area_j, z_j, _, _, w_in_j) in enumerate(box_records):
+                    if i != j and _layer_dominates(z_j, area_j, z_i, area_i):
+                        eff_w_in = eff_w_in * (1.0 - w_in_j).clamp(0.0, 1.0)
+            w_hier = eff_w_in * prio_i
+            accum_dn = accum_dn + w_hier * dn_i
+            accum_w = accum_w + w_hier
 
         safe_w = accum_w.clamp(min=1e-6)
         fg_dn = torch.where(
@@ -525,7 +573,6 @@ def compose_latent_inpaint_mask(
     )
     if ref_t is None:
         return None
-
     eff_h = int(h_lat) if h_lat is not None else int(ref_t.shape[-2])
     eff_w = int(w_lat) if w_lat is not None else int(ref_t.shape[-1])
 
@@ -631,7 +678,6 @@ def splat_box_latents_to_canvas(
     w_work = w_lat * sub_scale
 
     canvas_work = _unpack_latents_2x2(canvas) if use_subphase else canvas
-
     accum_lat = torch.zeros(
         (1, c_work, h_work, w_work), device=device, dtype=torch.float32
     )
@@ -659,6 +705,21 @@ def splat_box_latents_to_canvas(
     ]
     z_mean = (sum(z_vals) / float(len(z_vals))) if z_vals else 0.0
 
+    prepared_layers: List[
+        Tuple[
+            int,
+            int,
+            int,
+            int,
+            float,
+            float,
+            float,
+            float,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ] = []
+
     for entry in splat_entries:
         box_lat_cpu = entry[0]
         norm_bbox = entry[1]
@@ -680,12 +741,12 @@ def splat_box_latents_to_canvas(
             _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
             + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((box_z - z_mean) / 4.0)
         )
-
         eff_dn = (
             max(0.01, min(1.0, float(box_dn)))
             if box_dn is not None
             else fallback_dn
         )
+
         eff_feather = raw_feather
         if eff_feather > 1e-4:
             if box_sharpness is not None and float(box_sharpness) > 0.0:
@@ -745,33 +806,94 @@ def splat_box_latents_to_canvas(
             local_alpha = torch.minimum(local_alpha, b_mask.clamp(0.0, 1.0))
 
         local_alpha = local_alpha.clamp(0.0, 1.0)
-        w_hier = local_alpha * priority
-        b_rms = torch.sqrt(torch.mean(b_work * b_work, dim=1, keepdim=True) + 1e-12)
-        w_rms = w_hier * b_rms
-
-        accum_lat[:, :, sy0:sy1, sx0:sx1] = (
-            accum_lat[:, :, sy0:sy1, sx0:sx1] + w_hier * b_work
-        )
-        accum_weight[:, :, sy0:sy1, sx0:sx1] = (
-            accum_weight[:, :, sy0:sy1, sx0:sx1] + w_hier
-        )
-        accum_rms_w1[:, :, sy0:sy1, sx0:sx1] = (
-            accum_rms_w1[:, :, sy0:sy1, sx0:sx1] + w_rms
-        )
-        accum_rms_w2[:, :, sy0:sy1, sx0:sx1] = (
-            accum_rms_w2[:, :, sy0:sy1, sx0:sx1] + w_rms * w_rms
-        )
-        accum_dn[:, :, sy0:sy1, sx0:sx1] = (
-            accum_dn[:, :, sy0:sy1, sx0:sx1] + w_hier * eff_dn
-        )
         union_alpha_work[:, :, sy0:sy1, sx0:sx1] = torch.maximum(
             union_alpha_work[:, :, sy0:sy1, sx0:sx1], local_alpha
+        )
+        prepared_layers.append(
+            (
+                sy0,
+                sy1,
+                sx0,
+                sx1,
+                area_frac,
+                box_z,
+                priority,
+                eff_dn,
+                b_work,
+                local_alpha,
+            )
+        )
+
+    num_layers = len(prepared_layers)
+    for i, (
+        sy0_i,
+        sy1_i,
+        sx0_i,
+        sx1_i,
+        area_i,
+        z_i,
+        prio_i,
+        dn_i,
+        b_work_i,
+        alpha_i,
+    ) in enumerate(prepared_layers):
+        eff_alpha = alpha_i
+        if num_layers > 1:
+            trans_i: Optional[torch.Tensor] = None
+            for j, (
+                sy0_j,
+                sy1_j,
+                sx0_j,
+                sx1_j,
+                area_j,
+                z_j,
+                _,
+                _,
+                _,
+                alpha_j,
+            ) in enumerate(prepared_layers):
+                if i == j or not _layer_dominates(z_j, area_j, z_i, area_i):
+                    continue
+                iy0 = max(sy0_i, sy0_j)
+                iy1 = min(sy1_i, sy1_j)
+                ix0 = max(sx0_i, sx0_j)
+                ix1 = min(sx1_i, sx1_j)
+                if iy1 > iy0 and ix1 > ix0:
+                    if trans_i is None:
+                        trans_i = torch.ones_like(alpha_i)
+                    sub_j = alpha_j[
+                        :, :, iy0 - sy0_j : iy1 - sy0_j, ix0 - sx0_j : ix1 - sx0_j
+                    ]
+                    trans_i[
+                        :, :, iy0 - sy0_i : iy1 - sy0_i, ix0 - sx0_i : ix1 - sx0_i
+                    ].mul_((1.0 - sub_j).clamp(0.0, 1.0))
+            if trans_i is not None:
+                eff_alpha = alpha_i * trans_i
+
+        w_hier = eff_alpha * prio_i
+        b_rms = torch.sqrt(
+            torch.mean(b_work_i * b_work_i, dim=1, keepdim=True) + 1e-12
+        )
+        w_rms = w_hier * b_rms
+        accum_lat[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
+            accum_lat[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_hier * b_work_i
+        )
+        accum_weight[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
+            accum_weight[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_hier
+        )
+        accum_rms_w1[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
+            accum_rms_w1[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_rms
+        )
+        accum_rms_w2[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
+            accum_rms_w2[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_rms * w_rms
+        )
+        accum_dn[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
+            accum_dn[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_hier * dn_i
         )
 
     union_alpha_work = union_alpha_work.clamp(0.0, 1.0)
     safe_weight = accum_weight.clamp(min=1e-5)
     linear_fg = accum_lat / safe_weight
-
     target_fg_rms = accum_rms_w1 / safe_weight
     orth_fg_rms = torch.sqrt(accum_rms_w2.clamp(min=0.0)) / safe_weight
     lin_fg_rms = torch.sqrt(
@@ -950,6 +1072,7 @@ def couple_splat_velocity_prior(
     )
     psi = 0.5 * (1.0 - torch.cos(math.pi * tau))
     g_max = (1.0 - 0.38 * sigma_hand).clamp(0.35, 1.0)
+
     alpha_f32 = splat_union_alpha.to(dtype=torch.float32).clamp(0.0, 1.0)
     t_floor = (alpha_f32 / 1e-4).clamp(0.0, 1.0)
     floor_gate = t_floor * t_floor * (3.0 - 2.0 * t_floor)
@@ -960,6 +1083,7 @@ def couple_splat_velocity_prior(
         torch.zeros_like(alpha_f32),
     )
     kappa = (alpha_eff * g_max * psi).clamp(0.0, 1.0)
+
     dt_abs = abs(float(step_dt))
     sigma_eff = max(s_val, _CFL_SIGMA_FLOOR, _CFL_STEP_MULTIPLIER * dt_abs)
     lat_f32 = latents.float()
@@ -970,49 +1094,196 @@ def couple_splat_velocity_prior(
         v_splat = (noise_f32 - splat_f32) + (lat_f32 - z_bridge) / sigma_eff
     else:
         v_splat = (lat_f32 - splat_f32) / max(s_val, 0.05)
+
     coupled = ((1.0 - kappa) * v_dit.float() + kappa * v_splat).to(dtype=v_dit.dtype)
     return torch.where(kappa > 1e-6, coupled, v_dit)
 
 
+def _srgb_to_linear_torch(srgb: torch.Tensor) -> torch.Tensor:
+    c = srgb.clamp(0.0, 1.0)
+    return torch.where(
+        c <= 0.04045,
+        c * (1.0 / 12.92),
+        torch.pow((c + 0.055) * (1.0 / 1.055), 2.4),
+    )
+
+
+def _linear_to_srgb_torch(lin: torch.Tensor) -> torch.Tensor:
+    v = lin.clamp(0.0, 1.0)
+    return torch.where(
+        v <= 0.0031308,
+        v * 12.92,
+        1.055 * torch.pow(v.clamp(min=1e-12), 1.0 / 2.4) - 0.055,
+    )
+
+
+def _source_to_srgb_01_chw(
+    source: Union[str, Path, bytes, np.ndarray, Image.Image, torch.Tensor],
+    value_range: str = "minus1_to_1",
+) -> torch.Tensor:
+    if isinstance(source, torch.Tensor):
+        t = source.detach().to(device="cpu", dtype=torch.float32)
+        if t.ndim == 4:
+            t = t[0]
+        if t.ndim == 2:
+            t = t.unsqueeze(0).expand(3, -1, -1)
+        elif t.ndim == 3 and t.shape[0] not in (1, 3, 4) and t.shape[2] in (1, 3, 4):
+            t = t.permute(2, 0, 1)
+        if t.shape[0] == 1:
+            t = t.expand(3, -1, -1)
+        elif t.shape[0] == 4:
+            t = t[:3]
+        v_mode = str(value_range or "minus1_to_1").strip().lower()
+        if (
+            source.dtype == torch.uint8
+            or v_mode in ("0_to_255", "uint8", "[0,255]")
+            or float(t.max().item()) > 1.5
+        ):
+            return (t * (1.0 / 255.0)).clamp(0.0, 1.0).contiguous()
+        if v_mode in ("0_to_1", "unit", "[0,1]") and float(t.min().item()) >= -1e-3:
+            return t.clamp(0.0, 1.0).contiguous()
+        return (t * 0.5 + 0.5).clamp(0.0, 1.0).contiguous()
+
+    if isinstance(source, np.ndarray):
+        arr = source
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        if arr.shape[2] == 4:
+            arr = arr[..., :3]
+        elif arr.shape[2] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+        if arr.dtype == np.uint16:
+            f_arr = arr.astype(np.float32) * (1.0 / 65535.0)
+        elif np.issubdtype(arr.dtype, np.floating):
+            f_arr = arr.astype(np.float32)
+        else:
+            f_arr = arr.astype(np.float32) * (1.0 / 255.0)
+        return (
+            torch.from_numpy(np.ascontiguousarray(f_arr))
+            .permute(2, 0, 1)
+            .clamp(0.0, 1.0)
+            .contiguous()
+        )
+
+    if isinstance(source, Image.Image):
+        img = source.convert("RGB")
+    else:
+        img = Image.open(source).convert("RGB")
+    arr_u8 = np.asarray(img, dtype=np.float32) * (1.0 / 255.0)
+    return torch.from_numpy(arr_u8).permute(2, 0, 1).clamp(0.0, 1.0).contiguous()
+
+
+def _linear_resample_srgb_chw(
+    srgb_chw: torch.Tensor, h_out: int, w_out: int
+) -> torch.Tensor:
+    _, h_in, w_in = srgb_chw.shape
+    if (h_in, w_in) == (h_out, w_out):
+        return (srgb_chw * 2.0 - 1.0).unsqueeze(0).contiguous()
+    lin = _srgb_to_linear_torch(srgb_chw).unsqueeze(0)
+    lin_res = F.interpolate(
+        lin,
+        size=(h_out, w_out),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    ).clamp(0.0, 1.0)
+    srgb_out = _linear_to_srgb_torch(lin_res)
+    return (srgb_out * 2.0 - 1.0).clamp(-1.0, 1.0).contiguous()
+
+
 def load_image_tensor_16px(
-    image_path: Union[str, Path],
+    image_path: Union[str, Path, bytes, np.ndarray, Image.Image, torch.Tensor],
     target_h: Optional[int] = None,
     target_w: Optional[int] = None,
+    value_range: str = "minus1_to_1",
 ) -> torch.Tensor:
-    img = Image.open(image_path).convert("RGB")
-    w_in, h_in = img.size
+    viz_client = _get_shared_viz_client()
+    if viz_client is not None and VizInjectorRequest is not None:
+        if target_h is not None and target_w is not None:
+            h_out = max(64, (int(target_h) // 16) * 16)
+            w_out = max(64, (int(target_w) // 16) * 16)
+            framing = "stretch"
+        else:
+            h_out = 1024
+            w_out = 1024
+            framing = "never_crop"
+        req = VizInjectorRequest(
+            target_width=w_out,
+            target_height=h_out,
+            framing_mode=framing,
+            input_role="photo_ref",
+            emit_vae_branch=True,
+            emit_vit_branch=False,
+            emit_mask_branch=False,
+            deband_8bit=False,
+            mtf_boost=0.0,
+            prefer_vulkan=True,
+        )
+        bundle = (
+            viz_client.condition_tensor(image_path, req, value_range=value_range)
+            if isinstance(image_path, torch.Tensor)
+            else viz_client.condition_image(image_path, req)
+        )
+        if bundle.vae_tensor is not None:
+            return bundle.vae_tensor
+
+    srgb_chw = _source_to_srgb_01_chw(image_path, value_range=value_range)
+    _, h_in, w_in = srgb_chw.shape
     if target_h is not None and target_w is not None:
-        h_out = max(64, (target_h // 16) * 16)
-        w_out = max(64, (target_w // 16) * 16)
+        h_out = max(64, (int(target_h) // 16) * 16)
+        w_out = max(64, (int(target_w) // 16) * 16)
     else:
         scale = min(1.0, math.sqrt((1024.0 * 1024.0) / float(max(1, w_in * h_in))))
         h_out = max(64, (int(round(h_in * scale)) // 16) * 16)
         w_out = max(64, (int(round(w_in * scale)) // 16) * 16)
-    if (w_in, h_in) != (w_out, h_out):
-        img = img.resize((w_out, h_out), resample=Image.Resampling.BICUBIC)
-    arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+    out = _linear_resample_srgb_chw(srgb_chw, h_out, w_out)
+    pinned = _pin_cpu_tensor(out)
+    return pinned if pinned is not None else out
 
 
 def pack_vision_patches_32px(
-    image_path: Union[str, Path], max_patches: int = 2304
+    image_path: Union[str, Path, bytes, np.ndarray, Image.Image, torch.Tensor],
+    max_patches: int = 2304,
+    value_range: str = "minus1_to_1",
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    img = Image.open(image_path).convert("RGB")
-    w_in, h_in = img.size
     eff_max_patches = max(64, int(max_patches or 2304))
+    viz_client = _get_shared_viz_client()
+    if viz_client is not None and VizInjectorRequest is not None:
+        req = VizInjectorRequest(
+            target_width=0,
+            target_height=0,
+            max_vit_patches=eff_max_patches,
+            edit_mode_384_vit=False,
+            framing_mode="inscribed",
+            input_role="photo_ref",
+            emit_vae_branch=False,
+            emit_mask_branch=False,
+            emit_vit_branch=True,
+            deband_8bit=False,
+            mtf_boost=0.0,
+            prefer_vulkan=True,
+        )
+        bundle = (
+            viz_client.condition_tensor(image_path, req, value_range=value_range)
+            if isinstance(image_path, torch.Tensor)
+            else viz_client.condition_image(image_path, req)
+        )
+        if bundle.vit_patches is not None and bundle.grid_thw is not None:
+            return bundle.vit_patches, bundle.grid_thw, int(bundle.llm_tokens)
+
+    srgb_chw = _source_to_srgb_01_chw(image_path, value_range=value_range)
+    _, h_in, w_in = srgb_chw.shape
     max_pixels = eff_max_patches * 16 * 16
     scale = math.sqrt(float(max_pixels) / float(max(1, w_in * h_in)))
-    h_vis = min(2048, max(32, (int(round(h_in * scale)) // 32) * 32))
-    w_vis = min(2048, max(32, (int(round(w_in * scale)) // 32) * 32))
+    h_vis = min(2048, max(32, (int(math.floor(h_in * scale / 32.0 + 0.5))) * 32))
+    w_vis = min(2048, max(32, (int(math.floor(w_in * scale / 32.0 + 0.5))) * 32))
     while (w_vis // 16) * (h_vis // 16) > eff_max_patches and w_vis > 32 and h_vis > 32:
         if w_vis >= h_vis:
             w_vis -= 32
         else:
             h_vis -= 32
-    if (w_in, h_in) != (w_vis, h_vis):
-        img = img.resize((w_vis, h_vis), resample=Image.Resampling.BICUBIC)
-    normed = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
-    chw = torch.from_numpy(normed).permute(2, 0, 1).contiguous()
+
+    chw = _linear_resample_srgb_chw(srgb_chw, h_vis, w_vis)[0]
     grid_h = h_vis // 16
     grid_w = w_vis // 16
     merge = 2
@@ -1025,9 +1296,14 @@ def pack_vision_patches_32px(
         .contiguous()
         .view(grid_h * grid_w, 3, 2, 16, 16)
     )
+    pinned_patches = _pin_cpu_tensor(patches)
     grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
     llm_tokens = (grid_h * grid_w) // (merge * merge)
-    return patches, grid_thw, llm_tokens
+    return (
+        pinned_patches if pinned_patches is not None else patches,
+        grid_thw,
+        llm_tokens,
+    )
 
 
 __all__ = [

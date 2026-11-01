@@ -38,6 +38,31 @@ VIZINJECTOR_API int32_t vizinjector_process_rgba8(
     VizInjectorOutput *out_result
 );
 
+VIZINJECTOR_API int32_t vizinjector_process_rgba16(
+    const uint16_t *rgba16,
+    uint32_t width,
+    uint32_t height,
+    const VizInjectorConfig *cfg,
+    VizInjectorOutput *out_result
+);
+
+VIZINJECTOR_API int32_t vizinjector_process_rgbaf32(
+    const float *rgbaf32,
+    uint32_t width,
+    uint32_t height,
+    int32_t input_is_linear,
+    const VizInjectorConfig *cfg,
+    VizInjectorOutput *out_result
+);
+
+VIZINJECTOR_API int32_t vizinjector_process_linear_f32(
+    const float *linear_rgba,
+    uint32_t width,
+    uint32_t height,
+    const VizInjectorConfig *cfg,
+    VizInjectorOutput *out_result
+);
+
 VIZINJECTOR_API int32_t vizinjector_postprocess_vae_to_rgb8(
     const float *planar_vae_rgb,
     uint32_t width,

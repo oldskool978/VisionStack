@@ -22,11 +22,14 @@ from safetensors.torch import save_file as save_safetensors
 import torch
 import torch.nn.functional as F
 
+from core.caches import PromptEmbedCache, ReferenceVisionCache
 from core.conditioning import (
     build_box_denoise_horizon_map,
     splat_box_masks_to_canvas,
 )
 from core.pipeline import (
+    PipelineLifecycleMixin,
+    PipelineStagesMixin,
     compute_differential_inpaint_gate,
     resolve_foreground_aperture_carveouts,
     resolve_skip_layer_regimes,
@@ -34,9 +37,15 @@ from core.pipeline import (
 from download_model import inspect_shard_header
 from engine import (
     BifurcatedFlowMatchScheduler,
+    ConditionedVisionBundle,
+    HAS_VIZINJECTOR,
     MOSSImageEngine,
+    VIZJ_TIER_VAE_LATENT,
+    VizInjectorClient,
+    VizInjectorRequest,
     WDDMMemoryGuard,
     _AI_TOOLKIT_MAX_REF_DIM,
+    _evacuate_to_cpu,
     _resolve_boxed_reference_dims,
     _resolve_unboxed_reference_dims,
     build_box_aperture_mask,
@@ -53,6 +62,19 @@ from harness import (
     build_default_request,
     stage_test_input_files,
 )
+from models.modeling_moss import (
+    MOSSImageConfig,
+    MOSSImageTransformer,
+    _boxes_overlap_coefficient,
+    _compute_collaborating_ref_groups,
+)
+from models.modeling_qwen35 import (
+    Qwen3_5Config,
+    Qwen3_5Model,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
+from models.modeling_vae import Flux2AutoencoderKL, Flux2VAEConfig
 from refinery import (
     DTYPE_LOOKUP,
     DTYPE_MAP,
@@ -74,7 +96,9 @@ from schema import (
     has_custom_default_preset,
     pixel_bbox_to_abs_centralized,
     reconcile_layout_summary_quotes,
+    scale_layout_items_to_canvas,
 )
+from vizinjector.schema import VizInjectorResponseMeta, VizInjectorTelemetry
 
 
 def _assert(cond: bool, msg: str) -> None:
@@ -82,16 +106,43 @@ def _assert(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+class _Stage1UpgradeHarness(PipelineLifecycleMixin, PipelineStagesMixin):
+    def __init__(
+        self,
+        device: torch.device,
+        vae: Flux2AutoencoderKL,
+        text_encoder: Qwen3_5Model,
+        vizinjector: VizInjectorClient,
+    ) -> None:
+        self.model_variant = "sft"
+        self.repo_id = "OpenMOSS-Team/MOSS-Image-SFT"
+        self.device = device
+        self.dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        self.vae_dtype = torch.float32
+        self.tokenizer = None
+        self.text_encoder = text_encoder
+        self.transformer = None
+        self.vae = vae
+        self.embed_cache = PromptEmbedCache(max_entries=4)
+        self.ref_cache = ReferenceVisionCache(max_entries=4)
+        self.memory_guard = WDDMMemoryGuard(device)
+        self.vizinjector = vizinjector
+        self._loaded_repo_id = None
+        self._current_offload_state = False
+        self._warmed_up = True
+
+
 def gate_5_refinery_schema_and_snapshots() -> None:
     print(
         "\n--- Gate 5: Gorilla DTO-CA Refinery, WDDM Guard, Preset Point-of-Truth & Spatio-Visual Graph ---"
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+
     _assert(
         "bf16" in DTYPE_MAP and "fp16" in DTYPE_LOOKUP,
         "Refinery DTYPE_MAP/DTYPE_LOOKUP missing",
     )
-
     with torch.inference_mode():
         w = torch.randn((64, 128), device=dev, dtype=torch.float32) * 0.25
         q_bf16 = refineTensor(
@@ -291,6 +342,183 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(fb_patches.max().item()) - 1.0) < 1e-5,
             f"pack_vision_patches_32px failed full-budget upsampling or [-1, 1] sRGB normalization: shape={fb_patches.shape}, range=[{fb_patches.min().item()}, {fb_patches.max().item()}]",
         )
+
+        if HAS_VIZINJECTOR and VizInjectorClient is not None:
+            with torch.inference_mode(), VizInjectorClient(prefer_vulkan=True) as viz:
+                mini_vae = (
+                    Flux2AutoencoderKL(
+                        config=Flux2VAEConfig(
+                            block_out_channels=(16, 16, 32, 32),
+                            decoder_block_out_channels=(16, 16, 32, 32),
+                            latent_channels=32,
+                            layers_per_block=1,
+                            norm_num_groups=8,
+                        )
+                    )
+                    .to(device=dev, dtype=torch.float32)
+                    .eval()
+                )
+                mini_qwen = (
+                    Qwen3_5Model(
+                        Qwen3_5Config(
+                            text_config=Qwen3_5TextConfig(
+                                vocab_size=256,
+                                hidden_size=64,
+                                intermediate_size=128,
+                                num_hidden_layers=1,
+                                num_attention_heads=2,
+                                num_key_value_heads=2,
+                                head_dim=32,
+                                linear_conv_kernel_dim=4,
+                                linear_key_head_dim=16,
+                                linear_value_head_dim=16,
+                                linear_num_key_heads=2,
+                                linear_num_value_heads=2,
+                            ),
+                            vision_config=Qwen3_5VisionConfig(
+                                depth=1,
+                                hidden_size=32,
+                                intermediate_size=64,
+                                num_heads=4,
+                                in_channels=3,
+                                patch_size=16,
+                                spatial_merge_size=2,
+                                temporal_patch_size=2,
+                                out_hidden_size=64,
+                                num_position_embeddings=64,
+                            ),
+                        )
+                    )
+                    .to(device=dev, dtype=dtype)
+                    .eval()
+                )
+                stage_harness = _Stage1UpgradeHarness(
+                    device=dev,
+                    vae=mini_vae,
+                    text_encoder=mini_qwen,
+                    vizinjector=viz,
+                )
+                t1_lat = philox_randn(
+                    (1, 128, 4, 4), seed=777, stream_id=1, device="cpu"
+                )
+                t1_bundle = ConditionedVisionBundle(
+                    vae_tensor=None,
+                    vit_patches=None,
+                    grid_thw=torch.tensor([[1, 24, 24]], dtype=torch.long),
+                    llm_tokens=0,
+                    latent_mask=torch.ones((1, 1, 4, 4), dtype=torch.float32),
+                    packed_latents=t1_lat,
+                    vit_embeds=None,
+                    wire_vizj_bytes=None,
+                    meta=VizInjectorResponseMeta(
+                        orig_size=(64, 64),
+                        vae_size=(64, 64),
+                        vit_size=(384, 384),
+                        grid_thw=(1, 24, 24),
+                        llm_tokens=0,
+                        backend_used="VIZJ Zero-Copy Cache",
+                        edit_format="ai_toolkit_isolated",
+                        input_role="photo_ref",
+                        reference_zero_timestep=True,
+                        reference_isolated_kv=True,
+                        telemetry=VizInjectorTelemetry(),
+                    ),
+                )
+                t1_vizj_path = Path(tmpdir) / "stage1_tier1.vizj"
+                viz.save_vizj(
+                    t1_bundle,
+                    dest_path=t1_vizj_path,
+                    tier=VIZJ_TIER_VAE_LATENT,
+                    use_bf16=False,
+                )
+                upgrade_req = GenerationRequest(
+                    prompt="Stage 1 Tier-1 ViT upgrade audit",
+                    width=256,
+                    height=256,
+                    max_vit_patches=576,
+                    edit_format="ai_toolkit_isolated",
+                    prefer_vulkan=True,
+                    seed=42,
+                    soft_knee_tau=0.015,
+                    use_reference_cache=True,
+                )
+                upgraded_rec, was_hit = stage_harness._condition_single_reference(
+                    t1_vizj_path,
+                    upgrade_req,
+                    role_override="photo_ref",
+                    framing_override="inscribed",
+                    target_w_override=64,
+                    target_h_override=64,
+                    force_vit=True,
+                )
+                dec_rgb_ref = mini_vae.decode_packed_latents(
+                    t1_lat.to(device=dev, non_blocking=True)
+                )
+                dec_rgb_cpu_ref = _evacuate_to_cpu(dec_rgb_ref)
+                assert dec_rgb_cpu_ref is not None
+                vit_expected_req = VizInjectorRequest(
+                    target_width=64,
+                    target_height=64,
+                    max_vit_patches=576,
+                    edit_mode_384_vit=True,
+                    framing_mode="inscribed",
+                    input_role="photo_ref",
+                    edit_format="ai_toolkit_isolated",
+                    emit_vae_branch=False,
+                    emit_mask_branch=False,
+                    emit_vit_branch=True,
+                    deband_8bit=False,
+                    prefer_vulkan=True,
+                    seed=42,
+                    mtf_boost=0.0,
+                    soft_knee_tau=0.015,
+                )
+                expected_f32_vit = viz.condition_image(
+                    dec_rgb_cpu_ref, vit_expected_req
+                )
+                pil_8bit_ref, _ = viz.postprocess_to_pil(
+                    dec_rgb_cpu_ref, apply_bayer_dither=False
+                )
+                quantized_8bit_vit = viz.condition_image(
+                    pil_8bit_ref[0], vit_expected_req
+                )
+                f32_upgrade_drift = float(
+                    (upgraded_rec.vit_patches - expected_f32_vit.vit_patches)
+                    .abs()
+                    .max()
+                    .item()
+                )
+                pil_quant_err = float(
+                    (expected_f32_vit.vit_patches - quantized_8bit_vit.vit_patches)
+                    .abs()
+                    .max()
+                    .item()
+                )
+                _assert(
+                    not was_hit
+                    and upgraded_rec.packed_latents is not None
+                    and upgraded_rec.vit_patches is not None
+                    and upgraded_rec.vit_embeds is not None
+                    and upgraded_rec.llm_tokens == 144
+                    and f32_upgrade_drift == 0.0
+                    and pil_quant_err > 1e-4,
+                    f"Stage 1 Tier-1 .vizj ViT upgrade drifted from direct FP32 tensor conditioning: f32_drift={f32_upgrade_drift}, pil_err={pil_quant_err}",
+                )
+                if dev.type == "cuda":
+                    _assert(
+                        upgraded_rec.packed_latents.is_pinned()
+                        and upgraded_rec.vit_patches.is_pinned()
+                        and upgraded_rec.vit_embeds.is_pinned(),
+                        "Stage 1 upgraded CachedReferenceRecord tensors must be page-locked",
+                    )
+                stage_harness.prepare_for_exit()
+                del (
+                    stage_harness,
+                    mini_vae,
+                    mini_qwen,
+                    dec_rgb_ref,
+                    dec_rgb_cpu_ref,
+                )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_preset = Path(tmpdir) / "default.json"
@@ -645,6 +873,31 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         f"Mixed-role layout prompt desynchronized Picture index: {compiled_mixed}",
     )
 
+    v11_norm_boxes = (
+        (0.0, 0.0, 1.0, 0.5625),
+        (0.0, 0.0, 1.0, 0.5625),
+        (0.4375, 0.5, 1.0, 1.0),
+    )
+    omega_01 = _boxes_overlap_coefficient(v11_norm_boxes[0], v11_norm_boxes[1])
+    omega_02 = _boxes_overlap_coefficient(v11_norm_boxes[0], v11_norm_boxes[2])
+    v11_collab = _compute_collaborating_ref_groups(3, v11_norm_boxes)
+    _assert(
+        abs(omega_01 - 1.0) < 1e-6
+        and abs(omega_02 - 0.125) < 1e-6
+        and v11_collab == ((0, 1), (0, 1), (2,)),
+        f"Szymkiewicz-Simpson IsoKV peerhood failed on V11 boxes: omega_01={omega_01}, omega_02={omega_02}, groups={v11_collab}",
+    )
+    chain_boxes = (
+        (0.0, 0.0, 0.5, 0.5),
+        (0.0, 0.25, 0.5, 0.75),
+        (0.0, 0.5, 0.5, 1.0),
+    )
+    chain_collab = _compute_collaborating_ref_groups(3, chain_boxes)
+    _assert(
+        chain_collab == ((0, 1), (0, 1, 2), (1, 2)),
+        f"Direct pairwise IsoKV peerhood must prevent transitive A<->C leakage: got {chain_collab}",
+    )
+
     aperture_mask = build_box_aperture_mask(
         layout_items=[{"bbox": [256, 256, 768, 768]}],
         height=1024,
@@ -726,6 +979,38 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and abs(float(horizon_map[0, 0, 8, 56].item()) - 1.0) < 1e-5,
         "build_box_denoise_horizon_map failed per-box denoise horizon synthesis",
     )
+
+    nested_horizon_map = build_box_denoise_horizon_map(
+        layout_items=[
+            {
+                "bbox": [128, 128, 896, 896],
+                "inpaint_box": True,
+                "denoise_strength": 0.80,
+                "z_order": 1,
+            },
+            {
+                "bbox": [384, 384, 640, 640],
+                "inpaint_box": True,
+                "denoise_strength": 0.20,
+                "z_order": 5,
+            },
+        ],
+        height=1024,
+        width=1024,
+        coords_are_pixels=True,
+        feather_radius_lat=1.0,
+        default_denoise_strength=1.0,
+        device=dev,
+        only_flagged_boxes=True,
+        return_none_if_uniform=True,
+    )
+    _assert(
+        nested_horizon_map is not None
+        and abs(float(nested_horizon_map[0, 0, 32, 32].item()) - 0.20) < 1e-6
+        and abs(float(nested_horizon_map[0, 0, 12, 12].item()) - 0.80) < 1e-6,
+        "Porter-Duff occlusion in build_box_denoise_horizon_map failed to keep nested child interior 100% uncontaminated",
+    )
+
     warped_horizon = warp_denoise_to_sigma_horizon(horizon_map, shift=5.0)
     _assert(
         isinstance(warped_horizon, torch.Tensor)
@@ -737,6 +1022,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     m_paint = torch.zeros((1, 1, 64, 64), device=dev, dtype=torch.float32)
     m_paint[:, :, :32, :] = 1.0
     m_alpha = torch.full((1, 1, 64, 64), 0.5, device=dev, dtype=torch.float32)
+
     m_auto_union = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -753,6 +1039,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and float(m_auto_union[0, 0, 55, 5].item()) == 0.0,
         "compose_latent_inpaint_mask auto-union failed",
     )
+
     m_auto_inter = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -769,6 +1056,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and float(m_auto_inter[0, 0, 40, 32].item()) == 0.0,
         "compose_latent_inpaint_mask auto-intersect (preserve_outside_boxes) failed",
     )
+
     m_inv_alpha = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -785,6 +1073,52 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
 
     with torch.inference_mode():
+        mini_dit = (
+            MOSSImageTransformer(
+                config=MOSSImageConfig(
+                    dim=128,
+                    ffn_dim=256,
+                    num_heads=4,
+                    num_layers=1,
+                    text_dim=128,
+                    freq_dim=32,
+                    latent_channels=128,
+                )
+            )
+            .to(device=dev, dtype=torch.float32)
+            .eval()
+        )
+        fg_cutout_m = torch.zeros((1, 1, 6, 6), device=dev, dtype=torch.float32)
+        fg_cutout_m[:, :, 2:4, 2:4] = 1.0
+        bias_occ = mini_dit._get_box_aperture_bias(
+            height=8,
+            width=8,
+            ref_token_lengths=[36, 36],
+            text_tokens=8,
+            ref_shapes=[(6, 6), (6, 6)],
+            ref_bboxes=[(0.125, 0.125, 0.875, 0.875), (0.125, 0.125, 0.875, 0.875)],
+            reference_box_isolation=[0.85, 0.90],
+            feather_radius_lat=0.0,
+            device=dev,
+            dtype=torch.float32,
+            reference_masks=[None, fg_cutout_m],
+            reference_roles=["photo_ref", "photo_ref"],
+            reference_z_orders=[1.0, 5.0],
+        )
+        q_opaque_center = 4 * 8 + 4
+        q_transp_corner = 1 * 8 + 1
+        k_bg_table = 64 + (3 * 6 + 3)
+        k_fg_bowl_opaque = 64 + 36 + (2 * 6 + 2)
+        _assert(
+            bias_occ is not None
+            and float(bias_occ[0, 0, q_opaque_center, k_fg_bowl_opaque].item()) == 0.0
+            and float(bias_occ[0, 0, q_opaque_center, k_bg_table].item()) < -10.0
+            and float(bias_occ[0, 0, q_transp_corner, k_bg_table].item()) == 0.0
+            and float(bias_occ[0, 0, q_transp_corner, k_fg_bowl_opaque].item()) < -15.0,
+            "Silhouette-conformal foreground occlusion failed: transparent cutout corner must leave parent reference unattenuated (0.0) while opaque center occludes parent",
+        )
+        del mini_dit, bias_occ
+
         boxed_w, boxed_h = _resolve_boxed_reference_dims(
             (0.25, 0.25, 0.75, 0.75), 1024, 1024
         )
@@ -792,6 +1126,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             (boxed_w, boxed_h) == (512, 512),
             f"_resolve_boxed_reference_dims mismatch: {(boxed_w, boxed_h)}",
         )
+
         unpacked_ramp = (
             (torch.arange(16, device=dev, dtype=torch.float32) + 0.5)
             .view(1, 1, 1, 16)
@@ -988,9 +1323,43 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             float((h_can_pc - h_can_cp).abs().max().item()) < 1e-6
             and float((h_alp_pc - h_alp_cp).abs().max().item()) < 1e-6
             and float((h_dn_pc - h_dn_cp).abs().max().item()) < 1e-6
-            and float(h_can_pc[0, 0, 16, 16].item()) < -1.2
-            and float(h_dn_pc[0, 0, 16, 16].item()) < 0.30,
-            "Hierarchical area-priority splatting failed nested child dominance or permutation invariance",
+            and abs(float(h_can_pc[0, 0, 16, 16].item()) - (-2.0)) < 1e-6
+            and abs(float(h_dn_pc[0, 0, 16, 16].item()) - 0.15) < 1e-6
+            and abs(float(h_can_pc[0, 0, 8, 8].item()) - 2.0) < 1e-6
+            and abs(float(h_dn_pc[0, 0, 8, 8].item()) - 0.80) < 1e-6,
+            "Porter-Duff hierarchical occlusion failed 100% uncontaminated child interior or permutation invariance",
+        )
+
+        child_cutout_mask = torch.zeros((1, 1, 16, 16), device="cpu", dtype=torch.float32)
+        child_cutout_mask[:, :, 4:12, 4:12] = 1.0
+        cut_child_lat = torch.full((1, 128, 16, 16), -2.0, device="cpu", dtype=torch.float32)
+        cut_can, cut_alp, cut_dn = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[
+                (parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.80, None, 1.0),
+                (
+                    cut_child_lat,
+                    (0.25, 0.25, 0.75, 0.75),
+                    child_cutout_mask,
+                    0.15,
+                    None,
+                    5.0,
+                ),
+            ],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            return_denoise_map=True,
+        )
+        _assert(
+            abs(float(cut_can[0, 0, 16, 16].item()) - (-2.0)) < 1e-6
+            and abs(float(cut_dn[0, 0, 16, 16].item()) - 0.15) < 1e-6
+            and abs(float(cut_can[0, 0, 9, 9].item()) - 2.0) < 1e-6
+            and abs(float(cut_dn[0, 0, 9, 9].item()) - 0.80) < 1e-6
+            and float(cut_alp[0, 0, 9, 9].item()) == 1.0,
+            "Porter-Duff cutout child on parent surface failed: opaque center must be -2.0 (d=0.15) while transparent corner reveals parent +2.0 (d=0.80)",
         )
 
         z_low_lat = torch.full((1, 128, 16, 16), -2.0, device="cpu", dtype=torch.float32)
@@ -1009,9 +1378,9 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             return_denoise_map=True,
         )
         _assert(
-            float(z_can[0, 0, 16, 16].item()) > 1.2
-            and float(z_dn[0, 0, 16, 16].item()) < 0.30,
-            "z_order priority in splat_box_latents_to_canvas failed to elevate foreground layer",
+            abs(float(z_can[0, 0, 16, 16].item()) - 2.0) < 1e-6
+            and abs(float(z_dn[0, 0, 16, 16].item()) - 0.20) < 1e-6,
+            "z_order Porter-Duff dominance in splat_box_latents_to_canvas failed to elevate foreground layer",
         )
 
         ovr_can, ovr_alpha, ovr_dn_map = splat_box_latents_to_canvas(
@@ -1096,6 +1465,20 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(v11_attn_carve[0][1]) - 0.85) < 1e-6
             and v11_attn_carve[0][2] == 5.0,
             f"Gate 5.A resolve_foreground_aperture_carveouts failed V11 synthesis: ovr={v11_ovr}, attn={v11_attn_carve}",
+        )
+
+        v11_scaled_512 = scale_layout_items_to_canvas(
+            v11_test_items,
+            height=512,
+            width=512,
+            src_height=1024,
+            src_width=1024,
+            coords_are_pixels=True,
+        )
+        _assert(
+            v11_scaled_512[0]["bbox"] == [0, 0, 512, 288]
+            and v11_scaled_512[2]["bbox"] == [128, 48, 256, 224],
+            f"scale_layout_items_to_canvas failed V11 512x512 scaling: {v11_scaled_512}",
         )
 
         alpha_sweep = torch.tensor(
@@ -1249,6 +1632,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             0.0 < rem_drift < drift_err,
             f"CFL drift restorer violated monotonic contraction at d=0.05, sigma=0.08, dt=-0.25: rem_drift={rem_drift}",
         )
+
         dn_locked = torch.zeros((1, 1, 32, 32), device=dev, dtype=torch.float32)
         v_locked_out = couple_splat_velocity_prior(
             v_dit=v_dit_ones,
@@ -1324,6 +1708,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         assert loop_inpaint_mask is not None
         loop_dn_warped = warp_denoise_to_sigma_horizon(loop_dn, shift=5.0)
         assert isinstance(loop_dn_warped, torch.Tensor)
+
         loop_sched = BifurcatedFlowMatchScheduler(
             early_solver="heun",
             late_solver="ipndm",
@@ -1334,6 +1719,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         loop_sched.set_timesteps(12, device=dev)
         s0_loop = float(loop_sched.sigmas[0].item())
         lat_loop = (1.0 - s0_loop) * loop_can + s0_loop * loop_noise
+
         for p_idx, t_loop in enumerate(loop_sched.timesteps):
             cfg_l = loop_sched._step_configs[p_idx]
             s_eval = float(t_loop.item()) / float(loop_sched.num_train_timesteps)
@@ -1367,6 +1753,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 bool(torch.isfinite(lat_loop).all().item()),
                 f"Gate 5.D Non-finite latent state encountered at pass {p_idx}",
             )
+
         final_cell_rms = torch.sqrt(torch.mean(lat_loop[0] * lat_loop[0], dim=0))
         ext_rms = float(final_cell_rms[:2, :2].mean().item())
         box_int_rms = float(final_cell_rms[6:10, 6:10].mean().item())
@@ -1420,7 +1807,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        f"  [+] Spatio-Visual Graph      : V03 (Heun->IPNDM) + 768px 4D-RoPE + DiffReleaseGate + ClosedLoopRMS (rim={rim_loop_rms:.3f}, txt={carved_txt_rms:.3f}) Verified"
+        f"  [+] Spatio-Visual Graph      : PorterDuffOcclusion + NonTransitiveIsoKV + Stage1FP32Upgrade + ClosedLoopRMS (rim={rim_loop_rms:.3f}, txt={carved_txt_rms:.3f}) Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)

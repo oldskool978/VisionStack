@@ -58,20 +58,16 @@ static inline __m256 viz_lin_to_srgb_avx2(__m256 v_lin, const float *lut) {
     __m256 v_zero = _mm256_setzero_ps();
     __m256 v_one = _mm256_set1_ps(1.0f);
     __m256 v_clamped = _mm256_min_ps(v_one, _mm256_max_ps(v_zero, v_lin));
-
     __m256 v_toe_thresh = _mm256_set1_ps(0.0031308f);
     __m256 v_toe = _mm256_mul_ps(v_clamped, _mm256_set1_ps(12.92f));
-
     __m256 v_scaled = _mm256_mul_ps(v_clamped, _mm256_set1_ps(65536.0f));
     __m256i v_idx = _mm256_cvttps_epi32(v_scaled);
     __m256 v_idx_f = _mm256_cvtepi32_ps(v_idx);
     __m256 v_frac = _mm256_sub_ps(v_scaled, v_idx_f);
     __m256i v_idx1 = _mm256_add_epi32(v_idx, _mm256_set1_epi32(1));
-
     __m256 v_y0 = _mm256_i32gather_ps(lut, v_idx, 4);
     __m256 v_y1 = _mm256_i32gather_ps(lut, v_idx1, 4);
     __m256 v_lut_val = _mm256_fmadd_ps(v_frac, _mm256_sub_ps(v_y1, v_y0), v_y0);
-
     __m256 v_is_toe = _mm256_cmp_ps(v_clamped, v_toe_thresh, _CMP_LE_OQ);
     return _mm256_blendv_ps(v_lut_val, v_toe, v_is_toe);
 }
@@ -93,17 +89,20 @@ void viz_pack_vae_planar_f32(
     const float *lut = viz_get_lin_to_srgb_lut();
     __m256 v_two = _mm256_set1_ps(2.0f);
     __m256 v_neg_one = _mm256_set1_ps(-1.0f);
+
     for (; i + 8u <= plane; i += 8u) {
         __m256 v_r_lin, v_g_lin, v_b_lin;
         viz_deinterleave_rgba8_avx2(linear_rgba + i * 4u, &v_r_lin, &v_g_lin, &v_b_lin);
         __m256 v_r_srgb = viz_lin_to_srgb_avx2(v_r_lin, lut);
         __m256 v_g_srgb = viz_lin_to_srgb_avx2(v_g_lin, lut);
         __m256 v_b_srgb = viz_lin_to_srgb_avx2(v_b_lin, lut);
+
         _mm256_storeu_ps(r_dst + i, _mm256_fmadd_ps(v_r_srgb, v_two, v_neg_one));
         _mm256_storeu_ps(g_dst + i, _mm256_fmadd_ps(v_g_srgb, v_two, v_neg_one));
         _mm256_storeu_ps(b_dst + i, _mm256_fmadd_ps(v_b_srgb, v_two, v_neg_one));
     }
 #endif
+
     for (; i < plane; ++i) {
         float r_srgb = viz_linear_to_srgb_f32(linear_rgba[i * 4u + 0u]);
         float g_srgb = viz_linear_to_srgb_f32(linear_rgba[i * 4u + 1u]);
@@ -132,6 +131,7 @@ void viz_pack_qwen35_vit_patches_f32(
     *out_llm_tokens = (grid_h * grid_w) / (merge * merge);
 
     size_t patch_stride = 3u * 2u * 256u;
+
 #if VIZ_PACK_AVX2
     const float *lut = viz_get_lin_to_srgb_lut();
     const __m256 v_two = _mm256_set1_ps(2.0f);
@@ -145,6 +145,7 @@ void viz_pack_qwen35_vit_patches_f32(
             uint32_t gw_m = gw / merge;
             uint32_t m_x = gw % merge;
             uint32_t patch_idx = ((gh_m * (grid_w / merge) + gw_m) * merge + m_y) * merge + m_x;
+
             float *p_out = out_patches_5d + (size_t)patch_idx * patch_stride;
             float *r_t0 = p_out + (0u * 2u + 0u) * 256u;
             float *r_t1 = p_out + (0u * 2u + 1u) * 256u;
@@ -157,6 +158,7 @@ void viz_pack_qwen35_vit_patches_f32(
                 uint32_t y = gh * 16u + py;
                 uint32_t sp_base = py * 16u;
                 const float *row_in = linear_rgba + ((size_t)y * vis_w + (size_t)gw * 16u) * 4u;
+
 #if VIZ_PACK_AVX2
                 for (uint32_t px = 0; px < 16u; px += 8u) {
                     __m256 r_lin, g_lin, b_lin;
@@ -164,6 +166,7 @@ void viz_pack_qwen35_vit_patches_f32(
                     __m256 vr = _mm256_fmadd_ps(viz_lin_to_srgb_avx2(r_lin, lut), v_two, v_neg_one);
                     __m256 vg = _mm256_fmadd_ps(viz_lin_to_srgb_avx2(g_lin, lut), v_two, v_neg_one);
                     __m256 vb = _mm256_fmadd_ps(viz_lin_to_srgb_avx2(b_lin, lut), v_two, v_neg_one);
+
                     uint32_t off = sp_base + px;
                     _mm256_storeu_ps(r_t0 + off, vr);
                     _mm256_storeu_ps(r_t1 + off, vr);
@@ -204,8 +207,8 @@ void viz_downsample_latent_mask_16x(
     uint32_t lat_w = vae_w / 16u;
     uint32_t lat_h = vae_h / 16u;
     size_t total_cells = (size_t)lat_w * (size_t)lat_h;
-
-    float eff_feather = (channel_offset == 0) ? feather_radius_cells : 0.0f;
+    int is_inpaint_mask = (channel_offset == 0);
+    float eff_feather = is_inpaint_mask ? feather_radius_cells : 0.0f;
 
     int owns_raw = 0;
     float *raw_mask = NULL;
@@ -270,10 +273,10 @@ void viz_downsample_latent_mask_16x(
             }
 #endif
             float avg = sum * (1.0f / 256.0f);
-            if (avg > 0.01f && avg < 0.25f && max_val > 0.75f) {
-                avg = 0.65f * avg + 0.35f * max_val;
-            }
-            target_buf[(size_t)ly * lat_w + lx] = fminf(1.0f, fmaxf(0.0f, avg));
+            float out_m = is_inpaint_mask
+                ? (0.45f * avg + 0.55f * sqrtf(fmaxf(0.0f, avg * max_val)))
+                : avg;
+            target_buf[(size_t)ly * lat_w + lx] = fminf(1.0f, fmaxf(0.0f, out_m));
         }
     }
 
@@ -283,20 +286,26 @@ void viz_downsample_latent_mask_16x(
 
         int tap_kx[225];
         int tap_ky[225];
+        float tap_akx[225];
+        float tap_aky[225];
         float tap_w[225];
         int num_taps = 0;
 
         for (int ky = -rad; ky <= rad; ++ky) {
-            float dy = fmaxf(0.0f, fabsf((float)ky) - 0.5f);
+            float aky = fabsf((float)ky);
+            float dy = fmaxf(0.0f, aky - 0.5f);
             for (int kx = -rad; kx <= rad; ++kx) {
                 if (kx == 0 && ky == 0) continue;
-                float dx = fmaxf(0.0f, fabsf((float)kx) - 0.5f);
+                float akx = fabsf((float)kx);
+                float dx = fmaxf(0.0f, akx - 0.5f);
                 float dist = sqrtf(dx * dx + dy * dy);
                 if (dist < eff_feather) {
                     float w = 0.5f * (1.0f + cosf((float)M_PI * dist / eff_feather));
                     if (w > 1e-6f) {
                         tap_kx[num_taps] = kx;
                         tap_ky[num_taps] = ky;
+                        tap_akx[num_taps] = akx;
+                        tap_aky[num_taps] = aky;
                         tap_w[num_taps] = w;
                         num_taps++;
                     }
@@ -304,20 +313,33 @@ void viz_downsample_latent_mask_16x(
             }
         }
 
+        const float pi_over_feather = (float)M_PI / eff_feather;
         for (uint32_t ly = 0; ly < lat_h; ++ly) {
             for (uint32_t lx = 0; lx < lat_w; ++lx) {
                 float max_env = raw_mask[(size_t)ly * lat_w + lx];
                 if (max_env < 1.0f) {
                     for (int t = 0; t < num_taps; ++t) {
-                        float w = tap_w[t];
-                        if (w <= max_env) continue;
+                        float w_max = tap_w[t];
+                        if (w_max <= max_env) continue;
                         int ny = (int)ly + tap_ky[t];
                         int nx = (int)lx + tap_kx[t];
                         if (ny < 0) ny = 0;
                         if (ny >= (int)lat_h) ny = (int)lat_h - 1;
                         if (nx < 0) nx = 0;
                         if (nx >= (int)lat_w) nx = (int)lat_w - 1;
-                        float cand = raw_mask[(size_t)ny * lat_w + (size_t)nx] * w;
+                        float m = raw_mask[(size_t)ny * lat_w + (size_t)nx];
+                        if (m <= max_env || m * w_max <= max_env) continue;
+                        float cand;
+                        if (m >= 0.9999f) {
+                            cand = m * w_max;
+                        } else {
+                            float r_occ = 0.5f * sqrtf(m);
+                            float dx = fmaxf(0.0f, tap_akx[t] - r_occ);
+                            float dy = fmaxf(0.0f, tap_aky[t] - r_occ);
+                            float dist = sqrtf(dx * dx + dy * dy);
+                            if (dist >= eff_feather) continue;
+                            cand = m * 0.5f * (1.0f + cosf(dist * pi_over_feather));
+                        }
                         if (cand > max_env) {
                             max_env = cand;
                         }
@@ -339,6 +361,7 @@ void viz_compute_perceptual_telemetry(
     VizPerceptualTelemetry *out_telemetry
 ) {
     if (!planar_vae_rgb || !out_telemetry || width == 0 || height == 0) return;
+
     size_t plane = (size_t)width * (size_t)height;
     const float *r_p = planar_vae_rgb;
     const float *g_p = planar_vae_rgb + plane;
@@ -380,15 +403,19 @@ void viz_compute_perceptual_telemetry(
         __m256 v_row_sum = _mm256_setzero_ps();
         __m256 v_row_sq = _mm256_setzero_ps();
         int32_t bins[8];
+
         for (; x + 8u <= width; x += 8u) {
             size_t idx = row_off + x;
             __m256 vr = _mm256_min_ps(v_one, _mm256_max_ps(v_zero, _mm256_fmadd_ps(_mm256_loadu_ps(r_p + idx), v_half, v_half)));
             __m256 vg = _mm256_min_ps(v_one, _mm256_max_ps(v_zero, _mm256_fmadd_ps(_mm256_loadu_ps(g_p + idx), v_half, v_half)));
             __m256 vb = _mm256_min_ps(v_one, _mm256_max_ps(v_zero, _mm256_fmadd_ps(_mm256_loadu_ps(b_p + idx), v_half, v_half)));
+
             __m256 vy = _mm256_fmadd_ps(vr, v_wr, _mm256_fmadd_ps(vg, v_wg, _mm256_mul_ps(vb, v_wb)));
             _mm256_storeu_ps(row_cur + x, vy);
+
             v_row_sum = _mm256_add_ps(v_row_sum, vy);
             v_row_sq = _mm256_fmadd_ps(vy, vy, v_row_sq);
+
             __m256i vbins = _mm256_cvtps_epi32(_mm256_mul_ps(vy, v_255));
             _mm256_storeu_si256((__m256i *)bins, vbins);
             hist[(uint32_t)bins[0] & 0xFFu]++;
@@ -400,6 +427,7 @@ void viz_compute_perceptual_telemetry(
             hist[(uint32_t)bins[6] & 0xFFu]++;
             hist[(uint32_t)bins[7] & 0xFFu]++;
         }
+
         float s_lanes[8], sq_lanes[8];
         _mm256_storeu_ps(s_lanes, v_row_sum);
         _mm256_storeu_ps(sq_lanes, v_row_sq);
@@ -408,6 +436,7 @@ void viz_compute_perceptual_telemetry(
             sum_luma_sq += (double)sq_lanes[k];
         }
 #endif
+
         for (; x < width; ++x) {
             size_t idx = row_off + x;
             float r = fminf(1.0f, fmaxf(0.0f, r_p[idx] * 0.5f + 0.5f));
@@ -415,8 +444,10 @@ void viz_compute_perceptual_telemetry(
             float b = fminf(1.0f, fmaxf(0.0f, b_p[idx] * 0.5f + 0.5f));
             float y_val = 0.2126f * r + 0.7152f * g + 0.0722f * b;
             row_cur[x] = y_val;
+
             sum_luma += (double)y_val;
             sum_luma_sq += (double)y_val * (double)y_val;
+
             int bin = (int)lrintf(y_val * 255.0f);
             if (bin < 0) bin = 0;
             if (bin > 255) bin = 255;
@@ -428,6 +459,7 @@ void viz_compute_perceptual_telemetry(
             const float *row_ct = luma_ring + (size_t)((y - 1u) % 3u) * width;
             const float *row_dn = row_cur;
             uint32_t lx = 1u;
+
 #if VIZ_PACK_AVX2
             __m256 v_l_sum = _mm256_setzero_ps();
             __m256 v_l_sq = _mm256_setzero_ps();
@@ -437,6 +469,7 @@ void viz_compute_perceptual_telemetry(
                 __m256 v_lf = _mm256_loadu_ps(row_ct + lx - 1u);
                 __m256 v_rt = _mm256_loadu_ps(row_ct + lx + 1u);
                 __m256 v_ct = _mm256_loadu_ps(row_ct + lx);
+
                 __m256 v_lap = _mm256_fnmadd_ps(v_four, v_ct, _mm256_add_ps(_mm256_add_ps(v_up, v_dn), _mm256_add_ps(v_lf, v_rt)));
                 v_l_sum = _mm256_add_ps(v_l_sum, v_lap);
                 v_l_sq = _mm256_fmadd_ps(v_lap, v_lap, v_l_sq);
@@ -449,6 +482,7 @@ void viz_compute_perceptual_telemetry(
                 sum_lap_sq += (double)lsq[k];
             }
 #endif
+
             for (; lx + 1u < width; ++lx) {
                 double lap = (double)row_up[lx]
                            + (double)row_dn[lx]
@@ -528,9 +562,11 @@ void viz_postprocess_vae_f32_to_rgb8(
         const float *bayer_row = g_bayer_8x8 + ((y & 7u) << 3u);
         size_t row_off = (size_t)y * width;
         uint32_t x = 0;
+
 #if VIZ_PACK_AVX2
         __m256 v_dither = apply_bayer_dither ? _mm256_loadu_ps(bayer_row) : v_zero;
         int32_t r_i[8], g_i[8], b_i[8];
+
         for (; x + 8u <= width; x += 8u) {
             size_t idx = row_off + x;
             __m256 vr = _mm256_min_ps(v_one, _mm256_max_ps(v_zero, _mm256_fmadd_ps(_mm256_loadu_ps(r_p + idx), v_half, v_half)));
@@ -553,13 +589,13 @@ void viz_postprocess_vae_f32_to_rgb8(
             }
         }
 #endif
+
         for (; x < width; ++x) {
             size_t idx = row_off + x;
             float dither = apply_bayer_dither ? bayer_row[x & 7u] : 0.0f;
             float r = fminf(1.0f, fmaxf(0.0f, r_p[idx] * 0.5f + 0.5f)) * 255.0f + dither;
             float g = fminf(1.0f, fmaxf(0.0f, g_p[idx] * 0.5f + 0.5f)) * 255.0f + dither;
             float b = fminf(1.0f, fmaxf(0.0f, b_p[idx] * 0.5f + 0.5f)) * 255.0f + dither;
-
             int ri = (int)lrintf(r);
             int gi = (int)lrintf(g);
             int bi = (int)lrintf(b);

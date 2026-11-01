@@ -66,8 +66,10 @@ static inline double mitchell_netravali(double x) {
     return 0.0;
 }
 
-static uint32_t snap_multiple(float val, uint32_t mult, uint32_t min_v, uint32_t max_v) {
-    uint32_t snapped = ((uint32_t)floorf(val / (float)mult + 0.5f)) * mult;
+static uint32_t snap_multiple(double val, uint32_t mult, uint32_t min_v, uint32_t max_v) {
+    double raw = floor(val / (double)mult + 0.5);
+    if (raw < 0.0) raw = 0.0;
+    uint32_t snapped = ((uint32_t)raw) * mult;
     if (snapped < min_v) snapped = min_v;
     if (snapped > max_v) snapped = (max_v / mult) * mult;
     return snapped;
@@ -86,22 +88,23 @@ void viz_solve_coupled_grid(
     uint32_t *out_vit_w,
     uint32_t *out_vit_h
 ) {
-    if (src_w == 0) src_w = 1024u;
-    if (src_h == 0) src_h = 1024u;
-    float src_aspect = (float)src_w / (float)src_h;
+    if (src_w == 0u) src_w = 1024u;
+    if (src_h == 0u) src_h = 1024u;
+    double src_aspect = (double)src_w / (double)src_h;
 
     uint32_t vae_w = 1024u;
     uint32_t vae_h = 1024u;
-
     if (framing == VIZ_FRAMING_NEVER_CROP) {
-        uint32_t target_area = (req_w > 0 && req_h > 0) ? (req_w * req_h) : (1024u * 1024u);
-        float raw_h = sqrtf((float)target_area / src_aspect);
-        float raw_w = raw_h * src_aspect;
+        uint64_t target_area = (req_w > 0u && req_h > 0u)
+            ? ((uint64_t)req_w * (uint64_t)req_h)
+            : (1024ull * 1024ull);
+        double raw_h = sqrt((double)target_area / src_aspect);
+        double raw_w = raw_h * src_aspect;
         vae_w = snap_multiple(raw_w, 16u, 64u, 2048u);
         vae_h = snap_multiple(raw_h, 16u, 64u, 2048u);
     } else {
-        vae_w = snap_multiple((float)(req_w > 0 ? req_w : src_w), 16u, 16u, 4096u);
-        vae_h = snap_multiple((float)(req_h > 0 ? req_h : src_h), 16u, 16u, 4096u);
+        vae_w = snap_multiple((double)(req_w > 0u ? req_w : src_w), 16u, 16u, 4096u);
+        vae_h = snap_multiple((double)(req_h > 0u ? req_h : src_h), 16u, 16u, 4096u);
     }
 
     uint32_t basis_w = (framing == VIZ_FRAMING_INSCRIBED || framing == VIZ_FRAMING_STRETCH)
@@ -110,26 +113,25 @@ void viz_solve_coupled_grid(
     uint32_t basis_h = (framing == VIZ_FRAMING_INSCRIBED || framing == VIZ_FRAMING_STRETCH)
         ? vae_h
         : src_h;
-    float basis_aspect = (float)basis_w / (float)basis_h;
+    double basis_aspect = (double)basis_w / (double)basis_h;
 
     uint32_t vit_w = 384u;
     uint32_t vit_h = 384u;
-
     if (edit_mode_384_vit) {
         if (basis_w >= basis_h) {
             vit_w = 384u;
-            vit_h = snap_multiple(384.0f / basis_aspect, 32u, 64u, 384u);
+            vit_h = snap_multiple(384.0 / basis_aspect, 32u, 64u, 384u);
         } else {
             vit_h = 384u;
-            vit_w = snap_multiple(384.0f * basis_aspect, 32u, 64u, 384u);
+            vit_w = snap_multiple(384.0 * basis_aspect, 32u, 64u, 384u);
         }
     } else {
         uint32_t eff_max_patches = (max_vit_patches > 0u) ? max_vit_patches : 2304u;
-        uint32_t max_px = eff_max_patches * 256u;
-        float area_basis = (float)basis_w * (float)basis_h;
-        float scale = (area_basis > 0.0f) ? sqrtf((float)max_px / area_basis) : 1.0f;
-        vit_w = snap_multiple((float)basis_w * scale, 32u, 32u, 2048u);
-        vit_h = snap_multiple((float)basis_h * scale, 32u, 32u, 2048u);
+        uint64_t max_px = (uint64_t)eff_max_patches * 256ull;
+        double area_basis = (double)basis_w * (double)basis_h;
+        double scale = (area_basis > 0.0) ? sqrt((double)max_px / area_basis) : 1.0;
+        vit_w = snap_multiple((double)basis_w * scale, 32u, 32u, 2048u);
+        vit_h = snap_multiple((double)basis_h * scale, 32u, 32u, 2048u);
         while ((vit_w / 16u) * (vit_h / 16u) > eff_max_patches && vit_w > 32u && vit_h > 32u) {
             if (vit_w >= vit_h) vit_w -= 32u;
             else vit_h -= 32u;
@@ -142,31 +144,30 @@ void viz_solve_coupled_grid(
     if (out_vit_h) *out_vit_h = vit_h;
 }
 
-int viz_build_polyphase_schedule_1d(
+static int build_polyphase_schedule_1d_f64(
     uint32_t in_dim,
     uint32_t out_dim,
-    float scale,
-    float in_offset,
-    float out_offset,
-    float active_out_span,
-    float mtf_boost,
+    double scale,
+    double in_offset,
+    double out_offset,
+    double active_out_span,
+    double mtf_boost,
     VizPolyphaseSchedule1D *out_sched
 ) {
     if (!out_sched || in_dim == 0u || out_dim == 0u) return -1;
     memset(out_sched, 0, sizeof(*out_sched));
 
-    float eff_mtf = (scale > 1.0f + 1e-5f) ? mtf_boost : 0.0f;
-
+    double eff_mtf = (scale > 1.0 + 1e-5) ? mtf_boost : 0.0;
     int is_ident = (in_dim == out_dim &&
-                    fabsf(scale - 1.0f) < 1e-5f &&
-                    fabsf(in_offset) < 1e-5f &&
-                    fabsf(out_offset) < 1e-5f &&
-                    fabsf(active_out_span - (float)out_dim) < 1e-3f &&
-                    fabsf(eff_mtf) < 1e-5f);
+                    fabs(scale - 1.0) < 1e-5 &&
+                    fabs(in_offset) < 1e-5 &&
+                    fabs(out_offset) < 1e-5 &&
+                    fabs(active_out_span - (double)out_dim) < 1e-3 &&
+                    fabs(eff_mtf) < 1e-5);
 
     uint32_t max_taps = 1u;
     double support = 0.5;
-    double delta = (double)scale;
+    double delta = scale;
     double cutoff = 1.0;
     const double kaiser_a = 4.0;
     const double kaiser_beta = 8.5;
@@ -174,7 +175,7 @@ int viz_build_polyphase_schedule_1d(
 
     if (!is_ident) {
         if (delta >= 1.0) {
-            double bw = (eff_mtf > 0.0f) ? fmin(1.32, 0.92 + 3.8 * (double)eff_mtf) : 0.92;
+            double bw = (eff_mtf > 0.0) ? fmin(1.32, 0.92 + 3.8 * eff_mtf) : 0.92;
             cutoff = fmin(1.0, bw / delta);
             support = kaiser_a * delta;
         } else {
@@ -213,16 +214,16 @@ int viz_build_polyphase_schedule_1d(
     }
 
     for (uint32_t d = 0; d < out_dim; ++d) {
-        float d_center = (float)d + 0.5f;
+        double d_center = (double)d + 0.5;
         float *w_row = weights + (size_t)d * max_taps;
         if (d_center < out_offset || d_center > (out_offset + active_out_span)) {
             start_idx[d] = 0;
             src_center[d] = -1.0f;
             continue;
         }
-
-        double s_center = (double)in_offset + ((double)d_center - (double)out_offset) * delta - 0.5;
+        double s_center = in_offset + (d_center - out_offset) * delta - 0.5;
         src_center[d] = (float)s_center;
+
         int32_t ideal_start = (int32_t)floor(s_center - support) + 1;
         int32_t clamped_start = ideal_start;
         if (in_dim >= max_taps) {
@@ -243,26 +244,24 @@ int viz_build_polyphase_schedule_1d(
             int32_t s = ideal_start + (int32_t)t;
             double dist = (double)s - s_center;
             if (fabs(dist) >= support) continue;
-
             double w = 0.0;
             if (delta >= 1.0) {
                 double ratio = dist / support;
                 double win = viz_bessel_i0(kaiser_beta * sqrt(fmax(0.0, 1.0 - ratio * ratio))) * inv_i0_beta;
                 double x_c = dist * cutoff;
                 double sinc_v = clean_sinc(x_c);
-                if (eff_mtf > 0.0f) {
+                if (eff_mtf > 0.0) {
                     double axc = fabs(x_c);
                     if (axc > 0.0 && axc < 1.0) {
-                        sinc_v *= fmax(0.15, 1.0 - 2.2 * (double)eff_mtf * (axc * axc));
+                        sinc_v *= fmax(0.15, 1.0 - 2.2 * eff_mtf * (axc * axc));
                     } else if (axc >= 1.0 && axc < 2.2) {
-                        sinc_v *= (1.0 + 5.5 * (double)eff_mtf * (axc - 1.0));
+                        sinc_v *= (1.0 + 5.5 * eff_mtf * (axc - 1.0));
                     }
                 }
                 w = sinc_v * win;
             } else {
                 w = mitchell_netravali(dist);
             }
-
             int32_t eff_s = s;
             if (eff_s < 0) eff_s = 0;
             if (eff_s >= (int32_t)in_dim) eff_s = (int32_t)in_dim - 1;
@@ -284,12 +283,102 @@ int viz_build_polyphase_schedule_1d(
     out_sched->in_dim = in_dim;
     out_sched->out_dim = out_dim;
     out_sched->max_taps = max_taps;
-    out_sched->scale = scale;
+    out_sched->scale = (float)scale;
     out_sched->is_identity = 0;
     out_sched->start_idx = start_idx;
     out_sched->weights = weights;
     out_sched->src_center = src_center;
     return 0;
+}
+
+int viz_build_polyphase_schedule_1d(
+    uint32_t in_dim,
+    uint32_t out_dim,
+    float scale,
+    float in_offset,
+    float out_offset,
+    float active_out_span,
+    float mtf_boost,
+    VizPolyphaseSchedule1D *out_sched
+) {
+    return build_polyphase_schedule_1d_f64(
+        in_dim,
+        out_dim,
+        (double)scale,
+        (double)in_offset,
+        (double)out_offset,
+        (double)active_out_span,
+        (double)mtf_boost,
+        out_sched
+    );
+}
+
+static void solve_framing_geometry_2d(
+    uint32_t src_w,
+    uint32_t src_h,
+    uint32_t dst_w,
+    uint32_t dst_h,
+    VizFramingMode framing,
+    double *out_scale_x,
+    double *out_scale_y,
+    double *out_in_off_x,
+    double *out_in_off_y,
+    double *out_out_off_x,
+    double *out_out_off_y,
+    double *out_span_x,
+    double *out_span_y
+) {
+    double scale_x = (double)src_w / (double)dst_w;
+    double scale_y = (double)src_h / (double)dst_h;
+    double in_off_x = 0.0;
+    double in_off_y = 0.0;
+    double out_off_x = 0.0;
+    double out_off_y = 0.0;
+    double span_x = (double)dst_w;
+    double span_y = (double)dst_h;
+
+    if (framing == VIZ_FRAMING_INSCRIBED || framing == VIZ_FRAMING_NEVER_CROP) {
+        if ((uint64_t)dst_w * (uint64_t)src_h >= (uint64_t)dst_h * (uint64_t)src_w) {
+            scale_x = (double)src_w / (double)dst_w;
+            scale_y = scale_x;
+            in_off_x = 0.0;
+            double vis_h = (double)dst_h * scale_y;
+            in_off_y = 0.5 * ((double)src_h - vis_h);
+        } else {
+            scale_y = (double)src_h / (double)dst_h;
+            scale_x = scale_y;
+            in_off_y = 0.0;
+            double vis_w = (double)dst_w * scale_x;
+            in_off_x = 0.5 * ((double)src_w - vis_w);
+        }
+    } else if (framing == VIZ_FRAMING_CONTAIN) {
+        if ((uint64_t)dst_w * (uint64_t)src_h <= (uint64_t)dst_h * (uint64_t)src_w) {
+            scale_x = (double)src_w / (double)dst_w;
+            scale_y = scale_x;
+            span_x = (double)dst_w;
+            out_off_x = 0.0;
+            double fit_scale = (double)dst_w / (double)src_w;
+            span_y = (double)src_h * fit_scale;
+            out_off_y = 0.5 * ((double)dst_h - span_y);
+        } else {
+            scale_y = (double)src_h / (double)dst_h;
+            scale_x = scale_y;
+            span_y = (double)dst_h;
+            out_off_y = 0.0;
+            double fit_scale = (double)dst_h / (double)src_h;
+            span_x = (double)src_w * fit_scale;
+            out_off_x = 0.5 * ((double)dst_w - span_x);
+        }
+    }
+
+    *out_scale_x = scale_x;
+    *out_scale_y = scale_y;
+    *out_in_off_x = in_off_x;
+    *out_in_off_y = in_off_y;
+    *out_out_off_x = out_off_x;
+    *out_out_off_y = out_off_y;
+    *out_span_x = span_x;
+    *out_span_y = span_y;
 }
 
 int viz_build_coupled_schedules_2d(
@@ -302,37 +391,16 @@ int viz_build_coupled_schedules_2d(
     VizPolyphaseSchedule1D *out_sched_x,
     VizPolyphaseSchedule1D *out_sched_y
 ) {
-    float scale_x = (float)src_w / (float)dst_w;
-    float scale_y = (float)src_h / (float)dst_h;
-    float in_off_x = 0.0f;
-    float in_off_y = 0.0f;
-    float out_off_x = 0.0f;
-    float out_off_y = 0.0f;
-    float span_x = (float)dst_w;
-    float span_y = (float)dst_h;
+    double scale_x, scale_y, in_off_x, in_off_y, out_off_x, out_off_y, span_x, span_y;
+    solve_framing_geometry_2d(
+        src_w, src_h, dst_w, dst_h, framing,
+        &scale_x, &scale_y, &in_off_x, &in_off_y, &out_off_x, &out_off_y, &span_x, &span_y
+    );
 
-    if (framing == VIZ_FRAMING_INSCRIBED || framing == VIZ_FRAMING_NEVER_CROP) {
-        float fill_scale = fmaxf((float)dst_w / (float)src_w, (float)dst_h / (float)src_h);
-        scale_x = 1.0f / fill_scale;
-        scale_y = 1.0f / fill_scale;
-        float vis_w = (float)dst_w * scale_x;
-        float vis_h = (float)dst_h * scale_y;
-        in_off_x = 0.5f * ((float)src_w - vis_w);
-        in_off_y = 0.5f * ((float)src_h - vis_h);
-    } else if (framing == VIZ_FRAMING_CONTAIN) {
-        float fit_scale = fminf((float)dst_w / (float)src_w, (float)dst_h / (float)src_h);
-        scale_x = 1.0f / fit_scale;
-        scale_y = 1.0f / fit_scale;
-        span_x = (float)src_w * fit_scale;
-        span_y = (float)src_h * fit_scale;
-        out_off_x = 0.5f * ((float)dst_w - span_x);
-        out_off_y = 0.5f * ((float)dst_h - span_y);
-    }
-
-    if (viz_build_polyphase_schedule_1d(src_w, dst_w, scale_x, in_off_x, out_off_x, span_x, mtf_boost, out_sched_x) != 0) {
+    if (build_polyphase_schedule_1d_f64(src_w, dst_w, scale_x, in_off_x, out_off_x, span_x, (double)mtf_boost, out_sched_x) != 0) {
         return -1;
     }
-    if (viz_build_polyphase_schedule_1d(src_h, dst_h, scale_y, in_off_y, out_off_y, span_y, mtf_boost, out_sched_y) != 0) {
+    if (build_polyphase_schedule_1d_f64(src_h, dst_h, scale_y, in_off_y, out_off_y, span_y, (double)mtf_boost, out_sched_y) != 0) {
         viz_free_polyphase_schedule_1d(out_sched_x);
         return -1;
     }
@@ -345,24 +413,6 @@ void viz_free_polyphase_schedule_1d(VizPolyphaseSchedule1D *sched) {
     free(sched->weights);
     free(sched->src_center);
     memset(sched, 0, sizeof(*sched));
-}
-
-static inline float soft_knee_bound_1d(float v, float lo, float hi, float tau) {
-    float span = hi - lo;
-    float eff_tau = tau * span;
-    if (v > hi) {
-        if (eff_tau <= 1e-7f) return hi;
-        float z = (v - hi) / eff_tau;
-        float t = (z >= 3.0f) ? 1.0f : (z * (27.0f + z * z) / (27.0f + 9.0f * z * z));
-        return hi + eff_tau * t;
-    }
-    if (v < lo) {
-        if (eff_tau <= 1e-7f) return lo;
-        float z = (lo - v) / eff_tau;
-        float t = (z >= 3.0f) ? 1.0f : (z * (27.0f + z * z) / (27.0f + 9.0f * z * z));
-        return lo - eff_tau * t;
-    }
-    return v;
 }
 
 static inline __m128 finalize_rgba_128(__m128 v_acc, __m128 v_raw, __m128 p0, __m128 p1, __m128 v_tau) {
@@ -447,12 +497,10 @@ int viz_resample_2d_linear_rgba(
     if (!src_linear_rgba || !out_linear_rgba || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) {
         return -1;
     }
-
     VizPolyphaseSchedule1D sx, sy;
     if (viz_build_coupled_schedules_2d(src_w, src_h, dst_w, dst_h, framing, mtf_boost, &sx, &sy) != 0) {
         return -2;
     }
-
     if (sx.is_identity && sy.is_identity) {
         memcpy(out_linear_rgba, src_linear_rgba, (size_t)dst_w * (size_t)dst_h * 4u * sizeof(float));
         viz_free_polyphase_schedule_1d(&sx);
@@ -679,35 +727,14 @@ void viz_resample_majority_color_map_rgba8(
     float *g_p = out_planar_vae_rgb + plane;
     float *b_p = out_planar_vae_rgb + plane * 2u;
 
-    float scale_x = (float)src_w / (float)dst_w;
-    float scale_y = (float)src_h / (float)dst_h;
-    float in_off_x = 0.0f;
-    float in_off_y = 0.0f;
-    float out_off_x = 0.0f;
-    float out_off_y = 0.0f;
-    float span_x = (float)dst_w;
-    float span_y = (float)dst_h;
-
-    if (framing == VIZ_FRAMING_INSCRIBED || framing == VIZ_FRAMING_NEVER_CROP) {
-        float fill_scale = fmaxf((float)dst_w / (float)src_w, (float)dst_h / (float)src_h);
-        scale_x = 1.0f / fill_scale;
-        scale_y = 1.0f / fill_scale;
-        float vis_w = (float)dst_w * scale_x;
-        float vis_h = (float)dst_h * scale_y;
-        in_off_x = 0.5f * ((float)src_w - vis_w);
-        in_off_y = 0.5f * ((float)src_h - vis_h);
-    } else if (framing == VIZ_FRAMING_CONTAIN) {
-        float fit_scale = fminf((float)dst_w / (float)src_w, (float)dst_h / (float)src_h);
-        scale_x = 1.0f / fit_scale;
-        scale_y = 1.0f / fit_scale;
-        span_x = (float)src_w * fit_scale;
-        span_y = (float)src_h * fit_scale;
-        out_off_x = 0.5f * ((float)dst_w - span_x);
-        out_off_y = 0.5f * ((float)dst_h - span_y);
-    }
+    double scale_x, scale_y, in_off_x, in_off_y, out_off_x, out_off_y, span_x, span_y;
+    solve_framing_geometry_2d(
+        src_w, src_h, dst_w, dst_h, framing,
+        &scale_x, &scale_y, &in_off_x, &in_off_y, &out_off_x, &out_off_y, &span_x, &span_y
+    );
 
     for (uint32_t dy = 0; dy < dst_h; ++dy) {
-        float dy_center = (float)dy + 0.5f;
+        double dy_center = (double)dy + 0.5;
         if (dy_center < out_off_y || dy_center > (out_off_y + span_y)) {
             size_t row_base = (size_t)dy * dst_w;
             for (uint32_t dx = 0; dx < dst_w; ++dx) {
@@ -718,10 +745,10 @@ void viz_resample_majority_color_map_rgba8(
             continue;
         }
 
-        float sy_lo = in_off_y + ((float)dy - out_off_y) * scale_y;
-        float sy_hi = in_off_y + ((float)(dy + 1u) - out_off_y) * scale_y;
-        int y0 = (int)floorf(sy_lo);
-        int y1 = (int)ceilf(sy_hi);
+        double sy_lo = in_off_y + ((double)dy - out_off_y) * scale_y;
+        double sy_hi = in_off_y + ((double)(dy + 1u) - out_off_y) * scale_y;
+        int y0 = (int)floor(sy_lo);
+        int y1 = (int)ceil(sy_hi);
         if (y0 < 0) y0 = 0;
         if (y0 >= (int)src_h) y0 = (int)src_h - 1;
         if (y1 <= y0) y1 = y0 + 1;
@@ -729,7 +756,7 @@ void viz_resample_majority_color_map_rgba8(
 
         for (uint32_t dx = 0; dx < dst_w; ++dx) {
             size_t idx = (size_t)dy * dst_w + dx;
-            float dx_center = (float)dx + 0.5f;
+            double dx_center = (double)dx + 0.5;
             if (dx_center < out_off_x || dx_center > (out_off_x + span_x)) {
                 r_p[idx] = -1.0f;
                 g_p[idx] = -1.0f;
@@ -737,10 +764,10 @@ void viz_resample_majority_color_map_rgba8(
                 continue;
             }
 
-            float sx_lo = in_off_x + ((float)dx - out_off_x) * scale_x;
-            float sx_hi = in_off_x + ((float)(dx + 1u) - out_off_x) * scale_x;
-            int x0 = (int)floorf(sx_lo);
-            int x1 = (int)ceilf(sx_hi);
+            double sx_lo = in_off_x + ((double)dx - out_off_x) * scale_x;
+            double sx_hi = in_off_x + ((double)(dx + 1u) - out_off_x) * scale_x;
+            int x0 = (int)floor(sx_lo);
+            int x1 = (int)ceil(sx_hi);
             if (x0 < 0) x0 = 0;
             if (x0 >= (int)src_w) x0 = (int)src_w - 1;
             if (x1 <= x0) x1 = x0 + 1;

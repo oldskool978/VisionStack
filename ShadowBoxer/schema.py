@@ -1,7 +1,8 @@
-# ShadowBoxer/schema.py
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -174,6 +175,10 @@ _CHARACTER_SYNONYMS = {
 }
 
 
+def _snap_lattice_floor_half(val: float, mult: int) -> int:
+    return int(math.ceil((float(val) / float(mult)) - 0.5 - 1e-9)) * int(mult)
+
+
 def normalize_box_label(raw_label: Any, has_text: bool = False) -> str:
     if has_text:
         return "text"
@@ -237,16 +242,18 @@ def bbox_to_pixel_rect(
     if len(bbox) != 4:
         return (0, 0, height, width)
     y0, x0, y1, x1 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    min_v = min(y0, x0, y1, x1)
+    max_v = max(y0, x0, y1, x1)
     if (
-        not coords_are_pixels
-        and -1e-5 <= min(y0, x0, y1, x1)
-        and max(y0, x0, y1, x1) <= 1.0 + 1e-5
+        -1e-5 <= min_v
+        and 0.0 < max_v <= 1.0 + 1e-5
+        and (not coords_are_pixels or (int(height) >= 64 and int(width) >= 64))
     ):
         py0 = y0 * height
         px0 = x0 * width
         py1 = y1 * height
         px1 = x1 * width
-    elif not coords_are_pixels or min(y0, x0, y1, x1) < 0.0:
+    elif not coords_are_pixels or min_v < 0.0:
         cy = float(int(height) // 2)
         cx = float(int(width) // 2)
         py0 = y0 + cy
@@ -294,6 +301,66 @@ def bbox_to_abs_centralized(
     return pixel_bbox_to_abs_centralized(
         ymin, xmin, ymax, xmax, height=height, width=width
     )
+
+
+def scale_layout_items_to_canvas(
+    items: Sequence[Dict[str, Any]],
+    height: int,
+    width: int,
+    src_height: int = 1024,
+    src_width: int = 1024,
+    coords_are_pixels: bool = True,
+    snap_multiple: int = 16,
+) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+    h = max(16, int(height))
+    w = max(16, int(width))
+    sh = max(16, int(src_height))
+    sw = max(16, int(src_width))
+    if not coords_are_pixels or (h == sh and w == sw):
+        return [dict(it) for it in items if isinstance(it, dict)]
+
+    mult = max(1, int(snap_multiple))
+    scaled_items: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        d = dict(item)
+        bbox = d.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            uy0, ux0, uy1, ux1 = bbox_to_normalized(
+                bbox, height=sh, width=sw, coords_are_pixels=True
+            )
+            if mult > 1 and h >= mult and w >= mult:
+                ny0 = (
+                    0
+                    if uy0 <= 1e-5
+                    else max(0, min(h - mult, _snap_lattice_floor_half(uy0 * h, mult)))
+                )
+                nx0 = (
+                    0
+                    if ux0 <= 1e-5
+                    else max(0, min(w - mult, _snap_lattice_floor_half(ux0 * w, mult)))
+                )
+                ny1 = (
+                    h
+                    if uy1 >= 1.0 - 1e-5
+                    else max(ny0 + mult, min(h, _snap_lattice_floor_half(uy1 * h, mult)))
+                )
+                nx1 = (
+                    w
+                    if ux1 >= 1.0 - 1e-5
+                    else max(nx0 + mult, min(w, _snap_lattice_floor_half(ux1 * w, mult)))
+                )
+            else:
+                ny0 = max(0, min(h - 1, _snap_lattice_floor_half(uy0 * h, 1)))
+                nx0 = max(0, min(w - 1, _snap_lattice_floor_half(ux0 * w, 1)))
+                ny1 = max(ny0 + 1, min(h, _snap_lattice_floor_half(uy1 * h, 1)))
+                nx1 = max(nx0 + 1, min(w, _snap_lattice_floor_half(ux1 * w, 1)))
+            d["bbox"] = [ny0, nx0, ny1, nx1]
+        scaled_items.append(d)
+    return scaled_items
 
 
 def canonical_box_sort_key(
@@ -391,11 +458,9 @@ def reconcile_layout_summary_quotes(
     clean_cap = caption.strip()
     if not clean_cap or not active_texts:
         return clean_cap
-
     matches = list(re.finditer(r'"([^"\r\n]+)"', clean_cap))
     if not matches:
         return clean_cap
-
     if len(matches) == len(active_texts):
         parts: List[str] = []
         last_idx = 0
@@ -405,11 +470,9 @@ def reconcile_layout_summary_quotes(
             last_idx = m.end()
         parts.append(clean_cap[last_idx:])
         return "".join(parts)
-
     default_quote = '"Remember to test SFT & Base permutations @ 1024x1024"'
     if default_quote in clean_cap:
         return clean_cap.replace(default_quote, f'"{active_texts[0]}"', 1)
-
     return clean_cap
 
 
@@ -428,7 +491,6 @@ def compile_layout_prompt(
     active_texts = get_reading_order_texts(
         items, height=height, width=width, coords_are_pixels=coords_are_pixels
     )
-
     for idx in canonical_indices:
         item = items[idx]
         raw_entry = dict(item)
@@ -531,6 +593,7 @@ def compile_spatial_thinking_trace(
         width=w,
         coords_are_pixels=req.layout_coords_are_pixels,
     )
+
     clean_ls = (req.layout_summary or "").strip()
     clean_p = (req.prompt or "").strip()
     base_summary = (
@@ -600,7 +663,6 @@ def compile_spatial_thinking_trace(
             item = req.layout_items[idx]
             lbl, txt_val, cap = extract_box_text_and_caption(item)
             raw_cap = str(item.get("caption") or item.get("description") or "").strip()
-
             bbox = item.get("bbox")
             if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
                 c_b = bbox_to_abs_centralized(
@@ -619,20 +681,17 @@ def compile_spatial_thinking_trace(
             else:
                 c_b = [-cy, -cx, h - cy, w - cx]
                 area_pct = 100.0
-
             ref_tag = ""
             if isinstance(item.get("reference"), str) and item["reference"].strip():
                 ref_tag = f", ref={item['reference'].strip()}"
             elif idx in box_pic_map:
                 ref_tag = f", ref=Picture {box_pic_map[idx]}"
-
             dn_raw = item.get("denoise_strength")
             dn_tag = (
                 f", d={float(dn_raw):.2f}"
                 if (dn_raw is not None and str(dn_raw).strip() != "")
                 else ""
             )
-
             if lbl == "text" and txt_val:
                 style_note = (
                     raw_cap
@@ -646,7 +705,6 @@ def compile_spatial_thinking_trace(
                 box_descs.append(
                     f"R{order_num}[{lbl} {c_b}, {area_pct:.1f}%{ref_tag}{dn_tag}: {cap or lbl}]"
                 )
-
         step_idx = 4 if ref_specs else 3
         lines.append(
             f"{step_idx}. Coarse-to-Fine Spatial Hierarchy: " + "; ".join(box_descs) + "."
@@ -691,7 +749,6 @@ def parse_layer_list(
 def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "engine_defaults" in data and isinstance(data["engine_defaults"], dict):
         data = data["engine_defaults"]
-
     harvested: Dict[str, Any] = {}
     if "model_variant" in data and isinstance(data["model_variant"], str):
         mv = data["model_variant"].strip().lower()
@@ -714,7 +771,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         and data["layout_coords_are_pixels"] is not None
     ):
         harvested["layout_coords_are_pixels"] = bool(data["layout_coords_are_pixels"])
-
     for dim_key in ("height", "width"):
         if dim_key in data and data[dim_key] is not None:
             try:
@@ -722,7 +778,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 harvested[dim_key] = (v // 16) * 16
             except (ValueError, TypeError):
                 pass
-
     if "num_inference_steps" in data and data["num_inference_steps"] is not None:
         try:
             harvested["num_inference_steps"] = max(
@@ -730,22 +785,18 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     if "shift" in data and data["shift"] is not None:
         try:
             harvested["shift"] = max(0.1, min(20.0, float(data["shift"])))
         except (ValueError, TypeError):
             pass
-
     if "use_v2_grid" in data and data["use_v2_grid"] is not None:
         harvested["use_v2_grid"] = bool(data["use_v2_grid"])
-
     for s_key in ("early_solver", "late_solver"):
         if s_key in data and isinstance(data[s_key], str):
             slv = data[s_key].strip().lower()
             if slv in SUPPORTED_SOLVERS:
                 harvested[s_key] = slv
-
     if "handoff_threshold" in data and data["handoff_threshold"] is not None:
         try:
             harvested["handoff_threshold"] = max(
@@ -753,43 +804,36 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     for cfg_key in ("guidance_scale", "early_cfg", "late_cfg"):
         if cfg_key in data and data[cfg_key] is not None:
             try:
                 harvested[cfg_key] = max(0.0, min(30.0, float(data[cfg_key])))
             except (ValueError, TypeError):
                 pass
-
     if "guidance_scale" in harvested and "early_cfg" not in harvested:
         harvested["early_cfg"] = harvested["guidance_scale"]
     if "early_cfg" in harvested and "guidance_scale" not in harvested:
         harvested["guidance_scale"] = harvested["early_cfg"]
-
     if "uncond_skip_layers" in data:
         harvested["uncond_skip_layers"] = parse_layer_list(data["uncond_skip_layers"])
     if "slg_layers" in data:
         harvested["slg_layers"] = parse_layer_list(data["slg_layers"])
-
     if "slg_scale" in data and data["slg_scale"] is not None:
         try:
             harvested["slg_scale"] = max(0.0, min(20.0, float(data["slg_scale"])))
         except (ValueError, TypeError):
             pass
-
     for b_key in ("slg_start", "slg_stop", "eta", "box_attn_isolation"):
         if b_key in data and data[b_key] is not None:
             try:
                 harvested[b_key] = max(0.0, min(1.0, float(data[b_key])))
             except (ValueError, TypeError):
                 pass
-
     if "s_noise" in data and data["s_noise"] is not None:
         try:
             harvested["s_noise"] = max(0.0, min(5.0, float(data["s_noise"])))
         except (ValueError, TypeError):
             pass
-
     if "denoise_strength" in data and data["denoise_strength"] is not None:
         try:
             harvested["denoise_strength"] = max(
@@ -797,7 +841,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     if "max_sequence_length" in data and data["max_sequence_length"] is not None:
         try:
             harvested["max_sequence_length"] = max(
@@ -805,7 +848,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     if "framing_mode" in data and isinstance(data["framing_mode"], str):
         fm = data["framing_mode"].strip().lower()
         if fm in SUPPORTED_FRAMING_MODES:
@@ -822,7 +864,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         mb = data["mask_blend_mode"].strip().lower()
         if mb in SUPPORTED_MASK_BLEND_MODES:
             harvested["mask_blend_mode"] = mb
-
     if "max_vit_patches" in data and data["max_vit_patches"] is not None:
         try:
             harvested["max_vit_patches"] = max(
@@ -830,7 +871,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (ValueError, TypeError):
             pass
-
     for flt_key, lo, hi in (
         ("mtf_boost", 0.0, 0.5),
         ("soft_knee_tau", 0.001, 0.25),
@@ -843,17 +883,14 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 harvested[flt_key] = max(lo, min(hi, float(data[flt_key])))
             except (ValueError, TypeError):
                 pass
-
     if "edit_lora_path" in data:
         val = data["edit_lora_path"]
         harvested["edit_lora_path"] = (
             str(val).strip() if (isinstance(val, str) and val.strip()) else None
         )
-
     if "uncond_uses_references" in data:
         val = data["uncond_uses_references"]
         harvested["uncond_uses_references"] = None if val is None else bool(val)
-
     for flag_key in (
         "enable_thinking",
         "add_vision_id",
@@ -869,7 +906,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     ):
         if flag_key in data and data[flag_key] is not None:
             harvested[flag_key] = bool(data[flag_key])
-
     return harvested
 
 
@@ -948,32 +984,26 @@ class GenerationRequest(BaseModel):
     preserve_canvas_outside_boxes: Optional[bool] = Field(default=None)
     box_attn_isolation: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     composite_box_images_to_init: Optional[bool] = Field(default=None)
-
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1024, ge=256, le=2048)
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     shift: Optional[float] = Field(default=None, ge=0.1, le=20.0)
     use_v2_grid: Optional[bool] = Field(default=None)
-
     early_solver: Optional[str] = Field(default=None)
     late_solver: Optional[str] = Field(default=None)
     handoff_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     early_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     late_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
-
     uncond_skip_layers: Optional[List[int]] = Field(default=None)
     slg_layers: Optional[List[int]] = Field(default=None)
     slg_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     slg_start: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     slg_stop: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
     eta: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     s_noise: Optional[float] = Field(default=None, ge=0.0, le=5.0)
     max_sequence_length: Optional[int] = Field(default=None, ge=64, le=32768)
     enable_thinking: Optional[bool] = Field(default=None)
-
     init_image_path: Optional[str] = Field(default=None)
     denoise_strength: float = Field(default=1.0, ge=0.01, le=1.0)
     inpaint_mask_path: Optional[str] = Field(default=None)
@@ -1000,7 +1030,6 @@ class GenerationRequest(BaseModel):
     edit_lora_scale: float = Field(default=1.0, ge=0.0, le=4.0)
     export_vizj_path: Optional[str] = Field(default=None)
     export_vizj_tier: int = Field(default=2, ge=0, le=2)
-
     num_images_per_prompt: int = Field(default=1, ge=1, le=8)
     seed: Optional[int] = Field(default=42)
     output_path: str = Field(default="output_moss_master.png")
@@ -1041,28 +1070,23 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]
         ):
             self.num_inference_steps = int(active["num_inference_steps"])
-
         if self.shift is None or (
             use_custom and self.shift == BASELINE_ENGINE_DEFAULTS["shift"]
         ):
             self.shift = float(active["shift"])
-
         if self.use_v2_grid is None or (
             use_custom and self.use_v2_grid == BASELINE_ENGINE_DEFAULTS["use_v2_grid"]
         ):
             self.use_v2_grid = bool(active["use_v2_grid"])
-
         if self.early_solver is None or (
             use_custom
             and self.early_solver == BASELINE_ENGINE_DEFAULTS["early_solver"]
         ):
             self.early_solver = str(active["early_solver"])
-
         if self.late_solver is None or (
             use_custom and self.late_solver == BASELINE_ENGINE_DEFAULTS["late_solver"]
         ):
             self.late_solver = str(active["late_solver"])
-
         if self.handoff_threshold is None or (
             use_custom
             and self.handoff_threshold
@@ -1096,44 +1120,36 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"]
         ):
             self.uncond_skip_layers = list(active["uncond_skip_layers"])
-
         if self.slg_layers is None or (
             use_custom and self.slg_layers == BASELINE_ENGINE_DEFAULTS["slg_layers"]
         ):
             self.slg_layers = list(active["slg_layers"])
-
         if self.slg_scale is None or (
             use_custom and self.slg_scale == BASELINE_ENGINE_DEFAULTS["slg_scale"]
         ):
             self.slg_scale = float(active["slg_scale"])
-
         if self.slg_start is None or (
             use_custom and self.slg_start == BASELINE_ENGINE_DEFAULTS["slg_start"]
         ):
             self.slg_start = float(active["slg_start"])
-
         if self.slg_stop is None or (
             use_custom and self.slg_stop == BASELINE_ENGINE_DEFAULTS["slg_stop"]
         ):
             self.slg_stop = float(active["slg_stop"])
-
         if self.eta is None or (
             use_custom and self.eta == BASELINE_ENGINE_DEFAULTS["eta"]
         ):
             self.eta = float(active["eta"])
-
         if self.s_noise is None or (
             use_custom and self.s_noise == BASELINE_ENGINE_DEFAULTS["s_noise"]
         ):
             self.s_noise = float(active["s_noise"])
-
         if self.max_sequence_length is None or (
             use_custom
             and self.max_sequence_length
             == BASELINE_ENGINE_DEFAULTS["max_sequence_length"]
         ):
             self.max_sequence_length = int(active["max_sequence_length"])
-
         if self.enable_thinking is None or (
             use_custom
             and self.enable_thinking == BASELINE_ENGINE_DEFAULTS["enable_thinking"]
@@ -1145,23 +1161,19 @@ class GenerationRequest(BaseModel):
             and self.framing_mode == BASELINE_ENGINE_DEFAULTS["framing_mode"]
         ):
             self.framing_mode = str(active["framing_mode"])
-
         if self.input_role is None or (
             use_custom and self.input_role == BASELINE_ENGINE_DEFAULTS["input_role"]
         ):
             self.input_role = str(active["input_role"])
-
         if self.edit_format is None or (
             use_custom and self.edit_format == BASELINE_ENGINE_DEFAULTS["edit_format"]
         ):
             self.edit_format = str(active["edit_format"])
-
         if self.mask_blend_mode is None or (
             use_custom
             and self.mask_blend_mode == BASELINE_ENGINE_DEFAULTS["mask_blend_mode"]
         ):
             self.mask_blend_mode = str(active.get("mask_blend_mode", "auto"))
-
         if self.invert_inpaint_mask is None or (
             use_custom
             and self.invert_inpaint_mask
@@ -1170,56 +1182,47 @@ class GenerationRequest(BaseModel):
             self.invert_inpaint_mask = bool(
                 active.get("invert_inpaint_mask", False)
             )
-
         if self.max_vit_patches is None or (
             use_custom
             and self.max_vit_patches == BASELINE_ENGINE_DEFAULTS["max_vit_patches"]
         ):
             self.max_vit_patches = int(active["max_vit_patches"])
-
         if self.deband_8bit is None or (
             use_custom and self.deband_8bit == BASELINE_ENGINE_DEFAULTS["deband_8bit"]
         ):
             self.deband_8bit = bool(active["deband_8bit"])
-
         if self.prefer_vulkan is None or (
             use_custom
             and self.prefer_vulkan == BASELINE_ENGINE_DEFAULTS["prefer_vulkan"]
         ):
             self.prefer_vulkan = bool(active["prefer_vulkan"])
-
         if self.mtf_boost is None or (
             use_custom and self.mtf_boost == BASELINE_ENGINE_DEFAULTS["mtf_boost"]
         ):
             self.mtf_boost = float(active["mtf_boost"])
-
         if self.soft_knee_tau is None or (
             use_custom
             and self.soft_knee_tau == BASELINE_ENGINE_DEFAULTS["soft_knee_tau"]
         ):
             self.soft_knee_tau = float(active["soft_knee_tau"])
-
         if self.mask_feather_radius is None or (
             use_custom
             and self.mask_feather_radius
             == BASELINE_ENGINE_DEFAULTS["mask_feather_radius"]
         ):
             self.mask_feather_radius = float(active["mask_feather_radius"])
-
         if self.latent_clamp_sigma is None or (
             use_custom
             and self.latent_clamp_sigma
             == BASELINE_ENGINE_DEFAULTS["latent_clamp_sigma"]
         ):
             self.latent_clamp_sigma = float(active["latent_clamp_sigma"])
-
         if self.apply_bayer_dither is None or (
             use_custom
             and self.apply_bayer_dither
             == BASELINE_ENGINE_DEFAULTS["apply_bayer_dither"]
         ):
             self.apply_bayer_dither = bool(active["apply_bayer_dither"])
-
         if self.use_reference_cache is None or (
             use_custom
             and self.use_reference_cache
@@ -1235,14 +1238,12 @@ class GenerationRequest(BaseModel):
             self.preserve_canvas_outside_boxes = bool(
                 active.get("preserve_canvas_outside_boxes", False)
             )
-
         if self.box_attn_isolation is None or (
             use_custom
             and self.box_attn_isolation
             == BASELINE_ENGINE_DEFAULTS["box_attn_isolation"]
         ):
             self.box_attn_isolation = float(active.get("box_attn_isolation", 0.0))
-
         if self.composite_box_images_to_init is None or (
             use_custom
             and self.composite_box_images_to_init
@@ -1251,7 +1252,6 @@ class GenerationRequest(BaseModel):
             self.composite_box_images_to_init = bool(
                 active.get("composite_box_images_to_init", False)
             )
-
         if (
             self.uncond_uses_references is None
             and active.get("uncond_uses_references") is not None
@@ -1262,13 +1262,11 @@ class GenerationRequest(BaseModel):
             use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]
         ):
             self.cpu_offload = bool(active["cpu_offload"])
-
         if self.prepass_warmup is None or (
             use_custom
             and self.prepass_warmup == BASELINE_ENGINE_DEFAULTS["prepass_warmup"]
         ):
             self.prepass_warmup = bool(active["prepass_warmup"])
-
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1347,7 +1345,6 @@ class GenerationRequest(BaseModel):
             width=self.width,
             coords_are_pixels=self.layout_coords_are_pixels,
         )
-
         for idx in canonical_indices:
             item = self.layout_items[idx]
             img_p = (
@@ -1374,7 +1371,6 @@ class GenerationRequest(BaseModel):
                     width=self.width,
                     coords_are_pixels=self.layout_coords_are_pixels,
                 )
-
             raw_box_fm = item.get("framing_mode")
             if (
                 isinstance(raw_box_fm, str)
@@ -1400,7 +1396,6 @@ class GenerationRequest(BaseModel):
             if emits_dit:
                 dit_ref_counter += 1
                 dit_idx = dit_ref_counter
-
             pic_idx = None
             if emits_vit:
                 vit_pic_counter += 1
@@ -1467,7 +1462,6 @@ class GenerationRequest(BaseModel):
                     "z_order": box_z,
                 }
             )
-
         return specs, box_pic_map
 
     def resolve_thinking_trace(

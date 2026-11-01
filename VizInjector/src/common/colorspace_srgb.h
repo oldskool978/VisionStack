@@ -14,10 +14,18 @@ float viz_srgb_to_linear_f32(float srgb_val);
 float viz_linear_to_srgb_f32(float linear_val);
 
 const float *viz_get_srgb_to_lin_lut(void);
+const float *viz_get_srgb_to_lin_interp_lut(void);
 const float *viz_get_lin_to_srgb_lut(void);
 
 void viz_ingest_scalar_rgba8_to_f32(
     const uint8_t *src_rgba8,
+    uint32_t width,
+    uint32_t height,
+    float *out_linear_rgba
+);
+
+void viz_ingest_scalar_rgba16_to_f32(
+    const uint16_t *src_rgba16,
     uint32_t width,
     uint32_t height,
     float *out_linear_rgba

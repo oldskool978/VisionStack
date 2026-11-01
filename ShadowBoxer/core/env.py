@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import shutil
+import stat
 import sys
 from typing import Any, Optional, Union
 import warnings
@@ -15,6 +17,43 @@ if str(ROOT_DIR) not in sys.path:
 sys.modules["torchvision"] = None
 sys.modules["torchvision.transforms"] = None
 sys.modules["torchvision.io"] = None
+
+
+def _sync_sibling_dist_if_newer(sibling_dist: Path, stage_dir: Path) -> None:
+    if not sibling_dist.is_dir():
+        return
+    try:
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        for src_file in sibling_dist.iterdir():
+            if not src_file.is_file():
+                continue
+            dst_file = stage_dir / src_file.name
+            needs_copy = not dst_file.is_file()
+            if not needs_copy:
+                try:
+                    needs_copy = (
+                        src_file.stat().st_mtime_ns > dst_file.stat().st_mtime_ns
+                        or src_file.stat().st_size != dst_file.stat().st_size
+                    )
+                except OSError:
+                    needs_copy = True
+            if needs_copy:
+                if dst_file.exists():
+                    try:
+                        os.chmod(dst_file, stat.S_IWRITE | stat.S_IREAD)
+                    except Exception:
+                        pass
+                shutil.copy2(src_file, dst_file)
+    except Exception:
+        pass
+
+
+_sync_sibling_dist_if_newer(
+    ROOT_DIR.parent / "VizToken" / "dist" / "bin", ROOT_DIR / "viztoken"
+)
+_sync_sibling_dist_if_newer(
+    ROOT_DIR.parent / "VizInjector" / "dist" / "bin", ROOT_DIR / "vizinjector"
+)
 
 
 def _resolve_cache_dir() -> Path:
@@ -87,6 +126,7 @@ def _configure_rocm_runtime_env() -> None:
 
 
 _configure_rocm_runtime_env()
+
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 import torch
@@ -143,21 +183,30 @@ def _pin_cpu_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if t is None:
         return None
     with torch.inference_mode(False):
-        cpu_t = t.detach().to(device="cpu").clone().contiguous()
+        src = t.detach()
         if torch.cuda.is_available():
             try:
-                return cpu_t.pin_memory()
+                out = torch.empty(
+                    src.shape, dtype=src.dtype, device="cpu", pin_memory=True
+                )
+                out.copy_(src, non_blocking=False)
+                return out
             except Exception:
-                return cpu_t
-        return cpu_t
+                pass
+        return src.to(device="cpu").clone().contiguous()
 
 
 def _evacuate_to_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if t is None:
         return None
-    if t.device.type == "cpu":
+    if (
+        t.device.type == "cpu"
+        and not t.is_inference()
+        and t.is_contiguous()
+        and (not torch.cuda.is_available() or t.is_pinned())
+    ):
         return t
-    return t.detach().to(device="cpu").contiguous()
+    return _pin_cpu_tensor(t)
 
 
 __all__ = [
