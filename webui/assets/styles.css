@@ -31,13 +31,16 @@
   width: 6px;
   height: 6px;
 }
+
 ::-webkit-scrollbar-track {
   background: var(--bg-secondary);
 }
+
 ::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 3px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
@@ -348,9 +351,7 @@ html, body {
   grid-template-columns: 1fr 1fr 1fr 1fr;
 }
 
-.input-text,
-.input-select,
-.input-textarea {
+.input-text, .input-select, .input-textarea {
   width: 100%;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
@@ -364,16 +365,12 @@ html, body {
   transition: border-color 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
 }
 
-.input-text:focus,
-.input-select:focus,
-.input-textarea:focus {
+.input-text:focus, .input-select:focus, .input-textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-glow);
 }
 
-.input-text:disabled,
-.input-select:disabled,
-.input-textarea:disabled {
+.input-text:disabled, .input-select:disabled, .input-textarea:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
@@ -495,8 +492,7 @@ html, body {
   transform: translateY(-1px);
 }
 
-.btn-primary:disabled,
-.btn-secondary:disabled {
+.btn-primary:disabled, .btn-secondary:disabled {
   opacity: 0.45;
   cursor: not-allowed;
   transform: none;
@@ -508,8 +504,7 @@ html, body {
   color: var(--text-primary);
 }
 
-.btn-secondary:hover:not(:disabled),
-.btn-secondary.active {
+.btn-secondary:hover:not(:disabled), .btn-secondary.active {
   border-color: var(--accent);
   color: var(--accent);
   box-shadow: 0 0 10px var(--accent-glow);
@@ -950,8 +945,7 @@ html, body {
   background: rgba(16, 185, 129, 0.14);
 }
 
-.spatial-box.selected-box,
-.spatial-box:hover {
+.spatial-box.selected-box, .spatial-box:hover {
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.32), 0 8px 24px rgba(0, 0, 0, 0.55);
 }
 
@@ -1004,6 +998,21 @@ html, body {
   border-radius: 3px;
   font-size: 9px;
   font-variant-numeric: tabular-nums;
+}
+
+.box-mini-pill.pill-carve {
+  color: var(--info);
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.box-mini-pill.pill-coop {
+  color: var(--success);
+  border-color: rgba(16, 185, 129, 0.45);
+}
+
+.box-mini-pill.pill-cutout {
+  color: var(--char-accent);
+  border-color: rgba(168, 85, 247, 0.45);
 }
 
 .spatial-box-handle {
@@ -1105,6 +1114,24 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+.z-input {
+  width: 44px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.z-input:focus {
+  border-color: var(--accent);
+  outline: none;
 }
 
 .z-btn {
@@ -1264,10 +1291,12 @@ html, body {
   max-height: 28%;
   flex-shrink: 0;
 }
+
 .vault-panel[data-vault-mode="split"] .projects-section {
   max-height: 22%;
   flex-shrink: 0;
 }
+
 .vault-panel[data-vault-mode="split"] .gallery-section {
   flex: 1;
   border-bottom: none;
@@ -1277,6 +1306,7 @@ html, body {
 .vault-panel[data-vault-mode="assets"] .gallery-section {
   display: none;
 }
+
 .vault-panel[data-vault-mode="assets"] .assets-section {
   flex: 1;
   max-height: none;
@@ -1287,6 +1317,7 @@ html, body {
 .vault-panel[data-vault-mode="projects"] .gallery-section {
   display: none;
 }
+
 .vault-panel[data-vault-mode="projects"] .projects-section {
   flex: 1;
   max-height: none;
@@ -1297,6 +1328,7 @@ html, body {
 .vault-panel[data-vault-mode="gallery"] .projects-section {
   display: none;
 }
+
 .vault-panel[data-vault-mode="gallery"] .gallery-section {
   flex: 1;
   max-height: none;
@@ -1327,9 +1359,7 @@ html, body {
   gap: 5px;
 }
 
-.reference-list,
-.project-list,
-.gallery-list {
+.reference-list, .project-list, .gallery-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -1339,8 +1369,7 @@ html, body {
   padding-right: 2px;
 }
 
-.ref-card,
-.project-card {
+.ref-card, .project-card {
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -1355,8 +1384,7 @@ html, body {
   border-color: var(--accent);
 }
 
-.ref-card-top,
-.project-card-top {
+.ref-card-top, .project-card-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1404,8 +1432,7 @@ html, body {
   border-color: rgba(16, 185, 129, 0.4);
 }
 
-.ref-bind-btns,
-.project-actions {
+.ref-bind-btns, .project-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;

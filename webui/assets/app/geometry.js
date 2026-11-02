@@ -1,3 +1,4 @@
+// webui/assets/app/geometry.js
 import {
   state,
   el,
@@ -6,10 +7,71 @@ import {
   isTypographyBox,
   parseFiniteFloat,
   parseFiniteInt,
+   parseOptionalFloat,
+  resolveEffectiveBoxIsolation,
   findRefMeta,
   computeActiveMaskSummary
 } from "./state.js";
 import { renderSpatialLayoutEditor } from "./layout_editor.js";
+
+let lastTrackedCanvasW = 1024;
+let lastTrackedCanvasH = 1024;
+
+export function getTrackedCanvasDims() {
+  return { width: lastTrackedCanvasW, height: lastTrackedCanvasH };
+}
+
+export function setTrackedCanvasDims(width, height) {
+  lastTrackedCanvasW = Math.max(256, Math.min(2048, Math.round(width / 16) * 16));
+  lastTrackedCanvasH = Math.max(256, Math.min(2048, Math.round(height / 16) * 16));
+}
+
+export function snapLatticeFloorHalf(val, mult = 16) {
+  return Math.ceil(Number(val) / Number(mult) - 0.5 - 1e-9) * Number(mult);
+}
+
+export function scaleBboxToCanvas(bbox, oldW, oldH, newW, newH) {
+  if (!Array.isArray(bbox) || bbox.length !== 4) {
+    return [0, 0, newH, newW];
+  }
+  const y0 = Number(bbox[0]);
+  const x0 = Number(bbox[1]);
+  const y1 = Number(bbox[2]);
+  const x1 = Number(bbox[3]);
+  const sh = Math.max(16, Math.round(oldH));
+  const sw = Math.max(16, Math.round(oldW));
+  const h = Math.max(16, Math.round(newH));
+  const w = Math.max(16, Math.round(newW));
+  if (h === sh && w === sw) {
+    return [Math.round(y0), Math.round(x0), Math.round(y1), Math.round(x1)];
+  }
+  const py0 = Math.max(0, Math.min(sh - 1, Math.round(Math.min(y0, y1))));
+  const px0 = Math.max(0, Math.min(sw - 1, Math.round(Math.min(x0, x1))));
+  const py1 = Math.max(py0 + 1, Math.min(sh, Math.round(Math.max(y0, y1))));
+  const px1 = Math.max(px0 + 1, Math.min(sw, Math.round(Math.max(x0, x1))));
+  const uy0 = Math.max(0.0, Math.min(1.0, py0 / sh));
+  const ux0 = Math.max(0.0, Math.min(1.0, px0 / sw));
+  const uy1 = Math.max(0.0, Math.min(1.0, py1 / sh));
+  const ux1 = Math.max(0.0, Math.min(1.0, px1 / sw));
+
+  const ny0 =
+    uy0 <= 1e-5
+      ? 0
+      : Math.max(0, Math.min(h - 16, snapLatticeFloorHalf(uy0 * h, 16)));
+  const nx0 =
+    ux0 <= 1e-5
+      ? 0
+      : Math.max(0, Math.min(w - 16, snapLatticeFloorHalf(ux0 * w, 16)));
+  const ny1 =
+    uy1 >= 1.0 - 1e-5
+      ? h
+      : Math.max(ny0 + 16, Math.min(h, snapLatticeFloorHalf(uy1 * h, 16)));
+  const nx1 =
+    ux1 >= 1.0 - 1e-5
+      ? w
+      : Math.max(nx0 + 16, Math.min(w, snapLatticeFloorHalf(ux1 * w, 16)));
+  return [ny0, nx0, ny1, nx1];
+}
 
 export function snapCoord(val, maxDim, bypassSnap = false) {
   const clamped = Math.max(0, Math.min(maxDim, Math.round(val)));
@@ -33,6 +95,207 @@ export function pixelToAbsCentralized(ymin, xmin, ymax, xmax, height, width) {
     Math.max(-cy, Math.min(maxY, Math.round(effYmax - cy))),
     Math.max(-cx, Math.min(maxX, Math.round(effXmax - cx)))
   ];
+}
+
+export function bboxToNormalizedJs(bbox, height, width) {
+  if (!Array.isArray(bbox) || bbox.length !== 4) {
+    return [0.0, 0.0, 1.0, 1.0];
+  }
+  const h = Math.max(1, Math.round(height));
+  const w = Math.max(1, Math.round(width));
+  const py0 = Math.max(0, Math.min(h - 1, Math.round(Math.min(bbox[0], bbox[2]))));
+  const px0 = Math.max(0, Math.min(w - 1, Math.round(Math.min(bbox[1], bbox[3]))));
+  const py1 = Math.max(py0 + 1, Math.min(h, Math.round(Math.max(bbox[0], bbox[2]))));
+  const px1 = Math.max(px0 + 1, Math.min(w, Math.round(Math.max(bbox[1], bbox[3]))));
+  return [
+    Math.max(0.0, Math.min(1.0, py0 / h)),
+    Math.max(0.0, Math.min(1.0, px0 / w)),
+    Math.max(0.0, Math.min(1.0, py1 / h)),
+    Math.max(0.0, Math.min(1.0, px1 / w))
+  ];
+}
+
+function snapNormBoxToLatentGridJs(normBox, hLat, wLat) {
+  if (!normBox || normBox.length !== 4) return null;
+  const [uy0, ux0, uy1, ux1] = normBox;
+  const y0 = Math.max(0, Math.min(hLat - 1, Math.round(uy0 * hLat)));
+  const x0 = Math.max(0, Math.min(wLat - 1, Math.round(ux0 * wLat)));
+  const y1 = Math.max(y0 + 1, Math.min(hLat, Math.round(uy1 * hLat)));
+  const x1 = Math.max(x0 + 1, Math.min(wLat, Math.round(ux1 * wLat)));
+  if (y0 === 0 && x0 === 0 && y1 === hLat && x1 === wLat) {
+    return null;
+  }
+  return [
+    Number((y0 / hLat).toFixed(6)),
+    Number((x0 / wLat).toFixed(6)),
+    Number((y1 / hLat).toFixed(6)),
+    Number((x1 / wLat).toFixed(6))
+  ];
+}
+
+function boxesOverlap2dJs(boxA, boxB) {
+  if (!boxA || !boxB) return false;
+  const interH = Math.min(boxA[2], boxB[2]) - Math.max(boxA[0], boxB[0]);
+  const interW = Math.min(boxA[3], boxB[3]) - Math.max(boxA[1], boxB[1]);
+  return interH > 1e-5 && interW > 1e-5;
+}
+
+function boxesOverlapCoefficientJs(boxA, boxB) {
+  if (!boxA || !boxB) return 0.0;
+  const interH = Math.min(boxA[2], boxB[2]) - Math.max(boxA[0], boxB[0]);
+  const interW = Math.min(boxA[3], boxB[3]) - Math.max(boxA[1], boxB[1]);
+  if (interH <= 1e-6 || interW <= 1e-6) return 0.0;
+  const interArea = interH * interW;
+  const areaA = Math.max(0.0, boxA[2] - boxA[0]) * Math.max(0.0, boxA[3] - boxA[1]);
+  const areaB = Math.max(0.0, boxB[2] - boxB[0]) * Math.max(0.0, boxB[3] - boxB[1]);
+  const minArea = Math.min(areaA, areaB);
+  if (minArea <= 1e-6) return 0.0;
+  return interArea / minArea;
+}
+
+function normalizeRoleClassJs(role) {
+  const r = String(role || "photo_ref").trim().toLowerCase();
+  if (["depth_map", "color_map", "structural", "control"].includes(r)) {
+    return "structural";
+  }
+  return "photo_ref";
+}
+
+export function computeSpatioVisualBoxGraph(width, height) {
+  const hLat = Math.max(1, Math.floor(height / 16));
+  const wLat = Math.max(1, Math.floor(width / 16));
+  const globalRole = (el("inputRoleSelect") ? el("inputRoleSelect").value : "photo_ref").toLowerCase();
+  const globalSplat = Boolean(el("compositeBoxImagesCheck") && el("compositeBoxImagesCheck").checked);
+
+  const boxGraph = {};
+  const refBoxEntries = [];
+  const splatBoxes = [];
+  const splattedIndices = new Set();
+
+  state.layoutItems.forEach((item, idx) => {
+    boxGraph[idx] = {
+      peerBoxIndices: [],
+      coOpBoxIndices: [],
+      carvesSplat: false,
+      carvesKv: false,
+      isCutout: false
+    };
+    if (!item || item.enabled === false || !Array.isArray(item.bbox) || item.bbox.length !== 4) {
+      return;
+    }
+    const rawImg = String(item.image_path || item.image || item.vizj_path || "").trim();
+    const roleStr = String(item.input_role || globalRole || "photo_ref").toLowerCase();
+    const normBox = bboxToNormalizedJs(item.bbox, height, width);
+    const snappedBox = snapNormBoxToLatentGridJs(normBox, hLat, wLat);
+    const zVal = typeof item.z_order === "number" ? item.z_order : idx + 1;
+
+    if (rawImg && roleStr !== "inpaint_mask") {
+      const refMeta = findRefMeta(rawImg);
+      if (refMeta && refMeta.has_alpha && roleStr === "photo_ref") {
+        boxGraph[idx].isCutout = true;
+      }
+      const isPasted =
+        item.paste_to_canvas !== null && item.paste_to_canvas !== undefined
+          ? Boolean(item.paste_to_canvas)
+          : (globalSplat && roleStr === "photo_ref");
+      if (isPasted) {
+        splattedIndices.add(idx);
+        splatBoxes.push(normBox);
+      }
+      refBoxEntries.push({
+        boxIdx: idx,
+        normBox,
+        snappedBox,
+        roleClass: normalizeRoleClassJs(roleStr),
+        zOrder: zVal
+      });
+    }
+  });
+
+  for (let i = 0; i < refBoxEntries.length; i++) {
+    const a = refBoxEntries[i];
+    if (!a.snappedBox) continue;
+    for (let j = i + 1; j < refBoxEntries.length; j++) {
+      const b = refBoxEntries[j];
+      if (!b.snappedBox) continue;
+      if (boxesOverlapCoefficientJs(a.snappedBox, b.snappedBox) >= 0.25) {
+        if (a.roleClass !== b.roleClass) {
+          boxGraph[a.boxIdx].coOpBoxIndices.push(b.boxIdx);
+          boxGraph[b.boxIdx].coOpBoxIndices.push(a.boxIdx);
+        } else {
+          boxGraph[a.boxIdx].peerBoxIndices.push(b.boxIdx);
+          boxGraph[b.boxIdx].peerBoxIndices.push(a.boxIdx);
+        }
+      }
+    }
+  }
+
+  const hasGlobalRefs =
+    (state.bindings.reference_image_paths && state.bindings.reference_image_paths.length > 0) ||
+    Boolean(state.bindings.control_image_path);
+
+  state.layoutItems.forEach((item, idx) => {
+    if (!item || item.enabled === false || splattedIndices.has(idx)) return;
+    if (!Array.isArray(item.bbox) || item.bbox.length !== 4) return;
+    const rawImg = String(item.image_path || item.image || item.vizj_path || "").trim();
+    if (rawImg) return;
+
+    const isText = isTypographyBox(item);
+    const roleStr = String(item.input_role || "").trim().toLowerCase();
+    const isInp = Boolean(item.inpaint_box) || roleStr === "inpaint_mask";
+    const expDn = parseOptionalFloat(item.denoise_strength, 0.01, 1.0);
+    if (!isText && !isInp && expDn === null) return;
+
+    const ovrBox = bboxToNormalizedJs(item.bbox, height, width);
+    const ovrArea = (ovrBox[2] - ovrBox[0]) * (ovrBox[3] - ovrBox[1]);
+    if (ovrArea <= 1e-5) return;
+
+    const childDn = expDn !== null ? expDn : (isInp ? 1.0 : (isText ? 0.65 : 0.75));
+    const splatCarve = (isText || isInp || childDn >= 0.55) ? 1.0 : 0.0;
+
+    if (splatCarve > 0.0 && splatBoxes.length > 0) {
+      const overlapsSplat = splatBoxes.some((sb) => {
+        if (!boxesOverlap2dJs(ovrBox, sb)) return false;
+        const sbArea = (sb[2] - sb[0]) * (sb[3] - sb[1]);
+        return isText || isInp || expDn !== null || sbArea > ovrArea + 1e-5;
+      });
+      if (overlapsSplat) {
+        boxGraph[idx].carvesSplat = true;
+      }
+    }
+
+    if (isText || isInp) {
+      const expIso = parseOptionalFloat(item.isolate_box_attn, 0.0, 1.0);
+      const carveIso = expIso !== null ? expIso : 0.85;
+      if (carveIso > 1e-6) {
+        const childZ = typeof item.z_order === "number" ? item.z_order : null;
+        let overlapsRef = false;
+        if (hasGlobalRefs && (isText || (childZ !== null && childZ > 1e-4) || ovrArea < 0.98)) {
+          overlapsRef = true;
+        }
+        for (const rEntry of refBoxEntries) {
+          if (boxesOverlap2dJs(ovrBox, rEntry.normBox)) {
+            const rArea =
+              (rEntry.normBox[2] - rEntry.normBox[0]) *
+              (rEntry.normBox[3] - rEntry.normBox[1]);
+            if (
+              isText ||
+              (childZ !== null && childZ > rEntry.zOrder + 1e-4) ||
+              rArea > ovrArea + 1e-5
+            ) {
+              overlapsRef = true;
+              break;
+            }
+          }
+        }
+        if (overlapsRef) {
+          boxGraph[idx].carvesKv = true;
+        }
+      }
+    }
+  });
+
+  return boxGraph;
 }
 
 export function canonicalBoxSortKey(item, height, width) {
@@ -122,6 +385,7 @@ export function computeStageGeometry(containerId = "spatialStageContainer") {
   const canvasW = parseFiniteInt(el("widthInput") ? el("widthInput").value : 1024, 1024, 256, 2048);
   const canvasH = parseFiniteInt(el("heightInput") ? el("heightInput").value : 1024, 1024, 256, 2048);
   const { availW, availH } = resolveContainerBounds(containerId, 560);
+
   const fitScale = Math.min(availW / canvasW, availH / canvasH);
   const stageW = Math.max(192, Math.round(canvasW * fitScale));
   const stageH = Math.max(192, Math.round(canvasH * fitScale));
@@ -159,7 +423,6 @@ export function resolveUnderlayUrl(modeOverride = null) {
   const rawMode = modeOverride || (el("layoutUnderlaySelect") ? el("layoutUnderlaySelect").value : "auto");
   const mode = String(rawMode || "auto").toLowerCase();
   if (mode === "none") return null;
-
   if (mode === "master") {
     const masterImg = el("masterOutputImage");
     if (masterImg && !masterImg.hidden) {
@@ -339,14 +602,16 @@ export function renderViewportBoxesHud() {
   const canvasW = parseFiniteInt(el("widthInput") ? el("widthInput").value : 1024, 1024, 256, 2048);
   const canvasH = parseFiniteInt(el("heightInput") ? el("heightInput").value : 1024, 1024, 256, 2048);
   const { boxPicMap } = computeBoxPictureBindings();
-
+  const boxGraph = computeSpatioVisualBoxGraph(canvasW, canvasH);
   hud.innerHTML = "";
+
   state.layoutItems.forEach((item, idx) => {
     if (item.enabled === false || !Array.isArray(item.bbox) || item.bbox.length !== 4) return;
     const [ymin, xmin, ymax, xmax] = item.bbox;
     const isText = isTypographyBox(item);
     const normLbl = normalizeBoxLabel(item.label || item.category, isText);
     const isChar = normLbl === "character";
+    const gInfo = boxGraph[idx] || {};
     const boxDiv = document.createElement("div");
     boxDiv.className = `viewport-hud-box ${isText ? "text-hud" : (isChar ? "char-hud" : "")}`.trim();
     boxDiv.style.top = `${((ymin / canvasH) * 100).toFixed(2)}%`;
@@ -354,7 +619,8 @@ export function renderViewportBoxesHud() {
     boxDiv.style.width = `${(((xmax - xmin) / canvasW) * 100).toFixed(2)}%`;
     boxDiv.style.height = `${(((ymax - ymin) / canvasH) * 100).toFixed(2)}%`;
     const picTag = boxPicMap[idx] ? ` [Pic ${boxPicMap[idx]}]` : "";
-    const label = isText ? `T: "${item.text || item.caption || ""}"` : `${normLbl}${picTag}`;
+    const carveTag = (gInfo.carvesSplat || gInfo.carvesKv) ? " [Carve]" : "";
+    const label = isText ? `T: "${item.text || item.caption || ""}"${carveTag}` : `${normLbl}${picTag}${carveTag}`;
     boxDiv.textContent = `#${idx + 1} ${label}`;
     hud.appendChild(boxDiv);
   });
@@ -362,6 +628,7 @@ export function renderViewportBoxesHud() {
 
 export function syncStageAspectAndGuides() {
   const layoutGeom = computeStageGeometry("spatialStageContainer");
+  setTrackedCanvasDims(layoutGeom.canvasW, layoutGeom.canvasH);
   const spatialStage = el("spatialStage");
   if (spatialStage) {
     spatialStage.style.width = `${layoutGeom.stageW}px`;
@@ -401,18 +668,13 @@ export function applyCanvasResolutionChange(oldW, oldH, newW, newH) {
   el("heightInput").value = cleanH;
 
   if (oldW > 0 && oldH > 0 && (oldW !== cleanW || oldH !== cleanH)) {
-    const sx = cleanW / oldW;
-    const sy = cleanH / oldH;
     for (const b of state.layoutItems) {
       if (Array.isArray(b.bbox) && b.bbox.length === 4) {
-        const ny0 = snapCoord(b.bbox[0] * sy, cleanH - 16);
-        const nx0 = snapCoord(b.bbox[1] * sx, cleanW - 16);
-        const ny1 = Math.max(ny0 + 16, snapCoord(b.bbox[2] * sy, cleanH));
-        const nx1 = Math.max(nx0 + 16, snapCoord(b.bbox[3] * sx, cleanW));
-        b.bbox = [ny0, nx0, ny1, nx1];
+        b.bbox = scaleBboxToCanvas(b.bbox, oldW, oldH, cleanW, cleanH);
       }
     }
   }
+  setTrackedCanvasDims(cleanW, cleanH);
   syncStageAspectAndGuides();
   renderSpatialLayoutEditor();
 }

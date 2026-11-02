@@ -1,3 +1,4 @@
+# services/runtime/__init__.py
 from __future__ import annotations
 
 from .env import (
@@ -6,6 +7,7 @@ from .env import (
     BACKEND_ROOT,
     BASELINE_ENGINE_DEFAULTS,
     CONFIG_DIR,
+    DEFAULT_BOX_REF_ISOLATION,
     DEFAULT_LAYOUT_ITEMS,
     DEFAULT_PRESET_FILENAME,
     DEFAULT_SPECULATIVE_COT_TOKENS,
@@ -38,6 +40,7 @@ from .env import (
     parse_layer_list,
     render_versioned_index_html,
     resolve_site_root,
+    scale_layout_items_to_canvas,
     set_cli_overrides,
     slugify,
 )
@@ -56,6 +59,8 @@ from .queue import (
     ComputeQueue,
     EnginePipeline,
     SynthesisJob,
+    _compute_spatio_visual_graph_summary,
+    _resolve_preview_ref_telemetry,
 )
 from .routes import (
     SecurityHeadersMiddleware,
@@ -105,6 +110,7 @@ __all__ = [
     "CONFIG_DIR",
     "ARTIFACT_TTL_SECONDS",
     "BASELINE_ENGINE_DEFAULTS",
+    "DEFAULT_BOX_REF_ISOLATION",
     "DEFAULT_LAYOUT_ITEMS",
     "DEFAULT_PRESET_FILENAME",
     "DEFAULT_SPECULATIVE_COT_TOKENS",
@@ -120,6 +126,7 @@ __all__ = [
     "get_active_engine_defaults",
     "has_custom_default_preset",
     "parse_layer_list",
+    "scale_layout_items_to_canvas",
     "_FORBIDDEN_SPA_SEGMENTS",
     "_NO_CACHE_HEADERS",
     "get_runtime_override",
@@ -167,6 +174,8 @@ __all__ = [
     "_build_vsproj_package",
     "_extract_and_restore_vsproj",
     "_probe_available_models",
+    "_resolve_preview_ref_telemetry",
+    "_compute_spatio_visual_graph_summary",
     "SynthesisJob",
     "EnginePipeline",
     "ComputeQueue",

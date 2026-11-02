@@ -72,6 +72,70 @@ export const DEFAULT_LAYOUT_ITEMS = [
   }
 ];
 
+export const V11_SPATIOVISUAL_BOXES = [
+  {
+    label: "object",
+    category: "object",
+    caption: "A sleek brushed-steel refrigerator door with a small yellow sticky note",
+    bbox: [0, 0, 1024, 576],
+    enabled: true,
+    z_order: 1,
+    inpaint_box: false,
+    paste_to_canvas: true,
+    image_path: "ref_subject_a.png",
+    input_role: "photo_ref",
+    framing_mode: "",
+    isolate_box_attn: 0.85,
+    denoise_strength: 0.55
+  },
+  {
+    label: "object",
+    category: "object",
+    caption: "Structural depth guide for the left refrigerator panel",
+    bbox: [0, 0, 1024, 576],
+    enabled: true,
+    z_order: 2,
+    inpaint_box: false,
+    paste_to_canvas: false,
+    image_path: "control_map.png",
+    input_role: "depth_map",
+    framing_mode: "",
+    isolate_box_attn: 0.85,
+    denoise_strength: null
+  },
+  {
+    label: "object",
+    category: "object",
+    caption: "A glowing citrus medallion cutout on a warm walnut counter",
+    bbox: [448, 512, 1024, 1024],
+    enabled: true,
+    z_order: 3,
+    inpaint_box: false,
+    paste_to_canvas: true,
+    image_path: "ref_cutout_c.png",
+    input_role: "photo_ref",
+    framing_mode: "",
+    isolate_box_attn: 0.90,
+    denoise_strength: 0.45
+  },
+  {
+    label: "text",
+    category: "text",
+    caption: "Handwritten crisp black marker text on a small yellow sticky note",
+    text: "SOVEREIGN V11 CONVERGED",
+    bbox: [256, 112, 512, 464],
+    enabled: true,
+    z_order: 5,
+    inpaint_box: false,
+    paste_to_canvas: false,
+    image_path: "",
+    input_role: "",
+    framing_mode: "",
+    isolate_box_attn: null,
+    denoise_strength: 0.95
+  }
+];
+
 export const MAX_MASK_HISTORY = 20;
 
 export const state = {
@@ -96,6 +160,7 @@ export const state = {
   activeImageId: null,
   activeVariantIndex: 1,
   lastTelemetry: null,
+  lastSpatioVisualGraph: null,
   activeJobId: null,
   activeEventSource: null,
   showViewportHud: false,
@@ -130,7 +195,6 @@ export function showStudioToast(message, kind = "info", durationMs = 4200) {
   toast.appendChild(span);
   toast.appendChild(closeBtn);
   stack.appendChild(toast);
-
   if (durationMs > 0) {
     setTimeout(() => {
       if (toast.parentNode) {
@@ -231,7 +295,6 @@ export function resolveThinkingTraceFromDeck() {
   if (!modeSel) {
     return rawStr || null;
   }
-
   const mode = modeSel.value;
   if (mode === "auto") {
     return "auto";
@@ -264,7 +327,6 @@ export function applyThinkingTraceToDeck(rawTrace) {
   if (rawInput) {
     rawInput.value = s;
   }
-
   if (!s) {
     if (modeSel) modeSel.value = "";
     syncSpecCotInputDisabledState();

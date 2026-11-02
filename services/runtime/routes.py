@@ -1,3 +1,4 @@
+# services/runtime/routes.py
 from __future__ import annotations
 
 import asyncio
@@ -65,7 +66,11 @@ from .models import (
     ReferenceUploadPayload,
     SynthesisPayload,
 )
-from .queue import ComputeQueue
+from .queue import (
+    ComputeQueue,
+    _compute_spatio_visual_graph_summary,
+    _resolve_preview_ref_telemetry,
+)
 from .security import (
     MAX_GLOBAL_QUEUE_DEPTH,
     MAX_USER_INFLIGHT_JOBS,
@@ -136,7 +141,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
         response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-
         if is_webui_code:
             response.headers["Cache-Control"] = (
                 "no-cache, no-store, must-revalidate, max-age=0"
@@ -155,6 +159,7 @@ app = FastAPI(
     root_path="",
     lifespan=lifespan,
 )
+
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -186,7 +191,6 @@ async def login(payload: AuthPayload, request: Request):
     check_rate_limit(
         client_ip, scope="login", max_requests=30, window_seconds=60.0
     )
-
     raw_input = payload.username.strip()
     input_slug = slugify(raw_input)
     users_map, _ = load_user_registry()
@@ -331,7 +335,19 @@ async def health():
 
 
 @api_router.post("/prompt/preview")
-async def preview_compiled_prompt(payload: PromptPreviewPayload):
+async def preview_compiled_prompt(
+    payload: PromptPreviewPayload,
+    authorization: Optional[str] = Header(None),
+):
+    user_slug: Optional[str] = None
+    if authorization:
+        raw_tok = authorization.replace("Bearer ", "").strip()
+        if raw_tok:
+            try:
+                user_slug = verify_session_token(raw_tok)
+            except Exception:
+                user_slug = None
+
     req = GenerationRequest(
         prompt=payload.prompt,
         prompt_mode=payload.prompt_mode,
@@ -358,16 +374,14 @@ async def preview_compiled_prompt(payload: PromptPreviewPayload):
         control_image_path=payload.control_image_path,
     )
     effective_prompt = req.compile_effective_prompt()
-    resolved_trace, spec_cot_tokens = req.resolve_thinking_trace()
-    ref_specs, _ = req.resolve_visual_references()
+    telem_map, patch_counts = _resolve_preview_ref_telemetry(
+        req, user_slug=user_slug
+    )
+    resolved_trace, spec_cot_tokens = req.resolve_thinking_trace(
+        conditioned_ref_telemetry=telem_map if telem_map else None
+    )
+    sv_graph = _compute_spatio_visual_graph_summary(req)
 
-    max_patches = max(64, int(req.max_vit_patches or 2304))
-    default_llm_per_ref = max(16, max_patches // 4)
-    patch_counts: List[int] = [
-        default_llm_per_ref
-        for spec in ref_specs
-        if bool(spec.get("emits_vit"))
-    ]
     vision_tokens = sum(patch_counts)
     max_seq = int(req.max_sequence_length or 16384)
 
@@ -384,7 +398,6 @@ async def preview_compiled_prompt(payload: PromptPreviewPayload):
             )
         else:
             trace_tokens = 0
-
         chat_ids = tok.encode_chat(
             prompt=effective_prompt,
             enable_thinking=bool(
@@ -430,6 +443,7 @@ async def preview_compiled_prompt(payload: PromptPreviewPayload):
         "effective_reference_zero_timestep": req.effective_reference_zero_timestep,
         "effective_reference_isolated_kv": req.effective_reference_isolated_kv,
         "effective_uncond_uses_references": req.effective_uncond_uses_references,
+        "spatio_visual_graph": sv_graph,
     }
 
 
@@ -478,6 +492,7 @@ async def upload_reference_asset(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid base64 image payload.",
         )
+
     if len(binary) > 40 * 1024 * 1024:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -546,7 +561,6 @@ async def promote_gallery_image_to_reference(
         if c.is_file():
             src_file = c
             break
-
     if src_file is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -555,7 +569,6 @@ async def promote_gallery_image_to_reference(
 
     raw_bytes = src_file.read_bytes()
     target_sha = hashlib.sha256(raw_bytes).hexdigest()
-
     uploads_dir = (storage_root / slug / "uploads").resolve()
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
@@ -595,7 +608,6 @@ async def stage_default_test_assets(authorization: Optional[str] = Header(None))
     storage_root = Path(get_runtime_override("STORAGE_ROOT", STORAGE_ROOT))
     test_dir = sb_dir / "artifacts" / "test_inputs"
     staged_map = stage_test_input_files(test_dir)
-
     uploads_dir = storage_root / slug / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
@@ -928,8 +940,8 @@ async def synthesize(
     user_meta = users_map.get(slug, {})
     perms = user_meta.get("custom_permissions", [])
     is_unlimited = "admin" in perms or "unlimited_quota" in perms
-
     inflight_count = compute_queue.count_user_inflight_jobs(slug)
+
     if not is_unlimited:
         max_user_inflight = int(
             get_runtime_override(
@@ -958,7 +970,6 @@ async def synthesize(
                     )
             except Exception:
                 pass
-
         daily_quota = int(user_meta.get("daily_quota", 25))
         if (tokens_used_today + inflight_count) >= daily_quota:
             raise HTTPException(
@@ -989,21 +1000,18 @@ async def get_job_status(
 ):
     token = authorization.replace("Bearer ", "").strip() if authorization else None
     verify_session_token(token)
-
     info = compute_queue.get_status(job_id)
     if not info:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Master job record not found.",
         )
-
     etag = f'W/"{job_id}-{info.get("status")}-{info.get("progress_pct")}-{info.get("users_ahead")}"'
     if_none_match = request.headers.get("if-none-match")
     if if_none_match and if_none_match == etag:
         return Response(
             status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag}
         )
-
     return JSONResponse(content=info, headers={"ETag": etag})
 
 
@@ -1018,7 +1026,6 @@ async def stream_job_status(
         authorization.replace("Bearer ", "").strip() if authorization else None
     )
     verify_session_token(auth_token)
-
     job = compute_queue.jobs.get(job_id)
     if not job:
         raise HTTPException(
@@ -1071,7 +1078,6 @@ async def get_image_direct(job_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Master image artifact not ready.",
         )
-
     return FileResponse(
         str(job.output_file),
         media_type="image/png",
@@ -1090,7 +1096,6 @@ async def get_image_stream_user(user_slug: str, filename: str):
     storage_root = Path(get_runtime_override("STORAGE_ROOT", STORAGE_ROOT))
     art_dir = Path(get_runtime_override("ARTIFACTS_DIR", ARTIFACTS_DIR))
     target_file = storage_root / safe_slug / "images" / safe_name
-
     media_type = (
         "application/octet-stream"
         if safe_name.lower().endswith(".vizj")
@@ -1101,7 +1106,6 @@ async def get_image_stream_user(user_slug: str, filename: str):
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-cache",
     }
-
     if target_file.exists() and target_file.is_file():
         return FileResponse(
             str(target_file), media_type=media_type, headers=headers
@@ -1132,7 +1136,6 @@ async def delete_user_image(
 ):
     token = authorization.replace("Bearer ", "").strip() if authorization else None
     slug = verify_session_token(token)
-
     storage_root = Path(get_runtime_override("STORAGE_ROOT", STORAGE_ROOT))
     user_dir = storage_root / slug
     history_file = user_dir / "history.json"
@@ -1163,7 +1166,6 @@ async def delete_user_image(
     if images_dir.is_dir():
         for extra_p in images_dir.glob(f"{image_id}_master_*.png"):
             extra_p.unlink(missing_ok=True)
-
     return {"status": "deleted", "image_id": image_id}
 
 
@@ -1215,6 +1217,7 @@ def mount_static_and_spa() -> None:
         norm_path = full_path.replace("\\", "/").strip("/")
         path_lower = norm_path.lower()
         parts_lower = [p for p in path_lower.split("/") if p]
+
         if any(
             p in _FORBIDDEN_SPA_SEGMENTS or p.startswith(".")
             for p in parts_lower

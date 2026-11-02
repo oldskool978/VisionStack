@@ -10,18 +10,18 @@
   <script type="importmap">
   {
     "imports": {
-      "./assets/app/api.js": "./assets/app/api.js?v=20261031.3",
-      "./assets/app/bootstrap.js": "./assets/app/bootstrap.js?v=20261031.3",
-      "./assets/app/geometry.js": "./assets/app/geometry.js?v=20261031.3",
-      "./assets/app/inpaint_studio.js": "./assets/app/inpaint_studio.js?v=20261031.3",
-      "./assets/app/layout_editor.js": "./assets/app/layout_editor.js?v=20261031.3",
-      "./assets/app/state.js": "./assets/app/state.js?v=20261031.3",
-      "./assets/app/synthesis.js": "./assets/app/synthesis.js?v=20261031.3",
-      "./assets/app/vault_projects.js": "./assets/app/vault_projects.js?v=20261031.3"
+      "./assets/app/api.js": "./assets/app/api.js?v=20261101.1",
+      "./assets/app/bootstrap.js": "./assets/app/bootstrap.js?v=20261101.1",
+      "./assets/app/geometry.js": "./assets/app/geometry.js?v=20261101.1",
+      "./assets/app/inpaint_studio.js": "./assets/app/inpaint_studio.js?v=20261101.1",
+      "./assets/app/layout_editor.js": "./assets/app/layout_editor.js?v=20261101.1",
+      "./assets/app/state.js": "./assets/app/state.js?v=20261101.1",
+      "./assets/app/synthesis.js": "./assets/app/synthesis.js?v=20261101.1",
+      "./assets/app/vault_projects.js": "./assets/app/vault_projects.js?v=20261101.1"
     }
   }
   </script>
-  <link rel="stylesheet" href="assets/styles.css?v=20261031.3" />
+  <link rel="stylesheet" href="assets/styles.css?v=20261101.1" />
 </head>
 <body>
   <header class="topbar">
@@ -168,6 +168,7 @@
         <div class="aspect-preset-bar">
           <span class="field-label">Aspect:</span>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1024x1024">1:1</button>
+          <button type="button" class="btn btn-secondary tiny-btn" data-aspect="512x512" title="512x512 Fast Lattice">512</button>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1280x832">3:2</button>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="832x1280">2:3</button>
           <button type="button" class="btn btn-secondary tiny-btn" data-aspect="1344x768">16:9</button>
@@ -540,6 +541,7 @@
           <button id="addObjectBoxBtn" type="button" class="btn btn-secondary compact-btn">+ Object Box</button>
           <button id="addCharacterBoxBtn" type="button" class="btn btn-secondary compact-btn">+ Character Box</button>
           <button id="addTextBoxBtn" type="button" class="btn btn-secondary compact-btn">+ Typography Box</button>
+          <button id="loadV11GraphBtn" type="button" class="btn btn-secondary compact-btn" title="Stage deterministic test assets and populate the 4-box V11 Spatio-Visual Graph (Co-Op Depth + Cutout + Carved Typography)">+ V11 Graph</button>
           <button id="cycleOverlapBtn" type="button" class="btn btn-secondary compact-btn" title="Cycle active selection through stacked/overlapping boxes (or Alt+Click on stage)">Cycle Stacked</button>
           <button id="clearAllBoxesBtn" type="button" class="btn btn-secondary compact-btn">Clear Boxes</button>
           <button id="resetDefaultBoxesBtn" type="button" class="btn btn-secondary compact-btn">Reset Defaults</button>
@@ -585,7 +587,7 @@
 
             <div class="inspector-section-header">
               <h3>Collaborative Box Stack &amp; 4D-RoPE Bindings</h3>
-              <span class="tiny-muted" title="UI Z-order controls pointer manipulation priority; compiler canonically orders boxes coarse-to-fine for permutation-invariant synthesis">Permutation-Invariant</span>
+              <span class="tiny-muted" title="UI Z-order controls pointer manipulation and Porter-Duff foreground occlusion priority; compiler canonically orders boxes coarse-to-fine for permutation-invariant synthesis">Permutation-Invariant</span>
             </div>
             <div id="boxListContainer" class="box-list"></div>
 
@@ -633,6 +635,7 @@
           </label>
           <button id="commitMaskToVaultBtn" type="button" class="btn btn-primary compact-btn">Stage Mask to Vault</button>
         </div>
+
         <div class="inpaint-stage-wrap" id="inpaintStageWrap">
           <div id="inpaintStageContainer" class="inpaint-stage-container">
             <img id="inpaintUnderlayImg" class="stage-underlay-img" alt="" hidden />
@@ -710,6 +713,6 @@
     </div>
   </div>
 
-  <script type="module" src="assets/app.js?v=20261031.3"></script>
+  <script type="module" src="assets/app.js?v=20261101.1"></script>
 </body>
 </html>

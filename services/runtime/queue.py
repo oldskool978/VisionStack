@@ -15,15 +15,215 @@ import uuid
 import numpy as np
 import torch
 
+from ShadowBoxer.core.caches import ReferenceVisionCache
+from ShadowBoxer.core.conditioning import (
+    _resolve_boxed_reference_dims,
+    _resolve_unboxed_reference_dims,
+)
+from ShadowBoxer.core.pipeline import resolve_foreground_aperture_carveouts
+from ShadowBoxer.models.moss.geometry import (
+    _compute_collaborating_ref_groups,
+    _normalize_ref_bboxes,
+)
+
 from .env import (
     ARTIFACTS_DIR,
     ARTIFACT_TTL_SECONDS,
+    DEFAULT_BOX_REF_ISOLATION,
     GenerationRequest,
     STORAGE_ROOT,
     _close_preview_tokenizer,
     get_runtime_override,
 )
-from .vault import _resolve_user_upload_path
+from .vault import _inspect_reference_file, _resolve_user_upload_path
+
+
+def _resolve_preview_ref_telemetry(
+    gen_req: GenerationRequest,
+    user_slug: Optional[str] = None,
+) -> Tuple[Dict[Any, Dict[str, Any]], List[int]]:
+    eff_slug = user_slug or "administrator"
+    ref_specs, _ = gen_req.resolve_visual_references()
+    max_patches = max(64, int(gen_req.max_vit_patches or 2304))
+    default_llm = max(16, max_patches // 4)
+    telem_map: Dict[Any, Dict[str, Any]] = {}
+    patch_counts: List[int] = []
+
+    for spec_idx, spec in enumerate(ref_specs):
+        raw_path = str(spec.get("path") or "").strip()
+        resolved_str = (
+            _resolve_user_upload_path(eff_slug, raw_path) if raw_path else None
+        )
+        resolved_p = (
+            Path(resolved_str)
+            if (resolved_str and Path(resolved_str).is_file())
+            else None
+        )
+        norm_box = spec.get("norm_bbox")
+        px_box = spec.get("pixel_bbox")
+        role_str = str(
+            spec.get("input_role") or gen_req.input_role or "photo_ref"
+        ).lower()
+        framing_str = str(
+            spec.get("framing_mode") or gen_req.framing_mode or "inscribed"
+        ).lower()
+        emits_vit = bool(spec.get("emits_vit", role_str == "photo_ref"))
+
+        if norm_box is not None:
+            vae_w, vae_h = _resolve_boxed_reference_dims(
+                norm_box, gen_req.width, gen_req.height
+            )
+        elif px_box is not None and len(px_box) == 4:
+            ymin, xmin, ymax, xmax = px_box
+            vae_w = max(64, ((int(xmax) - int(xmin) + 8) // 16) * 16)
+            vae_h = max(64, ((int(ymax) - int(ymin) + 8) // 16) * 16)
+        elif resolved_p is not None:
+            vae_w, vae_h = _resolve_unboxed_reference_dims(
+                resolved_p,
+                gen_req.width,
+                gen_req.height,
+                str(gen_req.edit_format or "standard"),
+                max_vit_patches=max_patches,
+            )
+        else:
+            vae_w, vae_h = int(gen_req.width), int(gen_req.height)
+
+        llm_tokens = 0
+        if emits_vit:
+            if resolved_p is not None:
+                vit_w, vit_h = ReferenceVisionCache.solve_vit_dims(
+                    resolved_p,
+                    vae_w,
+                    vae_h,
+                    framing_str,
+                    max_vit_patches=max_patches,
+                )
+                llm_tokens = max(1, ((vit_w // 16) * (vit_h // 16)) // 4)
+            else:
+                llm_tokens = default_llm
+            patch_counts.append(llm_tokens)
+
+        has_cutout = False
+        if resolved_p is not None and resolved_p.suffix.lower() != ".vizj":
+            try:
+                info = _inspect_reference_file(resolved_p, eff_slug)
+                has_cutout = bool(info.get("has_alpha", False))
+            except Exception:
+                has_cutout = False
+
+        entry = {
+            "vae_size": (int(vae_w), int(vae_h)),
+            "llm_tokens": int(llm_tokens),
+            "has_cutout": bool(has_cutout and role_str == "photo_ref"),
+            "sharpness": 0.0,
+        }
+        telem_map[spec_idx] = entry
+        if raw_path:
+            telem_map[raw_path] = entry
+
+    return telem_map, patch_counts
+
+
+def _compute_spatio_visual_graph_summary(
+    gen_req: GenerationRequest,
+) -> Dict[str, Any]:
+    h_lat = max(1, int(gen_req.height) // 16)
+    w_lat = max(1, int(gen_req.width) // 16)
+    ref_specs, _ = gen_req.resolve_visual_references()
+
+    ref_bboxes_list: List[Optional[Tuple[float, float, float, float]]] = []
+    ref_box_iso_list: List[float] = []
+    ref_roles_list: List[str] = []
+    ref_z_orders_list: List[float] = []
+    splat_boxes: List[Tuple[float, float, float, float]] = []
+    splatted_box_indices: set[int] = set()
+
+    if gen_req.control_image_path and str(gen_req.control_image_path).strip():
+        ctrl_role = (
+            str(gen_req.input_role)
+            if gen_req.input_role in ("color_map", "depth_map")
+            else "color_map"
+        )
+        ref_bboxes_list.append(None)
+        ref_box_iso_list.append(0.0)
+        ref_roles_list.append(ctrl_role)
+        ref_z_orders_list.append(0.0)
+
+    for spec in ref_specs:
+        if not bool(spec.get("emits_dit_latents", True)):
+            continue
+        norm_box = spec.get("norm_bbox")
+        role_str = str(
+            spec.get("input_role") or gen_req.input_role or "photo_ref"
+        ).lower()
+        z_val = float(spec.get("z_order") or 0.0)
+        iso_val = float(spec.get("isolate_box_attn") or 0.0)
+        is_pasted = bool(spec.get("paste_to_canvas", False)) and (
+            norm_box is not None
+        )
+        ref_bboxes_list.append(norm_box)
+        ref_box_iso_list.append(iso_val)
+        ref_roles_list.append(role_str)
+        ref_z_orders_list.append(z_val)
+        if is_pasted and norm_box is not None:
+            b_idx = spec.get("box_index")
+            if isinstance(b_idx, int):
+                splatted_box_indices.add(b_idx)
+            splat_boxes.append(norm_box)
+
+    dummy_shapes = [(1, 1) for _ in ref_bboxes_list]
+    norm_boxes = _normalize_ref_bboxes(
+        dummy_shapes, ref_bboxes_list, height=h_lat, width=w_lat
+    )
+    eff_feather = float(
+        gen_req.mask_feather_radius
+        if gen_req.mask_feather_radius is not None
+        else 1.25
+    )
+    pad_y = max(0.0, eff_feather) / float(max(1, h_lat))
+    pad_x = max(0.0, eff_feather) / float(max(1, w_lat))
+    collab_groups = _compute_collaborating_ref_groups(
+        len(ref_bboxes_list), norm_boxes, pad_y=pad_y, pad_x=pad_x
+    )
+
+    default_carve_iso = max(
+        DEFAULT_BOX_REF_ISOLATION,
+        float(gen_req.box_attn_isolation or 0.0),
+        max(ref_box_iso_list) if ref_box_iso_list else 0.0,
+    )
+    aperture_overrides, attn_carveouts = resolve_foreground_aperture_carveouts(
+        layout_items=gen_req.layout_items,
+        height=gen_req.height,
+        width=gen_req.width,
+        coords_are_pixels=gen_req.layout_coords_are_pixels,
+        splat_boxes=splat_boxes,
+        splatted_box_indices=splatted_box_indices,
+        ref_bboxes=ref_bboxes_list,
+        ref_z_orders=ref_z_orders_list,
+        default_isolation=default_carve_iso,
+    )
+
+    return {
+        "dit_reference_count": len(ref_bboxes_list),
+        "splatted_box_indices": sorted(splatted_box_indices),
+        "collaborating_ref_groups": [list(g) for g in collab_groups],
+        "aperture_overrides": [
+            {
+                "bbox": list(ovr[0]),
+                "denoise_strength": round(float(ovr[1]), 4),
+                "carve_strength": round(float(ovr[2]), 4),
+            }
+            for ovr in aperture_overrides
+        ],
+        "foreground_carveouts": [
+            {
+                "bbox": list(c[0]),
+                "isolation": round(float(c[1]), 4),
+                "z_order": float(c[2]) if c[2] is not None else None,
+            }
+            for c in attn_carveouts
+        ],
+    }
 
 
 class SynthesisJob:
@@ -246,6 +446,7 @@ class EnginePipeline:
 
             gen_req = GenerationRequest(**req_kwargs)
             _, spec_cot_tokens = gen_req.resolve_thinking_trace()
+            sv_graph = _compute_spatio_visual_graph_summary(gen_req)
 
             progress_cb(
                 6,
@@ -330,6 +531,7 @@ class EnginePipeline:
                     "thinking_trace_mode": gen_req.thinking_trace,
                     "speculative_cot_tokens": spec_cot_tokens,
                     "reanchor_telemetry": reanchor_telem,
+                    "spatio_visual_graph": sv_graph,
                     "add_vision_id": bool(
                         gen_req.add_vision_id
                         if gen_req.add_vision_id is not None
@@ -365,7 +567,6 @@ class EnginePipeline:
                     "shannon_entropy_bits": round(resp.shannon_entropy_bits, 4),
                     "laplacian_sharpness": round(resp.laplacian_sharpness, 4),
                 }
-
                 recipe = {
                     "model_variant": gen_req.model_variant,
                     "prompt": gen_req.prompt,
@@ -423,7 +624,6 @@ class EnginePipeline:
                     "edit_lora_path": gen_req.edit_lora_path,
                     "edit_lora_scale": gen_req.edit_lora_scale,
                 }
-
                 working_draft = {
                     "title": req_data.get("title", "Untitled Vision Master"),
                     "model_variant": gen_req.model_variant,
@@ -490,7 +690,6 @@ class EnginePipeline:
                     "export_vizj_tier": int(req_data.get("export_vizj_tier", 2)),
                     "seed": resp.seed_used,
                 }
-
                 extra_paths = [
                     Path(p) for p in resp.additional_paths if Path(p).is_file()
                 ]
@@ -632,7 +831,6 @@ class ComputeQueue:
                             artifact.unlink(missing_ok=True)
                     except Exception:
                         pass
-
             dead_jobs = [
                 jid
                 for jid, j in self.jobs.items()
@@ -766,6 +964,8 @@ class ComputeQueue:
 
 
 __all__ = [
+    "_resolve_preview_ref_telemetry",
+    "_compute_spatio_visual_graph_summary",
     "SynthesisJob",
     "EnginePipeline",
     "ComputeQueue",

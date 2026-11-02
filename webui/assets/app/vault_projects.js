@@ -4,6 +4,7 @@ import {
   el,
   DEFAULT_PROMPT_TEXT,
   DEFAULT_LAYOUT_ITEMS,
+  V11_SPATIOVISUAL_BOXES,
   ensureBoxZOrders,
   updateProjectBadge,
   applyThinkingTraceToDeck,
@@ -11,11 +12,16 @@ import {
 } from "./state.js";
 import { apiFetch, showLoginModal } from "./api.js";
 import {
+  scaleBboxToCanvas,
+  computeStageGeometry,
   renderBindingsCard,
   renderViewportBoxesHud,
   syncUnderlayLayers
 } from "./geometry.js";
-import { renderSpatialLayoutEditor } from "./layout_editor.js";
+import {
+  syncTextEditToPrompt,
+  renderSpatialLayoutEditor
+} from "./layout_editor.js";
 import {
   updateMaskHistoryButtons,
   hasInpaintCanvasContent,
@@ -64,12 +70,14 @@ export function renderReferenceVault() {
     const sizeKb = (ref.size_bytes / 1024).toFixed(1);
     const isGlobalRef = state.bindings.reference_image_paths.includes(ref.ref_id);
     const isSelBoxBound = Boolean(activeBox && activeBox.image_path === ref.ref_id);
+
     const boundBoxNumbers = [];
     state.layoutItems.forEach((b, idx) => {
       if (b && b.enabled !== false && b.image_path === ref.ref_id) {
         boundBoxNumbers.push(`#${idx + 1}`);
       }
     });
+
     const dimsLabel = ref.width && ref.height ? `${ref.width}x${ref.height}` : "1024x1024";
     const alphaBadge = ref.has_alpha ? `<span class="meta-tag alpha-tag" title="Contains translucent alpha channel">ALPHA</span>` : "";
     const vizjBadge = ref.is_vizj ? `<span class="meta-tag vizj-tag" title="Tier-2 Zero-Copy .VIZJ Container">VIZJ</span>` : "";
@@ -157,7 +165,6 @@ export function renderProjectVault() {
     container.innerHTML = `<div class="muted-note">Save a project to bundle your layout boxes, prompt, mask canvas, and reference assets.</div>`;
     return;
   }
-
   container.innerHTML = "";
   for (const proj of state.projects) {
     const card = document.createElement("div");
@@ -212,13 +219,21 @@ export function resetToNewProjectDraft() {
   state.activeProjectTitle = null;
   state.activeImageId = null;
   state.lastTelemetry = null;
+  state.lastSpatioVisualGraph = null;
   el("titleInput").value = "Untitled Vision Master";
   el("promptInput").value = DEFAULT_PROMPT_TEXT;
   el("negativePromptInput").value = "";
   el("systemPromptInput").value = "";
   applyThinkingTraceToDeck("");
   el("layoutSummaryInput").value = "";
-  state.layoutItems = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+  const geom = computeStageGeometry("spatialStageContainer");
+  const cloned = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+  for (const b of cloned) {
+    if (Array.isArray(b.bbox) && b.bbox.length === 4) {
+      b.bbox = scaleBboxToCanvas(b.bbox, 1024, 1024, geom.canvasW, geom.canvasH);
+    }
+  }
+  state.layoutItems = cloned;
   ensureBoxZOrders();
   state.selectedBoxIndex = 0;
   state.bindings.init_image_path = null;
@@ -237,12 +252,50 @@ export function resetToNewProjectDraft() {
     state.maskRedoStack.length = 0;
     updateMaskHistoryButtons();
   }
-
   updateProjectBadge();
   renderBindingsCard();
   renderReferenceVault();
   renderProjectVault();
   renderSpatialLayoutEditor();
+}
+
+export async function loadV11SpatioVisualGraphPreset() {
+  const hasRefA = state.references.some((r) => r.ref_id === "ref_subject_a.png");
+  const hasCutC = state.references.some((r) => r.ref_id === "ref_cutout_c.png");
+  const hasCtrl = state.references.some((r) => r.ref_id === "control_map.png");
+  if (state.token && (!hasRefA || !hasCutC || !hasCtrl)) {
+    try {
+      await apiFetch("api/v1/references/stage-defaults", { method: "POST" });
+      await refreshReferences();
+    } catch (_) {}
+  }
+
+  const geom = computeStageGeometry("spatialStageContainer");
+  const v11Boxes = JSON.parse(JSON.stringify(V11_SPATIOVISUAL_BOXES));
+  for (const b of v11Boxes) {
+    if (Array.isArray(b.bbox) && b.bbox.length === 4) {
+      b.bbox = scaleBboxToCanvas(b.bbox, 1024, 1024, geom.canvasW, geom.canvasH);
+    }
+  }
+  state.layoutItems = v11Boxes;
+  ensureBoxZOrders();
+  state.selectedBoxIndex = 0;
+  el("promptModeSelect").value = "layout_json";
+  el("boxAttnIsolationInput").value = "0.85";
+  el("compositeBoxImagesCheck").checked = true;
+  el("enableThinkingCheck").checked = true;
+  applyThinkingTraceToDeck("auto");
+  syncTextEditToPrompt(
+    "Remember to test SFT & Base permutations @ 1024x1024",
+    "SOVEREIGN V11 CONVERGED"
+  );
+  renderBindingsCard();
+  renderReferenceVault();
+  renderSpatialLayoutEditor();
+  showStudioToast(
+    "Loaded V11 Spatio-Visual Graph (Co-Op Depth + Cutout + Carved Typography)",
+    "success"
+  );
 }
 
 export async function saveCurrentProject(downloadAfterSave = false) {
@@ -258,7 +311,6 @@ export async function saveCurrentProject(downloadAfterSave = false) {
     const draft = collectDeckPayload();
     const canvas = el("inpaintCanvas");
     const maskDataUrl = (canvas && hasInpaintCanvasContent()) ? canvas.toDataURL("image/png") : null;
-
     const res = await apiFetch("api/v1/projects/save", {
       method: "POST",
       body: {
@@ -271,14 +323,12 @@ export async function saveCurrentProject(downloadAfterSave = false) {
         include_all_vault_refs: false
       }
     });
-
     if (res && res.project) {
       state.activeProjectId = res.project.project_id;
       state.activeProjectTitle = res.project.title;
       updateProjectBadge();
       await refreshProjects();
       showStudioToast(`Saved project: ${res.project.title}`, "success");
-
       if (downloadAfterSave) {
         const dlUrl = `api/v1/projects/${encodeURIComponent(res.project.project_id)}/download?token=${encodeURIComponent(state.token)}`;
         const a = document.createElement("a");
@@ -375,7 +425,6 @@ export async function promoteGalleryImageToVault(imageId, bindMode = "ref", vari
     });
     if (!meta || !meta.ref_id) return;
     await refreshReferences();
-
     if (bindMode === "init") {
       state.bindings.init_image_path = meta.ref_id;
       showStudioToast(`Bound ${meta.ref_id} as Init Image`, "success");
@@ -441,7 +490,6 @@ export function updateViewportAndTelemetry(jobStatus) {
     el("emptyViewportState").hidden = true;
     dlPng.href = allUrls[0];
     dlPng.hidden = false;
-
     if (promoInitBtn) promoInitBtn.hidden = !state.activeImageId;
     if (promoRefBtn) promoRefBtn.hidden = !state.activeImageId;
 
@@ -490,10 +538,12 @@ export function updateViewportAndTelemetry(jobStatus) {
     const boxIso = Number(t.box_attn_isolation || 0);
     const splatTag = t.composite_box_images ? " | Splat" : "";
     const isoTag = boxIso > 0 ? ` | Iso=${boxIso.toFixed(2)}` : (t.reference_isolated_kv ? " | IsoKV" : "");
-    el("tRoutingVal").textContent = `${t.edit_format || "standard"}${isoTag}${splatTag}`;
+    const sv = t.spatio_visual_graph || {};
+    const carveCnt = Array.isArray(sv.foreground_carveouts) ? sv.foreground_carveouts.length : 0;
+    const carveTag = carveCnt > 0 ? ` | Carve=${carveCnt}` : "";
+    el("tRoutingVal").textContent = `${t.edit_format || "standard"}${isoTag}${splatTag}${carveTag}`;
     el("tSignalVal").textContent = `${Number(t.shannon_entropy_bits).toFixed(2)}b / ${Number(t.laplacian_sharpness).toFixed(3)}`;
     el("tLumaVal").textContent = `${Number(t.mean_luminance).toFixed(3)} / ${Number(t.rms_contrast).toFixed(3)}`;
-
     let cotSuffix = "";
     if (t.speculative_cot_tokens && Number(t.speculative_cot_tokens) > 0) {
       const rt = t.reanchor_telemetry;
@@ -537,7 +587,6 @@ export function restoreDraftToStudio(item) {
   if (draft.max_vit_patches !== undefined && draft.max_vit_patches !== null) {
     el("maxVitPatchesInput").value = draft.max_vit_patches;
   }
-
   if (draft.width !== undefined && draft.width !== null) el("widthInput").value = draft.width;
   if (draft.height !== undefined && draft.height !== null) el("heightInput").value = draft.height;
   if (draft.num_inference_steps !== undefined && draft.num_inference_steps !== null) {
@@ -676,8 +725,8 @@ export function renderGallery() {
     container.innerHTML = `<div class="muted-note">Completed syntheses appear here with full recipe &amp; draft restoration.</div>`;
     return;
   }
-
   container.innerHTML = "";
+
   for (const item of state.gallery) {
     const card = document.createElement("div");
     card.className = "gallery-card";

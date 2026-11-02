@@ -1,9 +1,11 @@
+# services/runtime/env.py
 from __future__ import annotations
 
 import os
 import sys
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 sys.modules["torchvision"] = None
 sys.modules["torchvision.transforms"] = None
 sys.modules["torchvision.io"] = None
@@ -40,22 +42,6 @@ for _p in reversed(PATH_ANCHORS):
     if _p.exists() and _p_str not in sys.path:
         sys.path.insert(0, _p_str)
 
-for _pkg_dir in [
-    SHADOWBOXER_DIR,
-    SHADOWBOXER_DIR / "models",
-    SHADOWBOXER_DIR / "viztoken",
-    SHADOWBOXER_DIR / "vizinjector",
-    SERVICES_DIR,
-    RUNTIME_DIR,
-]:
-    if _pkg_dir.exists():
-        _init_file = _pkg_dir / "__init__.py"
-        if not _init_file.exists():
-            try:
-                _init_file.touch()
-            except OSError:
-                pass
-
 try:
     import ShadowBoxer.schema as shadowboxer_schema_mod
 
@@ -67,6 +53,7 @@ except Exception:
 
 from ShadowBoxer.schema import (
     BASELINE_ENGINE_DEFAULTS,
+    DEFAULT_BOX_REF_ISOLATION,
     DEFAULT_LAYOUT_ITEMS,
     DEFAULT_PRESET_FILENAME,
     DEFAULT_SPECULATIVE_COT_TOKENS,
@@ -81,6 +68,7 @@ from ShadowBoxer.schema import (
     get_active_engine_defaults,
     has_custom_default_preset,
     parse_layer_list,
+    scale_layout_items_to_canvas,
 )
 
 SUPPORTED_MASK_BLEND_MODES: List[str] = list(
@@ -132,7 +120,7 @@ _PREVIEW_TOKENIZER: Optional[Any] = None
 _ASSET_VERSION_LOCK = threading.Lock()
 _ASSET_VERSION_CACHE: Dict[str, Any] = {
     "stat_sig": None,
-    "version": "20261031.2",
+    "version": "20261031.3",
     "rendered_html": b"",
 }
 _VERSION_QUERY_RE = re.compile(r"(\.(?:js|css)\?v=)[0-9a-zA-Z._-]+")
@@ -254,7 +242,7 @@ def _refresh_webui_asset_bundle() -> Tuple[str, bytes]:
     site_root = resolve_site_root()
     idx_file = site_root / "index.html"
     if not idx_file.is_file():
-        return "20261031.2", b""
+        return "20261031.3", b""
 
     tracked_files: List[Path] = [idx_file]
     assets_dir = site_root / "assets"
@@ -267,8 +255,8 @@ def _refresh_webui_asset_bundle() -> Tuple[str, bytes]:
         if f.is_file():
             st = f.stat()
             stat_entries.append((str(f), int(st.st_mtime_ns), int(st.st_size)))
-
     stat_sig = tuple(stat_entries)
+
     with _ASSET_VERSION_LOCK:
         if (
             _ASSET_VERSION_CACHE["stat_sig"] == stat_sig
@@ -286,7 +274,6 @@ def _refresh_webui_asset_bundle() -> Tuple[str, bytes]:
             except OSError:
                 pass
         digest_ver = hasher.hexdigest()[:12]
-
         raw_html = idx_file.read_text(encoding="utf-8")
         stamped_html = _VERSION_QUERY_RE.sub(rf"\g<1>{digest_ver}", raw_html)
         rendered_bytes = stamped_html.encode("utf-8")
@@ -341,6 +328,7 @@ def get_user_registry_candidates() -> List[Path]:
     custom_dir = os.environ.get("VISIONSTACK_CONFIG_DIR")
     if custom_dir and (Path(custom_dir) / "users.json").exists():
         return [(Path(custom_dir) / "users.json").resolve()]
+
     resolved_site = resolve_site_root()
     return [
         resolved_site / "config" / "users.json",
@@ -413,6 +401,7 @@ __all__ = [
     "CONFIG_DIR",
     "ARTIFACT_TTL_SECONDS",
     "BASELINE_ENGINE_DEFAULTS",
+    "DEFAULT_BOX_REF_ISOLATION",
     "DEFAULT_LAYOUT_ITEMS",
     "DEFAULT_PRESET_FILENAME",
     "DEFAULT_SPECULATIVE_COT_TOKENS",
@@ -428,6 +417,7 @@ __all__ = [
     "get_active_engine_defaults",
     "has_custom_default_preset",
     "parse_layer_list",
+    "scale_layout_items_to_canvas",
     "_FORBIDDEN_SPA_SEGMENTS",
     "_NO_CACHE_HEADERS",
     "get_runtime_override",

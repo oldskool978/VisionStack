@@ -1,3 +1,4 @@
+// webui/assets/app/bootstrap.js
 import {
   state,
   el,
@@ -20,6 +21,8 @@ import {
 } from "./api.js";
 import {
   snapCoord,
+  getTrackedCanvasDims,
+  scaleBboxToCanvas,
   computeStageGeometry,
   syncStageAspectAndGuides,
   syncUnderlayLayers,
@@ -45,6 +48,7 @@ import {
   importProjectFromFile,
   promoteGalleryImageToVault,
   stageDefaultTestSet,
+  loadV11SpatioVisualGraphPreset,
   renderReferenceVault
 } from "./vault_projects.js";
 import {
@@ -95,7 +99,6 @@ export function bindEventListeners() {
   const traceModeSel = el("thinkingTraceModeSelect");
   const specTokInput = el("specCotTokensInput");
   const traceRawInput = el("thinkingTraceInput");
-
   if (traceModeSel) {
     traceModeSel.addEventListener("change", () => {
       const mode = traceModeSel.value;
@@ -118,7 +121,6 @@ export function bindEventListeners() {
       updateCompiledJsonPreview();
     });
   }
-
   if (specTokInput) {
     specTokInput.addEventListener("input", () => {
       const budget = parseFiniteInt(
@@ -133,7 +135,6 @@ export function bindEventListeners() {
       }
     });
   }
-
   if (traceRawInput) {
     traceRawInput.addEventListener("input", () => {
       applyThinkingTraceToDeck(traceRawInput.value);
@@ -145,7 +146,6 @@ export function bindEventListeners() {
   el("saveProjectBtn").addEventListener("click", () => saveCurrentProject(false));
   el("vaultSaveProjectBtn").addEventListener("click", () => saveCurrentProject(false));
   el("exportProjectBtn").addEventListener("click", () => saveCurrentProject(true));
-
   el("importProjectInput").addEventListener("change", async (ev) => {
     const file = ev.target.files && ev.target.files[0];
     if (!file) return;
@@ -161,15 +161,12 @@ export function bindEventListeners() {
     el("toggleViewportHudBtn").classList.toggle("active", state.showViewportHud);
     renderViewportBoxesHud();
   });
-
   el("toggleCompareSplitBtn").addEventListener("click", () => {
     state.showCompareSplit = !state.showCompareSplit;
     el("toggleCompareSplitBtn").classList.toggle("active", state.showCompareSplit);
     syncUnderlayLayers();
   });
-
   el("viewportCompareSlider").addEventListener("input", syncUnderlayLayers);
-
   el("promoteViewportInitBtn").addEventListener("click", async () => {
     if (state.activeImageId) {
       await promoteGalleryImageToVault(state.activeImageId, "init", state.activeVariantIndex);
@@ -208,12 +205,10 @@ export function bindEventListeners() {
   document.querySelectorAll("[data-aspect]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const [wStr, hStr] = btn.getAttribute("data-aspect").split("x");
-      const oldW = parseFiniteInt(el("widthInput").value, 1024, 256, 2048);
-      const oldH = parseFiniteInt(el("heightInput").value, 1024, 256, 2048);
-      applyCanvasResolutionChange(oldW, oldH, parseInt(wStr, 10), parseInt(hStr, 10));
+      const prev = getTrackedCanvasDims();
+      applyCanvasResolutionChange(prev.width, prev.height, parseInt(wStr, 10), parseInt(hStr, 10));
     });
   });
-
   el("matchAssetAspectBtn").addEventListener("click", matchPrimaryAssetAspect);
 
   el("synthesizeBtn").addEventListener("click", triggerSynthesis);
@@ -308,6 +303,9 @@ export function bindEventListeners() {
     renderSpatialLayoutEditor();
   });
 
+  if (el("loadV11GraphBtn")) {
+    el("loadV11GraphBtn").addEventListener("click", loadV11SpatioVisualGraphPreset);
+  }
   el("cycleOverlapBtn").addEventListener("click", () => cycleOverlappingBoxes());
 
   el("clearAllBoxesBtn").addEventListener("click", () => {
@@ -317,7 +315,14 @@ export function bindEventListeners() {
   });
 
   el("resetDefaultBoxesBtn").addEventListener("click", () => {
-    state.layoutItems = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+    const geom = computeStageGeometry("spatialStageContainer");
+    const cloned = JSON.parse(JSON.stringify(DEFAULT_LAYOUT_ITEMS));
+    for (const b of cloned) {
+      if (Array.isArray(b.bbox) && b.bbox.length === 4) {
+        b.bbox = scaleBboxToCanvas(b.bbox, 1024, 1024, geom.canvasW, geom.canvasH);
+      }
+    }
+    state.layoutItems = cloned;
     ensureBoxZOrders();
     state.selectedBoxIndex = 0;
     renderSpatialLayoutEditor();
@@ -360,18 +365,21 @@ export function bindEventListeners() {
   if (el("refIsolatedKvSelect")) {
     el("refIsolatedKvSelect").addEventListener("change", updateCompiledJsonPreview);
   }
-
   el("layoutUnderlaySelect").addEventListener("change", syncUnderlayLayers);
   el("layoutUnderlayOpacity").addEventListener("input", syncUnderlayLayers);
   el("inpaintUnderlayOpacity").addEventListener("input", syncUnderlayLayers);
 
   el("widthInput").addEventListener("change", () => {
-    syncStageAspectAndGuides();
-    renderSpatialLayoutEditor();
+    const prev = getTrackedCanvasDims();
+    const newW = parseFiniteInt(el("widthInput").value, 1024, 256, 2048);
+    const newH = parseFiniteInt(el("heightInput").value, 1024, 256, 2048);
+    applyCanvasResolutionChange(prev.width, prev.height, newW, newH);
   });
   el("heightInput").addEventListener("change", () => {
-    syncStageAspectAndGuides();
-    renderSpatialLayoutEditor();
+    const prev = getTrackedCanvasDims();
+    const newW = parseFiniteInt(el("widthInput").value, 1024, 256, 2048);
+    const newH = parseFiniteInt(el("heightInput").value, 1024, 256, 2048);
+    applyCanvasResolutionChange(prev.width, prev.height, newW, newH);
   });
 
   el("referenceFileInput").addEventListener("change", async (ev) => {
@@ -406,6 +414,7 @@ export async function bootstrapStudio() {
   initInpaintCanvas();
   bindResizeObservers();
   updateProjectBadge();
+
   await loadThemeRegistry();
   await pollHealthTelemetry(true);
   syncStageAspectAndGuides();

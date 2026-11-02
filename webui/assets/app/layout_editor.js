@@ -1,3 +1,4 @@
+// webui/assets/app/layout_editor.js
 import {
   state,
   el,
@@ -18,6 +19,7 @@ import {
   pixelToAbsCentralized,
   getCanonicalEnabledBoxIndices,
   computeBoxPictureBindings,
+  computeSpatioVisualBoxGraph,
   computeStageGeometry,
   framingModeToCssObjectFit,
   syncStageAspectAndGuides,
@@ -51,6 +53,7 @@ export function getReadingOrderTextsJs(height, width) {
       : "";
     const txtVal = rawTxt || rawCap;
     if (!txtVal) return;
+
     const bbox = Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox : [0, 0, height, width];
     const py0 = Math.max(0, Math.min(height - 1, Math.round(Math.min(bbox[0], bbox[2]))));
     const px0 = Math.max(0, Math.min(width - 1, Math.round(Math.min(bbox[1], bbox[3]))));
@@ -78,7 +81,6 @@ export function getReadingOrderTextsJs(height, width) {
 export function reconcileSummaryQuotesJs(caption, activeTexts) {
   const cleanCap = (caption || "").trim();
   if (!cleanCap || !activeTexts || !activeTexts.length) return cleanCap;
-
   const quoteRegex = /"([^"\r\n]+)"/g;
   const matches = Array.from(cleanCap.matchAll(quoteRegex));
   if (!matches.length) return cleanCap;
@@ -160,7 +162,9 @@ function compileAutoSpatialTraceJs(width, height, reconciledCaption, canonicalIn
     const splat = item.paste_to_canvas !== null && item.paste_to_canvas !== undefined
       ? Boolean(item.paste_to_canvas)
       : (globalSplat && role === "photo_ref");
-    refParts.push(`${tag} (${role}, bbox=[${cB.join(", ")}], iso=${iso.toFixed(2)}, splat=${splat})`);
+    const refMeta = findRefMeta(imgP);
+    const cutoutSfx = refMeta && refMeta.has_alpha && role === "photo_ref" ? ", cutout=True" : "";
+    refParts.push(`${tag} (${role}, bbox=[${cB.join(", ")}], iso=${iso.toFixed(2)}, splat=${splat}${cutoutSfx})`);
   }
 
   const hasBoxRefs = Object.keys(boxDitMap).length > 0;
@@ -192,14 +196,12 @@ function compileAutoSpatialTraceJs(width, height, reconciledCaption, canonicalIn
       const capVal = lbl === "text"
         ? (!rawCap || rawCap === txtVal ? "Crisp legible typography with clean kerning" : rawCap)
         : (rawCap || (lbl === "character" ? "Character subject" : "Scene object"));
-
       const bbox = Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox : [0, 0, height, width];
       const cB = pixelToAbsCentralized(bbox[0], bbox[1], bbox[2], bbox[3], height, width);
       const areaPct = ((Math.abs(bbox[2] - bbox[0]) / Math.max(1, height)) * (Math.abs(bbox[3] - bbox[1]) / Math.max(1, width)) * 100.0).toFixed(1);
       const refTag = boxPicMap[idx] ? `, ref=Picture ${boxPicMap[idx]}` : "";
       const dnVal = parseOptionalFloat(item.denoise_strength, 0.01, 1.0);
       const dnTag = dnVal !== null ? `, d=${dnVal.toFixed(2)}` : "";
-
       if (lbl === "text" && txtVal) {
         const styleNote = rawCap && rawCap !== txtVal ? rawCap : "crisp kerning";
         boxDescs.push(`R${orderIdx + 1}[text [${cB.join(", ")}], ${areaPct}%${refTag}${dnTag}: ${styleNote}]`);
@@ -231,6 +233,7 @@ function scheduleAuthoritativePromptPreview(hasBoxRefs) {
       const height = parseFiniteInt(el("heightInput").value, 1024, 256, 2048);
       const summaryOverride = el("layoutSummaryInput") ? el("layoutSummaryInput").value.trim() : "";
       const resolvedTrace = resolveThinkingTraceFromDeck();
+
       const res = await apiFetch("api/v1/prompt/preview", {
         method: "POST",
         body: {
@@ -284,6 +287,10 @@ function scheduleAuthoritativePromptPreview(hasBoxRefs) {
       });
       if (!res || reqSeq !== previewRequestSeq) return;
 
+      if (res.spatio_visual_graph) {
+        state.lastSpatioVisualGraph = res.spatio_visual_graph;
+      }
+
       const modeBadge = el("layoutActiveModeBadge");
       if (modeBadge && res.total_context_tokens !== undefined) {
         const promptMode = el("promptModeSelect").value;
@@ -291,7 +298,10 @@ function scheduleAuthoritativePromptPreview(hasBoxRefs) {
           ? (hasBoxRefs ? "LAYOUT JSON + 4D-RoPE" : "LAYOUT JSON")
           : "NATURAL MODE";
         const visTag = res.vision_tokens > 0 ? ` | VIS ${res.vision_tokens}T` : "";
-        modeBadge.textContent = `${baseModeStr} (${res.total_context_tokens}/${res.max_sequence_length} TOK${visTag})`;
+        const sv = res.spatio_visual_graph || {};
+        const carveCount = Array.isArray(sv.foreground_carveouts) ? sv.foreground_carveouts.length : 0;
+        const carveTag = carveCount > 0 ? ` | CARVE ${carveCount}` : "";
+        modeBadge.textContent = `${baseModeStr} (${res.total_context_tokens}/${res.max_sequence_length} TOK${visTag}${carveTag})`;
       }
 
       const cotWrap = el("compiledCotPreviewWrap");
@@ -322,17 +332,14 @@ export function updateCompiledJsonPreview() {
 
   const items = [];
   const activeTexts = getReadingOrderTextsJs(height, width);
-
   for (const idx of canonicalIndices) {
     const b = state.layoutItems[idx];
     if (!b || b.enabled === false) continue;
-
     const rawTxt = typeof b.text === "string" ? b.text.trim() : "";
     const labelVal = normalizeBoxLabel(b.label || b.category, Boolean(rawTxt));
     const rawCap = b.caption || b.description;
     let txtVal = rawTxt;
     let capVal = typeof rawCap === "string" ? rawCap.trim() : "";
-
     if (labelVal === "text") {
       if (!txtVal && capVal) {
         txtVal = capVal;
@@ -415,9 +422,9 @@ export function updateCompiledJsonPreview() {
       cotBadge.textContent = `REANCHOR SPECULATIVE (${budget} TOK)`;
       cotPre.textContent =
         `Live ReAnchor Speculative CoT Active:\n` +
-        `• Budget: ${budget} reasoning tokens (block_size=4, max_candidates=4, H_thresh=1.25 bits)\n` +
-        `• Drafter: Parallel Shifted MTP / Variable-Order Shannon-Entropy Markov Prefix Survival\n` +
-        `• Auto-Closure: Guaranteed \\n</think>\\n\\n termination prior to MOSS-DiT cross-attention`;
+        `  Budget: ${budget} reasoning tokens (block_size=4, max_candidates=4, H_thresh=1.25 bits)\n` +
+        `  Drafter: Parallel Shifted MTP / Variable-Order Shannon-Entropy Markov Prefix Survival\n` +
+        `  Auto-Closure: Guaranteed \\n</think>\\n\\n termination prior to MOSS-DiT cross-attention`;
     } else {
       cotWrap.hidden = false;
       cotBadge.textContent = "CUSTOM TRACE";
@@ -499,6 +506,7 @@ export function renderSpatialLayoutEditor() {
   if (!boxesLayer || !listContainer) return;
 
   const { boxPicMap, boxDitMap } = computeBoxPictureBindings();
+  const boxGraph = computeSpatioVisualBoxGraph(geom.canvasW, geom.canvasH);
   const globalFraming = el("framingModeSelect").value || "inscribed";
   const globalSplat = Boolean(el("compositeBoxImagesCheck").checked);
 
@@ -513,16 +521,24 @@ export function renderSpatialLayoutEditor() {
     const isChar = normLbl === "character";
     const hasBoundRef = Boolean(item.image_path && String(item.image_path).trim());
     const refMeta = hasBoundRef ? findRefMeta(item.image_path) : null;
+    const effRole = String(item.input_role || el("inputRoleSelect").value || "photo_ref").toLowerCase();
     const effFraming = item.framing_mode || (globalFraming === "never_crop" ? "inscribed" : globalFraming);
     const effIso = resolveEffectiveBoxIsolation(item, geom.canvasH, geom.canvasW);
     const hasExplicitIso = parseOptionalFloat(item.isolate_box_attn, 0.0, 1.0) !== null;
     const effSplat = item.paste_to_canvas !== null && item.paste_to_canvas !== undefined
       ? Boolean(item.paste_to_canvas)
-      : (hasBoundRef && globalSplat);
+      : (hasBoundRef && globalSplat && effRole === "photo_ref");
     const isSelected = idx === state.selectedBoxIndex;
     const baseZ = typeof item.z_order === "number" ? item.z_order : idx + 1;
     const pxW = Math.max(1, Math.round(xmax - xmin));
     const pxH = Math.max(1, Math.round(ymax - ymin));
+    const gInfo = boxGraph[idx] || {
+      peerBoxIndices: [],
+      coOpBoxIndices: [],
+      carvesSplat: false,
+      carvesKv: false,
+      isCutout: false
+    };
 
     if (isEnabled) {
       const boxEl = document.createElement("div");
@@ -545,13 +561,29 @@ export function renderSpatialLayoutEditor() {
       if (boxPicMap[idx]) {
         badges.push(`<span class="box-mini-pill">Pic ${boxPicMap[idx]}</span>`);
       } else if (boxDitMap[idx]) {
-        badges.push(`<span class="box-mini-pill">4D#${boxDitMap[idx]} (${item.input_role || el("inputRoleSelect").value})</span>`);
+        badges.push(`<span class="box-mini-pill">4D#${boxDitMap[idx]} (${effRole})</span>`);
       }
       if (hasBoundRef && effIso > 0) {
         badges.push(`<span class="box-mini-pill">Iso ${Number(effIso).toFixed(2)}${hasExplicitIso ? "" : "*"}</span>`);
       }
       if (hasBoundRef && effSplat) {
         badges.push(`<span class="box-mini-pill">Splat</span>`);
+      }
+      if (gInfo.isCutout) {
+        badges.push(`<span class="box-mini-pill pill-cutout" title="Silhouette-conformal RGBA cutout mask">Cutout</span>`);
+      }
+      if (gInfo.coOpBoxIndices.length > 0) {
+        const peerTags = gInfo.coOpBoxIndices.map((p) => `#${p + 1}`).join(",");
+        badges.push(`<span class="box-mini-pill pill-coop" title="Multi-role IsoKV peer cooperation with Box ${peerTags}">Co-Op ${peerTags}</span>`);
+      } else if (gInfo.peerBoxIndices.length > 0) {
+        const peerTags = gInfo.peerBoxIndices.map((p) => `#${p + 1}`).join(",");
+        badges.push(`<span class="box-mini-pill pill-coop" title="Szymkiewicz-Simpson IsoKV peer with Box ${peerTags}">Peer ${peerTags}</span>`);
+      }
+      if (gInfo.carvesSplat || gInfo.carvesKv) {
+        const carveDesc = gInfo.carvesSplat && gInfo.carvesKv
+          ? "Carves parent splat prior & reference KV attention"
+          : (gInfo.carvesSplat ? "Carves parent splat prior" : "Carves parent reference KV attention");
+        badges.push(`<span class="box-mini-pill pill-carve" title="${carveDesc}">Carve</span>`);
       }
       if (item.inpaint_box) {
         badges.push(`<span class="box-mini-pill">Inpaint</span>`);
@@ -584,9 +616,9 @@ export function renderSpatialLayoutEditor() {
         state.selectedBoxIndex = idx;
         highlightSelectedBoxInDom();
         el("spatialStage").focus();
-
         ev.preventDefault();
         ev.stopPropagation();
+
         const startX = ev.clientX;
         const startY = ev.clientY;
         const [origY0, origX0, origY1, origX1] = item.bbox;
@@ -601,6 +633,7 @@ export function renderSpatialLayoutEditor() {
           boxEl.style.left = `${Math.round(cx0 * geom.scaleX)}px`;
           boxEl.style.width = `${Math.max(12, Math.round((cx1 - cx0) * geom.scaleX))}px`;
           boxEl.style.height = `${Math.max(12, Math.round((cy1 - cy0) * geom.scaleY))}px`;
+
           const dimPill = boxEl.querySelector(`[data-box-dim-pill="${idx}"]`);
           if (dimPill) {
             dimPill.textContent = `${curW}x${curH}`;
@@ -649,6 +682,7 @@ export function renderSpatialLayoutEditor() {
         function onUp() {
           window.removeEventListener("mousemove", onMove);
           window.removeEventListener("mouseup", onUp);
+          renderSpatialLayoutEditor();
         }
 
         window.addEventListener("mousemove", onMove);
@@ -689,9 +723,10 @@ export function renderSpatialLayoutEditor() {
           <strong data-box-coord-hdr="${idx}">#${idx + 1} [${cCoords.join(", ")}] (${pxW}x${pxH}px)</strong>
         </label>
         <div class="box-z-controls">
-          <span class="tiny-muted" title="Canonical Qwen3.5 Label">${normLbl.toUpperCase()} | Z:${baseZ}</span>
-          <button type="button" class="z-btn" data-z-up="${idx}" title="Bring box forward in UI pointer stack">&uarr;</button>
-          <button type="button" class="z-btn" data-z-down="${idx}" title="Send box backward in UI pointer stack">&darr;</button>
+          <span class="tiny-muted" title="Canonical Qwen3.5 Label &amp; Z-Plane">${normLbl.toUpperCase()} | Z:</span>
+          <input type="number" class="z-input" data-box-z="${idx}" value="${baseZ}" min="0" max="99" step="1" title="Explicit Z-order plane (higher Z occludes same-role lower Z and enables foreground child-aperture carve-outs)" />
+          <button type="button" class="z-btn" data-z-up="${idx}" title="Bring box forward in Z-plane stack">&uarr;</button>
+          <button type="button" class="z-btn" data-z-down="${idx}" title="Send box backward in Z-plane stack">&darr;</button>
           <button type="button" class="btn-link" data-remove-box="${idx}">Remove</button>
         </div>
       </div>
@@ -737,7 +772,6 @@ export function renderSpatialLayoutEditor() {
         </label>
       </div>
     `;
-
     card.addEventListener("mouseenter", () => {
       state.selectedBoxIndex = idx;
       highlightSelectedBoxInDom();
@@ -746,8 +780,19 @@ export function renderSpatialLayoutEditor() {
       state.selectedBoxIndex = idx;
       highlightSelectedBoxInDom();
     });
-
     listContainer.appendChild(card);
+  });
+
+  listContainer.querySelectorAll("[data-box-z]").forEach((inp) => {
+    inp.addEventListener("change", (ev) => {
+      ev.stopPropagation();
+      const i = parseInt(inp.getAttribute("data-box-z"), 10);
+      const target = state.layoutItems[i];
+      if (!target) return;
+      target.z_order = parseFiniteInt(inp.value, i + 1, 0, 99);
+      state.selectedBoxIndex = i;
+      renderSpatialLayoutEditor();
+    });
   });
 
   listContainer.querySelectorAll("[data-z-up]").forEach((btn) => {

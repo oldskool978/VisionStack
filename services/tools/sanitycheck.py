@@ -52,6 +52,7 @@ from services.router import (
     compute_webui_asset_version,
     get_active_engine_defaults,
     resolve_site_root,
+    scale_layout_items_to_canvas,
     verify_pow_solution,
 )
 import ShadowBoxer.schema as sb_schema
@@ -169,7 +170,6 @@ def _simulate_extracted_js_sha256(
             (h[6] + g) & 0xFFFFFFFF,
             (h[7] + hh) & 0xFFFFFFFF,
         ]
-
     return "".join(f"{word:08x}" for word in h)
 
 
@@ -177,36 +177,65 @@ def _js_round(val: float) -> int:
     return int(math.floor(val + 0.5))
 
 
-def _js_snap_coord(val: float, max_bound: int, free_motion: bool = False) -> int:
-    clamped = max(0.0, min(float(max_bound), float(val)))
-    if free_motion:
-        return _js_round(clamped)
-    return _js_round(clamped / 16.0) * 16
+def _js_snap_lattice_floor_half(val: float, mult: int = 16) -> int:
+    return int(math.ceil((float(val) / float(mult)) - 0.5 - 1e-9)) * int(mult)
 
 
 def _js_pixel_to_abs_centralized(
     ymin: float, xmin: float, ymax: float, xmax: float, height: int, width: int
 ) -> List[int]:
-    cy = height // 2
-    cx = width // 2
+    h_int = int(height)
+    w_int = int(width)
+    cy = h_int // 2
+    cx = w_int // 2
+    max_y = h_int - cy
+    max_x = w_int - cx
+    eff_ymax = float(h_int) if _js_round(ymax) == h_int - 1 else float(ymax)
+    eff_xmax = float(w_int) if _js_round(xmax) == w_int - 1 else float(xmax)
     return [
-        _js_round(ymin) - cy,
-        _js_round(xmin) - cx,
-        _js_round(ymax) - cy,
-        _js_round(xmax) - cx,
+        max(-cy, min(max_y, _js_round(ymin - cy))),
+        max(-cx, min(max_x, _js_round(xmin - cx))),
+        max(-cy, min(max_y, _js_round(eff_ymax - cy))),
+        max(-cx, min(max_x, _js_round(eff_xmax - cx))),
     ]
 
 
 def _js_scale_bbox_for_resolution(
     bbox: Sequence[float], old_w: int, old_h: int, new_w: int, new_h: int
 ) -> List[int]:
-    y0, x0, y1, x1 = bbox
-    sy = float(new_h) / float(max(1, old_h))
-    sx = float(new_w) / float(max(1, old_w))
-    ny0 = _js_snap_coord(y0 * sy, new_h - 16)
-    nx0 = _js_snap_coord(x0 * sx, new_w - 16)
-    ny1 = max(ny0 + 16, _js_snap_coord(y1 * sy, new_h))
-    nx1 = max(nx0 + 16, _js_snap_coord(x1 * sx, new_w))
+    y0, x0, y1, x1 = [float(v) for v in bbox]
+    sh = float(max(16, int(old_h)))
+    sw = float(max(16, int(old_w)))
+    h = max(16, int(new_h))
+    w = max(16, int(new_w))
+    py0 = max(0, min(int(sh) - 1, _js_round(min(y0, y1))))
+    px0 = max(0, min(int(sw) - 1, _js_round(min(x0, x1))))
+    py1 = max(py0 + 1, min(int(sh), _js_round(max(y0, y1))))
+    px1 = max(px0 + 1, min(int(sw), _js_round(max(x0, x1))))
+    uy0 = max(0.0, min(1.0, py0 / sh))
+    ux0 = max(0.0, min(1.0, px0 / sw))
+    uy1 = max(0.0, min(1.0, py1 / sh))
+    ux1 = max(0.0, min(1.0, px1 / sw))
+    ny0 = (
+        0
+        if uy0 <= 1e-5
+        else max(0, min(h - 16, _js_snap_lattice_floor_half(uy0 * h, 16)))
+    )
+    nx0 = (
+        0
+        if ux0 <= 1e-5
+        else max(0, min(w - 16, _js_snap_lattice_floor_half(ux0 * w, 16)))
+    )
+    ny1 = (
+        h
+        if uy1 >= 1.0 - 1e-5
+        else max(ny0 + 16, min(h, _js_snap_lattice_floor_half(uy1 * h, 16)))
+    )
+    nx1 = (
+        w
+        if ux1 >= 1.0 - 1e-5
+        else max(nx0 + 16, min(w, _js_snap_lattice_floor_half(ux1 * w, 16)))
+    )
     return [ny0, nx0, ny1, nx1]
 
 
@@ -343,6 +372,7 @@ def gate_1_multi_prefix_and_security_headers(client: _AsgiClient) -> None:
         runtime_pkg.app is app and runtime_pkg.compute_queue is compute_queue,
         "services.runtime package failed to bind canonical app or compute_queue",
     )
+
     _assert(
         BASELINE_ENGINE_DEFAULTS["early_solver"] == "heun"
         and BASELINE_ENGINE_DEFAULTS["late_solver"] == "ipndm"
@@ -357,6 +387,7 @@ def gate_1_multi_prefix_and_security_headers(client: _AsgiClient) -> None:
         and "add_vision_id" in BASELINE_ENGINE_DEFAULTS,
         f"Unexpected BASELINE_ENGINE_DEFAULTS: {BASELINE_ENGINE_DEFAULTS}",
     )
+
     expected_active = get_active_engine_defaults()
     expected_asset_ver = compute_webui_asset_version()
     prefixes = (
@@ -408,6 +439,7 @@ def gate_1_multi_prefix_and_security_headers(client: _AsgiClient) -> None:
             and float(hw.get("dedicated_total_gb", 0.0)) >= 0.0,
             f"Incomplete hardware telemetry in /health: {hw}",
         )
+
     print(
         f"  [+] Runtime & Multi-Prefix Health : 7 Modules in services/runtime/ + {len(prefixes)} Prefixes + Bundle #{expected_asset_ver} + Standby WDDM ({last_hw.get('adapter_name', 'GPU')}: {last_hw.get('dedicated_avail_gb', 0.0):.2f}/{last_hw.get('dedicated_total_gb', 0.0):.2f} GB)"
     )
@@ -723,14 +755,38 @@ def gate_3_auth_session_and_preset_sync(client: _AsgiClient) -> str:
             "max_vit_patches": 2304,
             "width": 1024,
             "height": 1024,
-            "reference_image_paths": ["ref_subject_a.png"],
+            "box_attn_isolation": 0.85,
+            "composite_box_images_to_init": True,
+            "reference_image_paths": [],
             "layout_items": [
+                {
+                    "label": "object",
+                    "caption": "Brushed-steel refrigerator door",
+                    "bbox": [0, 0, 1024, 576],
+                    "image_path": "ref_subject_a.png",
+                    "input_role": "photo_ref",
+                    "paste_to_canvas": True,
+                    "isolate_box_attn": 0.85,
+                    "z_order": 1,
+                    "enabled": True,
+                },
+                {
+                    "label": "object",
+                    "caption": "Structural depth guide",
+                    "bbox": [0, 0, 1024, 576],
+                    "image_path": "control_map.png",
+                    "input_role": "depth_map",
+                    "isolate_box_attn": 0.85,
+                    "z_order": 2,
+                    "enabled": True,
+                },
                 {
                     "label": "text",
                     "text": "SOVEREIGN STUDIO",
                     "bbox": [256, 112, 512, 464],
+                    "z_order": 5,
                     "enabled": True,
-                }
+                },
             ],
         },
     )
@@ -739,6 +795,7 @@ def gate_3_auth_session_and_preset_sync(client: _AsgiClient) -> str:
         f"POST /api/v1/prompt/preview (auto) failed: {prv_auto_code}",
     )
     prv_auto = json.loads(prv_auto_raw.decode("utf-8"))
+    sv_graph = prv_auto.get("spatio_visual_graph", {})
     _assert(
         '"SOVEREIGN STUDIO"' in prv_auto["effective_prompt"]
         and '"Crisp legible typography with clean kerning"'
@@ -748,12 +805,16 @@ def gate_3_auth_session_and_preset_sync(client: _AsgiClient) -> str:
         and prv_auto["speculative_cot_tokens"] == 0
         and int(prv_auto.get("prompt_tokens", 0)) > 20
         and int(prv_auto.get("trace_tokens", 0)) > 20
-        and int(prv_auto.get("vision_tokens", 0)) == 576
+        and int(prv_auto.get("vision_tokens", 0)) > 100
         and int(prv_auto.get("total_context_tokens", 0))
         > int(prv_auto["vision_tokens"]) + int(prv_auto["prompt_tokens"])
         and int(prv_auto.get("max_sequence_length", 0)) == 16384
-        and 0.0 < float(prv_auto.get("horizon_utilization_pct", 0.0)) < 10.0,
-        f"Unexpected auto spatial CoT preview response: {prv_auto}",
+        and 0.0 < float(prv_auto.get("horizon_utilization_pct", 0.0)) < 10.0
+        and sv_graph.get("dit_reference_count") == 2
+        and sv_graph.get("collaborating_ref_groups") == [[0, 1], [0, 1]]
+        and len(sv_graph.get("aperture_overrides", [])) == 1
+        and len(sv_graph.get("foreground_carveouts", [])) == 1,
+        f"Unexpected auto spatial CoT preview response or Spatio-Visual Graph: {prv_auto}",
     )
 
     prv_spec_code, _, prv_spec_raw = client.request(
@@ -835,7 +896,7 @@ def gate_3_auth_session_and_preset_sync(client: _AsgiClient) -> str:
             router_mod.get_active_engine_defaults()
 
     print(
-        f"  [+] Creator Auth & CoT Preview    : Session Token + VizToken Horizon ({prv_auto['total_context_tokens']}/{prv_auto['max_sequence_length']} tok) + default.json Hot-Reload Verified"
+        f"  [+] Creator Auth & CoT Preview    : Session Token + VizToken Horizon ({prv_auto['total_context_tokens']}/{prv_auto['max_sequence_length']} tok) + SpatioVisualGraph + default.json Verified"
     )
     return token
 
@@ -878,6 +939,37 @@ def gate_4_bifurcated_vault_projects_and_references(
         f"Unexpected uploaded RGBA PNG metadata: {u_info}",
     )
 
+    prv_cut_code, _, prv_cut_raw = client.request(
+        "POST",
+        "/api/v1/prompt/preview",
+        headers=auth_hdr,
+        json_body={
+            "prompt": "Cutout telemetry audit",
+            "prompt_mode": "layout_json",
+            "thinking_trace": "auto",
+            "width": 1024,
+            "height": 1024,
+            "layout_items": [
+                {
+                    "label": "object",
+                    "caption": "Translucent cutout badge",
+                    "bbox": [256, 256, 768, 768],
+                    "image_path": png_ref_id,
+                    "input_role": "photo_ref",
+                    "paste_to_canvas": True,
+                    "enabled": True,
+                }
+            ],
+        },
+    )
+    _assert(prv_cut_code == 200, f"Vault cutout preview failed: {prv_cut_code}")
+    prv_cut_data = json.loads(prv_cut_raw.decode("utf-8"))
+    _assert(
+        "cutout=True" in (prv_cut_data.get("resolved_thinking_trace") or "")
+        and "vae=512x512" in (prv_cut_data.get("resolved_thinking_trace") or ""),
+        f"Vault-aware /prompt/preview failed to inject live cutout=True or vae=512x512 telemetry: {prv_cut_data}",
+    )
+
     vizj_hdr = (
         b"VIZJ_CONTAINER01"
         + b"\x00" * 16
@@ -911,7 +1003,6 @@ def gate_4_bifurcated_vault_projects_and_references(
     fake_job_id = "vs_sanity_promo_test"
     fake_master_png = user_images_dir / f"{fake_job_id}_master.png"
     fake_master_png.write_bytes(buf.getvalue())
-
     try:
         pr_code, _, pr_raw = client.request(
             "POST",
@@ -1021,8 +1112,8 @@ def gate_4_bifurcated_vault_projects_and_references(
     _assert(st_code == 200, f"Stage default test assets failed: {st_code} {st_raw}")
     staged_files = json.loads(st_raw.decode("utf-8")).get("staged_files", [])
     _assert(
-        len(staged_files) >= 5 and "ref_subject_a.png" in staged_files,
-        f"Expected 5 staged test input files, got {staged_files}",
+        len(staged_files) >= 6 and "ref_cutout_c.png" in staged_files,
+        f"Expected 6 staged test input files including ref_cutout_c.png, got {staged_files}",
     )
 
     l_code, _, l_raw = client.request("GET", "/api/v1/references", headers=auth_hdr)
@@ -1033,7 +1124,9 @@ def gate_4_bifurcated_vault_projects_and_references(
         png_ref_id in ref_map
         and vizj_ref_id in ref_map
         and "ref_subject_a.png" in ref_map
+        and "ref_cutout_c.png" in ref_map
         and ref_map[png_ref_id]["has_alpha"] is True
+        and ref_map["ref_cutout_c.png"]["has_alpha"] is True
         and ref_map[vizj_ref_id]["is_vizj"] is True,
         f"Uploaded or staged references missing rich metadata in vault list: {ref_map.keys()}",
     )
@@ -1160,7 +1253,6 @@ def _audit_cross_stack_numeric_and_box_schema_supremacy(
             f"Field '{model_field}' missing from SynthesisPayload",
         )
         p_min, p_max = _extract_pydantic_bounds(f_info)
-
         if p_min is not None:
             _assert(
                 "min" in attrs and abs(float(attrs["min"]) - p_min) < 1e-6,
@@ -1181,6 +1273,7 @@ def _audit_cross_stack_numeric_and_box_schema_supremacy(
 
     aspect_presets: Tuple[Tuple[int, int], ...] = (
         (1024, 1024),
+        (512, 512),
         (1280, 832),
         (832, 1280),
         (1344, 768),
@@ -1199,23 +1292,31 @@ def _audit_cross_stack_numeric_and_box_schema_supremacy(
             "bbox": [256, 112, 512, 464],
         },
     ]
-
     for w_px, h_px in aspect_presets:
         _assert(
             w_px % 16 == 0 and h_px % 16 == 0,
             f"Aspect preset {w_px}x{h_px} is not aligned to 16px Flux2-VAE stride",
         )
+        py_scaled = scale_layout_items_to_canvas(
+            seed_boxes,
+            height=h_px,
+            width=w_px,
+            src_height=1024,
+            src_width=1024,
+            coords_are_pixels=True,
+        )
         scaled_items: List[Dict[str, Any]] = []
         js_centralized_map: Dict[str, List[int]] = {}
-        for item in seed_boxes:
+        for idx_b, item in enumerate(seed_boxes):
             sb = _js_scale_bbox_for_resolution(
                 item["bbox"], 1024, 1024, w_px, h_px
             )
             _assert(
-                all(c % 16 == 0 for c in sb)
+                sb == py_scaled[idx_b]["bbox"]
+                and all(c % 16 == 0 for c in sb)
                 and 0 <= sb[0] < sb[2] <= h_px
                 and 0 <= sb[1] < sb[3] <= w_px,
-                f"Scaled bbox {sb} violated 16px grid or canvas bounds for {w_px}x{h_px}",
+                f"Scaled bbox {sb} diverged from ShadowBoxer scale_layout_items_to_canvas {py_scaled[idx_b]['bbox']} at {w_px}x{h_px}",
             )
             entry = dict(item)
             entry["bbox"] = sb
@@ -1348,7 +1449,6 @@ def _audit_webui_js_and_fips_pow(
         r"(?<![0-9a-zA-Z_.\"'])0[0-9]+[a-fA-F][0-9a-fA-F]*\b"
     )
     blocking_alert_re = re.compile(r"\balert\s*\(")
-
     for js_file in all_js_targets:
         src = js_file.read_text(encoding="utf-8")
         bad_lit = malformed_hex_re.search(src)
@@ -1364,7 +1464,6 @@ def _audit_webui_js_and_fips_pow(
     api_js_path = site_root / "assets" / "app" / "api.js"
     _assert(api_js_path.is_file(), f"Missing {api_js_path}")
     api_src = api_js_path.read_text(encoding="utf-8")
-
     _assert(
         "export function sha256Hex(" in api_src
         and "export function minePowTimeSliced(" in api_src
@@ -1437,8 +1536,8 @@ def _audit_webui_dom_and_importmap_contract(
     idx_file = site_root / "index.html"
     if not idx_file.is_file():
         return 0, 0, 0, 0
-    html_text = idx_file.read_text(encoding="utf-8")
 
+    html_text = idx_file.read_text(encoding="utf-8")
     html_ids: Set[str] = set(re.findall(r'\bid="([^"]+)"', html_text))
     _assert(
         len(html_ids) >= 96 and "addCharacterBoxBtn" in html_ids,
@@ -1491,6 +1590,7 @@ def _audit_webui_dom_and_importmap_contract(
     num_numeric_specs = _audit_cross_stack_numeric_and_box_schema_supremacy(
         site_root, html_text
     )
+
     return len(js_files), len(referenced_ids), num_numeric_specs, num_edges
 
 
@@ -1505,7 +1605,6 @@ def gate_5_queue_etag_and_spa_guard(client: _AsgiClient, token: str) -> None:
     dummy_job.progress_pct = 42
     dummy_job.stage_description = "Integrating 4D-RoPE Velocity Field (10/21 passes)..."
     compute_queue.jobs[dummy_job.job_id] = dummy_job
-
     try:
         j_code, j_hdrs, j_raw = client.request(
             "GET", f"/api/v1/jobs/{dummy_job.job_id}", headers=auth_hdr
