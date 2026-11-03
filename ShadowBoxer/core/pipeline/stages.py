@@ -20,6 +20,7 @@ from schema import (
     GenerationRequest,
     GenerationResponse,
 )
+
 from ..caches import CachedReferenceRecord, PromptEmbedCache, ReferenceVisionCache
 from ..conditioning import (
     _normalize_vizinjector_framing,
@@ -73,6 +74,7 @@ class VisualConditioningStageState:
     ref_box_iso_list: List[float]
     ref_masks_cpu_list: List[Optional[torch.Tensor]]
     ref_roles_list: List[str]
+    ref_labels_list: List[str]
     ref_z_orders_list: List[float]
     ref_keep_in_uncond_list: List[bool]
     splat_entries: List[Tuple[Any, ...]]
@@ -390,7 +392,6 @@ class PipelineStagesMixin:
                     del img_splits
                     self.text_encoder.visual.clear_caches()
                     self._trim_reserved_vram(force=False, required_headroom_gb=3.80)  # type: ignore[attr-defined]
-
                 if vit_embeds is not None:
                     eff_llm_tokens = int(vit_embeds.shape[0])
                 elif vit_patches_cpu is None:
@@ -477,7 +478,6 @@ class PipelineStagesMixin:
                     del img_splits
                     self.text_encoder.visual.clear_caches()
                     self._trim_reserved_vram(force=False, required_headroom_gb=3.80)  # type: ignore[attr-defined]
-
             rec = CachedReferenceRecord(
                 packed_latents=packed_lat,
                 vit_embeds=vit_embeds,
@@ -577,6 +577,7 @@ class PipelineStagesMixin:
                                 dec_rgb_cpu, v_req
                             )
                             del dec_rgb_cpu
+
                         if (
                             v_bundle.grid_thw is not None
                             and v_bundle.llm_tokens > 0
@@ -628,13 +629,13 @@ class PipelineStagesMixin:
             thinking_trace=thinking_trace if not is_negative else None,
             add_vision_id=add_vision_id,
         )
+
         base_vision_signature = tuple(vision_sig_list)
         vision_signature = (
             base_vision_signature + (("spec_cot", int(speculative_cot_tokens)),)
             if do_speculative_cot
             else base_vision_signature
         )
-
         if use_cache:
             cached = self.embed_cache.lookup(
                 tok_list,
@@ -780,7 +781,6 @@ class PipelineStagesMixin:
             del base_embeds, image_mask, pre_vit_embeds
 
         im_end_id = int(self.text_encoder.config.text_config.eos_token_id or 248044)
-
         if do_speculative_cot:
             close_toks = self.tokenizer.trace_close_token_ids
             gen_ids, spec_hidden, spec_cache = (
@@ -905,11 +905,13 @@ class PipelineStagesMixin:
         box_mask_cpu: Optional[torch.Tensor] = None
         alpha_mask_cpu: Optional[torch.Tensor] = None
         inpaint_mask_cpu: Optional[torch.Tensor] = None
+
         ref_latents_cpu_list: List[torch.Tensor] = []
         ref_bboxes_list: List[Optional[Tuple[float, float, float, float]]] = []
         ref_box_iso_list: List[float] = []
         ref_masks_cpu_list: List[Optional[torch.Tensor]] = []
         ref_roles_list: List[str] = []
+        ref_labels_list: List[str] = []
         ref_z_orders_list: List[float] = []
         ref_keep_in_uncond_list: List[bool] = []
         splat_entries: List[Tuple[Any, ...]] = []
@@ -936,6 +938,9 @@ class PipelineStagesMixin:
         is_ait_format = request.edit_format in (
             "ai_toolkit_isolated",
             "ai_toolkit_full",
+        )
+        lora_active = bool(
+            self.transformer is not None and self.transformer._lora_backups
         )
 
         if has_init or has_mask_file or has_control or valid_ref_specs:
@@ -1024,8 +1029,9 @@ class PipelineStagesMixin:
                         ref_box_iso_list.append(0.0)
                         ref_masks_cpu_list.append(None)
                         ref_roles_list.append(ctrl_role)
+                        ref_labels_list.append("object")
                         ref_z_orders_list.append(0.0)
-                        ref_keep_in_uncond_list.append(True)
+                        ref_keep_in_uncond_list.append(False)
 
             for spec_idx, spec in enumerate(valid_ref_specs):
                 r_path = Path(spec["path"])
@@ -1035,6 +1041,7 @@ class PipelineStagesMixin:
                 role_str = str(
                     spec.get("input_role") or request.input_role or "photo_ref"
                 ).lower()
+                label_str = str(spec.get("box_label") or "object").lower()
                 emits_vit = bool(
                     spec.get(
                         "emits_vit",
@@ -1042,12 +1049,20 @@ class PipelineStagesMixin:
                         and (is_box_ref or request.edit_format != "moss_image_edit"),
                     )
                 )
+                if (
+                    not emits_vit
+                    and role_str == "photo_ref"
+                    and request.edit_format == "moss_image_edit"
+                    and not lora_active
+                ):
+                    emits_vit = True
                 emits_dit = bool(
                     spec.get("emits_dit_latents", role_str != "inpaint_mask")
                 )
                 emits_box_mask = bool(
                     spec.get("emits_box_mask", role_str == "inpaint_mask")
                 )
+
                 if norm_box is not None:
                     ref_w, ref_h = _resolve_boxed_reference_dims(
                         norm_box, request.width, request.height
@@ -1074,6 +1089,7 @@ class PipelineStagesMixin:
                     force_vit=emits_vit,
                 )
                 any_ref_cache_hit = any_ref_cache_hit or hit
+
                 vae_sz = (
                     (
                         int(r_rec.packed_latents.shape[3]) * 16,
@@ -1112,6 +1128,7 @@ class PipelineStagesMixin:
                 }
                 conditioned_ref_telem_map[spec_idx] = telem_info
                 conditioned_ref_telem_map[spec["path"]] = telem_info
+
                 if emits_box_mask and r_rec.latent_mask is not None:
                     box_mask_entries.append(
                         (_evacuate_to_cpu(r_rec.latent_mask), norm_box)
@@ -1123,6 +1140,12 @@ class PipelineStagesMixin:
                         norm_box is not None
                     )
                     z_val = float(spec.get("z_order") or 0.0)
+                    raw_spec_dn = spec.get("denoise_strength")
+                    spec_dn_val = (
+                        float(raw_spec_dn)
+                        if raw_spec_dn is not None
+                        else float(request.denoise_strength)
+                    )
                     if lat_cpu is not None:
                         ref_latents_cpu_list.append(lat_cpu)
                         ref_bboxes_list.append(norm_box)
@@ -1133,14 +1156,12 @@ class PipelineStagesMixin:
                             mask_cpu if is_cutout_mask else None
                         )
                         ref_roles_list.append(role_str)
+                        ref_labels_list.append(label_str)
                         ref_z_orders_list.append(z_val)
-                        keep_in_uncond = (
-                            True
-                            if not is_ait_format
-                            else (
-                                role_str in ("depth_map", "color_map")
-                                or is_pasted
-                            )
+                        keep_in_uncond = bool(
+                            lora_active
+                            and role_str == "photo_ref"
+                            and (not is_ait_format or (is_pasted and spec_dn_val < 0.35))
                         )
                         ref_keep_in_uncond_list.append(keep_in_uncond)
                         if is_pasted and norm_box is not None:
@@ -1152,9 +1173,10 @@ class PipelineStagesMixin:
                                     lat_cpu,
                                     norm_box,
                                     mask_cpu,
-                                    spec.get("denoise_strength"),
+                                    raw_spec_dn,
                                     box_sharpness,
                                     z_val,
+                                    label_str,
                                 )
                             )
                 if (
@@ -1170,6 +1192,7 @@ class PipelineStagesMixin:
                     request.export_vizj_path
                     and self.vizinjector is not None
                     and r_rec.viz_meta is not None
+                    and exported_vizj_str is None
                 ):
                     b_exp = ConditionedVisionBundle(
                         vae_tensor=None,
@@ -1283,6 +1306,7 @@ class PipelineStagesMixin:
             ref_box_iso_list=ref_box_iso_list,
             ref_masks_cpu_list=ref_masks_cpu_list,
             ref_roles_list=ref_roles_list,
+            ref_labels_list=ref_labels_list,
             ref_z_orders_list=ref_z_orders_list,
             ref_keep_in_uncond_list=ref_keep_in_uncond_list,
             splat_entries=splat_entries,
@@ -1324,7 +1348,6 @@ class PipelineStagesMixin:
 
         if cpu_offload:
             self.text_encoder.to(self.device)
-
         if reporter is not None:
             reporter.start_stage("context", ctx_total)
 
@@ -1440,6 +1463,7 @@ class PipelineStagesMixin:
         if cpu_offload:
             self.transformer.to(self.device)
 
+        lora_active = bool(self.transformer._lora_backups)
         depth = len(self.transformer.layers)
         uncond_skip_set = validate_skip_layers(
             request.uncond_skip_layers, depth, "uncond_skip_layers"
@@ -1470,8 +1494,7 @@ class PipelineStagesMixin:
             h_lat,
             w_lat,
         )
-
-        k_init, k_sde, _ = derive_stage_keys(explicit_seed)
+        k_init, k_sde, k_aux = derive_stage_keys(explicit_seed)
         noise = philox_randn(
             shape=shape,
             seed=k_init,
@@ -1508,6 +1531,7 @@ class PipelineStagesMixin:
         composite_used = False
         raw_splat_alpha: Optional[torch.Tensor] = None
         splat_union_alpha: Optional[torch.Tensor] = None
+        splat_denoise_map_raw: Optional[torch.Tensor] = None
         splat_denoise_map: Optional[torch.Tensor] = None
         box_horizon_map: Optional[torch.Tensor] = None
         d_init = max(0.01, min(1.0, float(request.denoise_strength)))
@@ -1517,7 +1541,12 @@ class PipelineStagesMixin:
             if request.mask_feather_radius is not None
             else 1.25
         )
+
         splat_boxes = [e[1] for e in vis_state.splat_entries]
+        splat_z_orders = [
+            float(e[5]) if (len(e) > 5 and e[5] is not None) else 0.0
+            for e in vis_state.splat_entries
+        ]
         default_carve_iso = max(
             DEFAULT_BOX_REF_ISOLATION,
             float(request.box_attn_isolation or 0.0),
@@ -1533,16 +1562,33 @@ class PipelineStagesMixin:
             ref_bboxes=vis_state.ref_bboxes_list,
             ref_z_orders=vis_state.ref_z_orders_list,
             default_isolation=default_carve_iso,
+            splat_z_orders=splat_z_orders,
         )
         active_fg_carveouts = attn_carveouts if attn_carveouts else None
 
         if vis_state.splat_entries:
             composite_used = True
             default_splat_dn = d_init if d_init < 0.999 else 0.75
+            uncarved_splat_alpha: Optional[torch.Tensor] = None
+            if vis_state.has_init and aperture_overrides:
+                _, uncarved_splat_alpha = splat_box_latents_to_canvas(
+                    base_canvas=clean_init_latents,
+                    splat_entries=vis_state.splat_entries,
+                    h_lat=h_lat,
+                    w_lat=w_lat,
+                    latent_channels=self.transformer.config.latent_channels,
+                    feather_radius_lat=eff_feather_lat,
+                    device=self.device,
+                    default_denoise_strength=default_splat_dn,
+                    return_denoise_map=False,
+                    aperture_overrides=None,
+                    bn_mean=bn_mean,
+                    bn_std=bn_std,
+                )
             (
                 clean_init_latents,
                 splat_union_alpha,
-                splat_denoise_map,
+                splat_denoise_map_raw,
             ) = splat_box_latents_to_canvas(
                 base_canvas=clean_init_latents,
                 splat_entries=vis_state.splat_entries,
@@ -1557,7 +1603,11 @@ class PipelineStagesMixin:
                 bn_mean=bn_mean,
                 bn_std=bn_std,
             )
-            raw_splat_alpha = splat_union_alpha.clone()
+            raw_splat_alpha = (
+                uncarved_splat_alpha.clone()
+                if uncarved_splat_alpha is not None
+                else splat_union_alpha.clone()
+            )
             resolved_box_dns = [
                 float(e[3]) if e[3] is not None else default_splat_dn
                 for e in vis_state.splat_entries
@@ -1577,13 +1627,11 @@ class PipelineStagesMixin:
                 if (
                     d_init < eff_denoise_strength - 1e-4
                     and splat_union_alpha is not None
-                    and splat_denoise_map is not None
+                    and raw_splat_alpha is not None
                 ):
-                    splat_denoise_map = (
-                        splat_union_alpha * splat_denoise_map
-                        + (1.0 - splat_union_alpha) * d_init
-                    ).clamp(0.01, 1.0)
-                    splat_union_alpha = torch.ones_like(splat_union_alpha)
+                    splat_union_alpha = (
+                        splat_union_alpha + (1.0 - raw_splat_alpha).clamp(0.0, 1.0)
+                    ).clamp(0.0, 1.0)
         vis_state.splat_entries.clear()
 
         if (
@@ -1603,7 +1651,14 @@ class PipelineStagesMixin:
                 include_paste_boxes=True,
                 return_none_if_uniform=True,
             )
-            if box_horizon_map is not None and not composite_used:
+            if box_horizon_map is not None:
+                if splat_denoise_map_raw is not None and raw_splat_alpha is not None:
+                    unified_dn_map = (
+                        raw_splat_alpha * splat_denoise_map_raw
+                        + (1.0 - raw_splat_alpha) * box_horizon_map
+                    ).clamp(0.0, 1.0)
+                    splat_denoise_map_raw = unified_dn_map
+                    box_horizon_map = unified_dn_map
                 max_h_dn = float(box_horizon_map.max().item())
                 if d_init < 0.999:
                     eff_denoise_strength = max(
@@ -1611,9 +1666,13 @@ class PipelineStagesMixin:
                     )
 
         sched_shift = float(request.shift if request.shift is not None else 5.0)
-        if splat_denoise_map is not None:
+        if splat_denoise_map_raw is not None and splat_union_alpha is not None:
+            preserve_w = (1.0 - splat_denoise_map_raw).clamp(0.0, 1.0)
+            splat_union_alpha = (
+                splat_union_alpha * torch.pow(preserve_w, 1.35) * 0.40
+            ).clamp(0.0, 1.0)
             splat_denoise_map = warp_denoise_to_sigma_horizon(
-                splat_denoise_map, shift=sched_shift
+                splat_denoise_map_raw, shift=sched_shift
             )  # type: ignore[assignment]
         if box_horizon_map is not None:
             box_horizon_map = warp_denoise_to_sigma_horizon(
@@ -1647,6 +1706,7 @@ class PipelineStagesMixin:
                 (1, 1, h_lat, w_lat), device=self.device, dtype=torch.float32
             )
         vis_state.inpaint_mask_cpu = None
+        del raw_splat_alpha, splat_denoise_map_raw
 
         start_step = 0
         if (
@@ -1654,18 +1714,23 @@ class PipelineStagesMixin:
             and clean_init_latents is not None
             and 0.0 < eff_denoise_strength < 1.0
         ):
-            start_step = max(
-                0,
-                min(
-                    request.num_inference_steps - 1,
-                    int(
-                        round(
-                            request.num_inference_steps
-                            * (1.0 - eff_denoise_strength)
-                        )
+            if (
+                inpaint_mask_tensor is not None or box_horizon_map is not None
+            ) and eff_denoise_strength >= 0.85:
+                start_step = 0
+            else:
+                start_step = max(
+                    0,
+                    min(
+                        request.num_inference_steps - 1,
+                        int(
+                            round(
+                                request.num_inference_steps
+                                * (1.0 - eff_denoise_strength)
+                            )
+                        ),
                     ),
-                ),
-            )
+                )
 
         early_cfg = ctx_state.early_cfg
         late_cfg = ctx_state.late_cfg
@@ -1715,81 +1780,34 @@ class PipelineStagesMixin:
         ):
             noised_init = (1.0 - sigma_0) * clean_init_latents + sigma_0 * noise
             if inpaint_mask_tensor is not None and start_step == 0:
-                latents = (
-                    inpaint_mask_tensor * noise
-                    + (1.0 - inpaint_mask_tensor) * noised_init
-                )
+                if box_horizon_map is not None:
+                    eff_h0 = torch.minimum(
+                        box_horizon_map,
+                        torch.full_like(box_horizon_map, sigma_0),
+                    )
+                    rel_dn0 = (
+                        inpaint_mask_tensor.clamp(0.0, 1.0) * eff_h0
+                    ).clamp(0.0, 1.0)
+                    init_fg_w = (
+                        (rel_dn0 - (sigma_0 - 0.08)) / 0.045
+                    ).clamp(0.0, 1.0)
+                    latents = init_fg_w * noise + (1.0 - init_fg_w) * noised_init
+                else:
+                    latents = (
+                        inpaint_mask_tensor * noise
+                        + (1.0 - inpaint_mask_tensor) * noised_init
+                    )
             else:
                 latents = noised_init
             del noised_init
         else:
             latents = noise
 
-        if (
-            inpaint_mask_tensor is not None
-            and clean_init_latents is not None
-            and vis_state.has_init
-        ):
-            eff_horizon = (
-                torch.minimum(
-                    box_horizon_map,
-                    torch.full_like(box_horizon_map, sigma_0),
-                )
-                if box_horizon_map is not None
-                else sigma_0
-            )
-            inpaint_release_dn = (
-                inpaint_mask_tensor.clamp(0.0, 1.0) * eff_horizon
-            ).clamp(0.0, 1.0)
-            horizon_hold_alpha = (
-                ((sigma_0 - inpaint_release_dn) / max(sigma_0, 1e-4)).clamp(
-                    0.0, 1.0
-                )
-            )
-            bg_preserve_alpha = torch.maximum(
-                (1.0 - inpaint_mask_tensor).clamp(0.0, 1.0),
-                horizon_hold_alpha,
-            )
-            if splat_union_alpha is None or splat_denoise_map is None:
-                splat_union_alpha = bg_preserve_alpha
-                splat_denoise_map = inpaint_release_dn
-            else:
-                pasted_mask = (
-                    raw_splat_alpha
-                    if raw_splat_alpha is not None
-                    else torch.zeros_like(inpaint_mask_tensor)
-                )
-                pure_inpaint_alpha = torch.minimum(
-                    inpaint_mask_tensor.clamp(0.0, 1.0),
-                    (1.0 - pasted_mask).clamp(0.0, 1.0),
-                )
-                attenuated_splat_alpha = torch.minimum(
-                    splat_union_alpha,
-                    (1.0 - pure_inpaint_alpha).clamp(0.0, 1.0),
-                )
-                splat_union_alpha = torch.maximum(
-                    attenuated_splat_alpha, bg_preserve_alpha
-                ).clamp(0.0, 1.0)
-                splat_denoise_map = (
-                    pasted_mask * splat_denoise_map
-                    + (1.0 - pasted_mask) * inpaint_release_dn
-                ).clamp(0.0, 1.0)
-            del (
-                bg_preserve_alpha,
-                horizon_hold_alpha,
-                inpaint_release_dn,
-            )
-        del raw_splat_alpha
-
         use_velocity_splat_prior = bool(
-            clean_init_latents is not None
+            composite_used
+            and clean_init_latents is not None
             and splat_union_alpha is not None
             and splat_denoise_map is not None
-            and (
-                composite_used
-                or inpaint_mask_tensor is not None
-                or box_horizon_map is not None
-            )
         )
 
         sde_gen = torch.Generator(device=self.device).manual_seed(k_sde & _MASK63)
@@ -1826,41 +1844,55 @@ class PipelineStagesMixin:
         active_ref_roles = (
             vis_state.ref_roles_list if active_ref_latents is not None else None
         )
+        active_ref_labels = (
+            vis_state.ref_labels_list if active_ref_latents is not None else None
+        )
         active_ref_z_orders = (
             vis_state.ref_z_orders_list if active_ref_latents is not None else None
         )
+
+        seeded_ref_latents: Optional[List[torch.Tensor]] = None
+        if active_ref_latents is not None and not lora_active:
+            seeded_ref_latents = []
+            for r_idx, r_lat in enumerate(active_ref_latents):
+                r_noise = philox_randn(
+                    shape=r_lat.shape,
+                    seed=k_aux,
+                    stream_id=0x10 + r_idx,
+                    offset=0,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                seeded_ref_latents.append(0.30 * r_lat + 0.70 * r_noise)
+
         if request.uncond_uses_references is not None:
             uncond_uses_refs = bool(request.uncond_uses_references)
-            uncond_ref_latents = active_ref_latents if uncond_uses_refs else None
-            uncond_ref_bboxes = active_ref_bboxes if uncond_uses_refs else None
-            uncond_ref_box_iso = active_ref_box_iso if uncond_uses_refs else None
-            uncond_ref_masks = active_ref_masks if uncond_uses_refs else None
-            uncond_ref_roles = active_ref_roles if uncond_uses_refs else None
-            uncond_ref_z_orders = active_ref_z_orders if uncond_uses_refs else None
-        elif vis_state.is_ait_format and active_ref_latents is not None:
+        else:
+            uncond_uses_refs = request.effective_uncond_uses_references
+
+        if lora_active and uncond_uses_refs and active_ref_latents is not None:
             keep_indices = [
                 i
                 for i, keep in enumerate(vis_state.ref_keep_in_uncond_list)
                 if keep
             ]
             if not keep_indices:
-                uncond_uses_refs = False
                 uncond_ref_latents = None
                 uncond_ref_bboxes = None
                 uncond_ref_box_iso = None
                 uncond_ref_masks = None
                 uncond_ref_roles = None
+                uncond_ref_labels = None
                 uncond_ref_z_orders = None
             elif len(keep_indices) == len(ref_latents_list):
-                uncond_uses_refs = True
                 uncond_ref_latents = active_ref_latents
                 uncond_ref_bboxes = active_ref_bboxes
                 uncond_ref_box_iso = active_ref_box_iso
                 uncond_ref_masks = active_ref_masks
                 uncond_ref_roles = active_ref_roles
+                uncond_ref_labels = active_ref_labels
                 uncond_ref_z_orders = active_ref_z_orders
             else:
-                uncond_uses_refs = True
                 uncond_ref_latents = [ref_latents_list[i] for i in keep_indices]
                 u_bboxes = [vis_state.ref_bboxes_list[i] for i in keep_indices]
                 uncond_ref_bboxes = (
@@ -1885,17 +1917,18 @@ class PipelineStagesMixin:
                     else None
                 )
                 uncond_ref_roles = [vis_state.ref_roles_list[i] for i in keep_indices]
+                uncond_ref_labels = [vis_state.ref_labels_list[i] for i in keep_indices]
                 uncond_ref_z_orders = [
                     vis_state.ref_z_orders_list[i] for i in keep_indices
                 ]
         else:
-            uncond_uses_refs = request.effective_uncond_uses_references
-            uncond_ref_latents = active_ref_latents if uncond_uses_refs else None
-            uncond_ref_bboxes = active_ref_bboxes if uncond_uses_refs else None
-            uncond_ref_box_iso = active_ref_box_iso if uncond_uses_refs else None
-            uncond_ref_masks = active_ref_masks if uncond_uses_refs else None
-            uncond_ref_roles = active_ref_roles if uncond_uses_refs else None
-            uncond_ref_z_orders = active_ref_z_orders if uncond_uses_refs else None
+            uncond_ref_latents = None
+            uncond_ref_bboxes = None
+            uncond_ref_box_iso = None
+            uncond_ref_masks = None
+            uncond_ref_roles = None
+            uncond_ref_labels = None
+            uncond_ref_z_orders = None
 
         uncond_fg_carveouts = (
             active_fg_carveouts if bool(uncond_ref_latents) else None
@@ -1918,7 +1951,6 @@ class PipelineStagesMixin:
         positive_mask = ctx_state.positive_mask
         negative = ctx_state.negative
         negative_mask = ctx_state.negative_mask
-
         prev_skip_regime: Optional[Tuple[bool, bool]] = None
 
         for pass_index, timestep in enumerate(timesteps):
@@ -1971,7 +2003,6 @@ class PipelineStagesMixin:
                 step_progress=step_frac,
                 depth=depth,
             )
-
             if do_slg and do_step_cfg and (eff_slg_skip & eff_uncond_skip):
                 ortho_slg: Set[int] = set()
                 for l_idx in eff_slg_skip:
@@ -1985,7 +2016,30 @@ class PipelineStagesMixin:
                         ortho_slg.add(l_idx)
                 eff_slg_skip = ortho_slg
 
-            cur_skip_regime = (bool(eff_uncond_skip and do_step_cfg), bool(do_slg))
+            use_step_refs = bool(
+                active_ref_latents is not None
+                and (lora_active or pass_index == 0)
+            )
+            step_ref_latents = (
+                (active_ref_latents if lora_active else seeded_ref_latents)
+                if use_step_refs
+                else None
+            )
+            step_ref_zero_t = bool(ref_zero_t and lora_active and use_step_refs)
+            step_ref_iso_kv = bool(ref_iso_kv and use_step_refs)
+            step_ref_bboxes = active_ref_bboxes if use_step_refs else None
+            step_ref_box_iso = active_ref_box_iso if use_step_refs else None
+            step_ref_masks = active_ref_masks if use_step_refs else None
+            step_ref_roles = active_ref_roles if use_step_refs else None
+            step_ref_z_orders = active_ref_z_orders if use_step_refs else None
+            step_fg_carveouts = active_fg_carveouts if use_step_refs else None
+            step_ref_labels = active_ref_labels if use_step_refs else None
+
+            cur_skip_regime = (
+                bool(eff_uncond_skip and do_step_cfg),
+                bool(do_slg),
+                use_step_refs,
+            )
             if (
                 prev_skip_regime is not None
                 and cur_skip_regime != prev_skip_regime
@@ -1999,16 +2053,17 @@ class PipelineStagesMixin:
                 timestep,
                 positive,
                 positive_mask,
-                reference_latents=active_ref_latents,
-                reference_zero_timestep=ref_zero_t,
-                reference_isolated_kv=ref_iso_kv,
-                reference_bboxes=active_ref_bboxes,
-                reference_box_isolation=active_ref_box_iso,
+                reference_latents=step_ref_latents,
+                reference_zero_timestep=step_ref_zero_t,
+                reference_isolated_kv=step_ref_iso_kv,
+                reference_bboxes=step_ref_bboxes,
+                reference_box_isolation=step_ref_box_iso,
                 box_feather_radius=box_feather_lat,
-                reference_masks=active_ref_masks,
-                reference_roles=active_ref_roles,
-                reference_z_orders=active_ref_z_orders,
-                foreground_carveouts=active_fg_carveouts,
+                reference_masks=step_ref_masks,
+                reference_roles=step_ref_roles,
+                reference_z_orders=step_ref_z_orders,
+                foreground_carveouts=step_fg_carveouts,
+                reference_labels=step_ref_labels,
             ).sample.float()
             conditional = prediction if do_slg else None
             hist_prediction: Optional[torch.Tensor] = None
@@ -2023,16 +2078,17 @@ class PipelineStagesMixin:
                     timestep,
                     negative,
                     negative_mask,
-                    reference_latents=uncond_ref_latents,
-                    reference_zero_timestep=ref_zero_t and bool(uncond_ref_latents),
-                    reference_isolated_kv=ref_iso_kv and bool(uncond_ref_latents),
-                    reference_bboxes=uncond_ref_bboxes,
-                    reference_box_isolation=uncond_ref_box_iso,
+                    reference_latents=uncond_ref_latents if use_step_refs else None,
+                    reference_zero_timestep=step_ref_zero_t and bool(uncond_ref_latents),
+                    reference_isolated_kv=step_ref_iso_kv and bool(uncond_ref_latents),
+                    reference_bboxes=uncond_ref_bboxes if use_step_refs else None,
+                    reference_box_isolation=uncond_ref_box_iso if use_step_refs else None,
                     box_feather_radius=box_feather_lat,
-                    reference_masks=uncond_ref_masks,
-                    reference_roles=uncond_ref_roles,
-                    reference_z_orders=uncond_ref_z_orders,
-                    foreground_carveouts=uncond_fg_carveouts,
+                    reference_masks=uncond_ref_masks if use_step_refs else None,
+                    reference_roles=uncond_ref_roles if use_step_refs else None,
+                    reference_z_orders=uncond_ref_z_orders if use_step_refs else None,
+                    foreground_carveouts=uncond_fg_carveouts if use_step_refs else None,
+                    reference_labels=uncond_ref_labels if use_step_refs else None,
                     **skip_kwargs,
                 ).sample.float()
                 cond_delta = prediction - uncond
@@ -2049,16 +2105,17 @@ class PipelineStagesMixin:
                     positive,
                     positive_mask,
                     skip_layers=eff_slg_skip,
-                    reference_latents=active_ref_latents,
-                    reference_zero_timestep=ref_zero_t,
-                    reference_isolated_kv=ref_iso_kv,
-                    reference_bboxes=active_ref_bboxes,
-                    reference_box_isolation=active_ref_box_iso,
+                    reference_latents=step_ref_latents,
+                    reference_zero_timestep=step_ref_zero_t,
+                    reference_isolated_kv=step_ref_iso_kv,
+                    reference_bboxes=step_ref_bboxes,
+                    reference_box_isolation=step_ref_box_iso,
                     box_feather_radius=box_feather_lat,
-                    reference_masks=active_ref_masks,
-                    reference_roles=active_ref_roles,
-                    reference_z_orders=active_ref_z_orders,
-                    foreground_carveouts=active_fg_carveouts,
+                    reference_masks=step_ref_masks,
+                    reference_roles=step_ref_roles,
+                    reference_z_orders=step_ref_z_orders,
+                    foreground_carveouts=step_fg_carveouts,
+                    reference_labels=step_ref_labels,
                 ).sample.float()
                 if not do_step_cfg:
                     prediction = skipped
@@ -2074,6 +2131,7 @@ class PipelineStagesMixin:
 
             if (
                 use_velocity_splat_prior
+                and step_frac < 0.12
                 and clean_init_latents is not None
                 and splat_union_alpha is not None
                 and splat_denoise_map is not None
@@ -2110,18 +2168,35 @@ class PipelineStagesMixin:
             )  # type: ignore[assignment]
             del prediction, hist_prediction
 
-            if inpaint_mask_tensor is not None and clean_init_latents is not None:
+            if (
+                inpaint_mask_tensor is not None
+                and clean_init_latents is not None
+                and (eff_denoise_strength < 0.80 or step_frac < 0.12)
+            ):
                 noised_bg = (1.0 - next_sigma) * clean_init_latents + next_sigma * noise
+                eff_inpaint_mask = (
+                    inpaint_mask_tensor.clamp(min=0.92)
+                    if eff_denoise_strength >= 0.80
+                    else inpaint_mask_tensor
+                )
+                raw_h_map = (
+                    splat_denoise_map
+                    if splat_denoise_map is not None
+                    else box_horizon_map
+                )
+                eff_h_map = (
+                    raw_h_map.clamp(min=0.94 * sigma_0)
+                    if (raw_h_map is not None and eff_denoise_strength >= 0.80)
+                    else raw_h_map
+                )
                 active_fg_gate, _ = compute_differential_inpaint_gate(
-                    inpaint_mask=inpaint_mask_tensor,
+                    inpaint_mask=eff_inpaint_mask,
                     next_sigma=next_sigma,
                     sigma_0=sigma_0,
-                    box_horizon_map=(
-                        box_horizon_map
-                        if box_horizon_map is not None
-                        else splat_denoise_map
-                    ),
+                    box_horizon_map=eff_h_map,
                 )
+                if eff_denoise_strength >= 0.80:
+                    active_fg_gate = active_fg_gate.clamp(min=0.65)
                 latents = (
                     active_fg_gate * latents
                     + (1.0 - active_fg_gate) * noised_bg
@@ -2141,7 +2216,6 @@ class PipelineStagesMixin:
                 effective_cb("dit", pass_index + 1, num_passes)
 
         dit_elapsed = time.perf_counter() - dit_t0
-
         if isinstance(active_scheduler, BifurcatedFlowMatchScheduler):
             early_steps = active_scheduler._early_steps
             late_steps = active_scheduler._late_steps
@@ -2168,10 +2242,12 @@ class PipelineStagesMixin:
             negative,
             negative_mask,
             active_ref_latents,
+            seeded_ref_latents,
             active_ref_bboxes,
             active_ref_box_iso,
             active_ref_masks,
             active_ref_roles,
+            active_ref_labels,
             active_ref_z_orders,
             active_fg_carveouts,
             uncond_ref_latents,
@@ -2179,6 +2255,7 @@ class PipelineStagesMixin:
             uncond_ref_box_iso,
             uncond_ref_masks,
             uncond_ref_roles,
+            uncond_ref_labels,
             uncond_ref_z_orders,
             uncond_fg_carveouts,
             ref_latents_list,
@@ -2195,6 +2272,7 @@ class PipelineStagesMixin:
         vis_state.ref_bboxes_list.clear()
         vis_state.ref_box_iso_list.clear()
         vis_state.ref_roles_list.clear()
+        vis_state.ref_labels_list.clear()
         vis_state.ref_z_orders_list.clear()
         vis_state.ref_keep_in_uncond_list.clear()
 
@@ -2237,7 +2315,6 @@ class PipelineStagesMixin:
         num_imgs = request.num_images_per_prompt
         if reporter is not None:
             reporter.start_stage("vae", num_imgs)
-
         latents_vae = flow_state.latents_cpu.to(
             device=self.device, non_blocking=True
         )
@@ -2247,7 +2324,6 @@ class PipelineStagesMixin:
         assert decoded_cpu is not None
         del decoded_gpu
         self._sync_device()  # type: ignore[attr-defined]
-
         if cpu_offload:
             self.vae.to("cpu")
             self._trim_reserved_vram(force=True, required_headroom_gb=4.20)  # type: ignore[attr-defined]
@@ -2268,6 +2344,7 @@ class PipelineStagesMixin:
                 pil_images[0]
             )
         del decoded_cpu
+
         effective_cb("vae", len(pil_images), len(pil_images))
         if reporter is not None:
             reporter.close()

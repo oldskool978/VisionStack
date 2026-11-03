@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -28,8 +29,10 @@ from core.conditioning import (
     splat_box_masks_to_canvas,
 )
 from core.pipeline import (
+    ContextEncodingStageState,
     PipelineLifecycleMixin,
     PipelineStagesMixin,
+    VisualConditioningStageState,
     compute_differential_inpaint_gate,
     resolve_foreground_aperture_carveouts,
     resolve_skip_layer_regimes,
@@ -40,6 +43,7 @@ from engine import (
     ConditionedVisionBundle,
     HAS_VIZINJECTOR,
     MOSSImageEngine,
+    VIZJ_TIER_DUAL_LATENT,
     VIZJ_TIER_VAE_LATENT,
     VizInjectorClient,
     VizInjectorRequest,
@@ -65,6 +69,7 @@ from harness import (
 from models.modeling_moss import (
     MOSSImageConfig,
     MOSSImageTransformer,
+    TransformerOutput,
     _boxes_overlap_coefficient,
     _compute_collaborating_ref_groups,
 )
@@ -85,15 +90,18 @@ from refinery import (
 from schema import (
     BASELINE_ENGINE_DEFAULTS,
     DEFAULT_BOX_REF_ISOLATION,
+    DEFAULT_CHARACTER_CARVE_ISOLATION,
     GenerationRequest,
     SUPPORTED_MASK_BLEND_MODES,
     bbox_to_normalized,
     bbox_to_pixel_rect,
     compile_layout_prompt,
     compile_spatial_thinking_trace,
+    extract_box_text_and_caption,
     get_active_engine_defaults,
     get_canonical_box_order,
     has_custom_default_preset,
+    normalize_layout_boxes,
     pixel_bbox_to_abs_centralized,
     reconcile_layout_summary_quotes,
     scale_layout_items_to_canvas,
@@ -106,6 +114,75 @@ def _assert(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+class _OracleFlowTransformer(torch.nn.Module):
+    def __init__(
+        self,
+        target_latent: torch.Tensor,
+        latent_channels: int = 128,
+        num_layers: int = 42,
+    ) -> None:
+        super().__init__()
+        self.config = MOSSImageConfig(
+            dim=128,
+            ffn_dim=256,
+            num_heads=4,
+            num_layers=num_layers,
+            text_dim=64,
+            freq_dim=32,
+            latent_channels=latent_channels,
+        )
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Identity() for _ in range(num_layers)]
+        )
+        self.target_latent = target_latent
+        self._lora_backups: Dict[str, torch.Tensor] = {}
+        self.call_log: List[Dict[str, Any]] = []
+
+    def clear_transient_caches(self) -> None:
+        pass
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: Union[float, int, torch.Tensor],
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+        skip_layers: Optional[Iterable[int]] = None,
+        reference_latents: Optional[List[torch.Tensor]] = None,
+        reference_zero_timestep: bool = False,
+        reference_isolated_kv: bool = False,
+        reference_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
+        reference_box_isolation: Optional[Union[float, Sequence[Optional[float]]]] = None,
+        box_feather_radius: float = 1.25,
+        reference_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        reference_roles: Optional[Sequence[Optional[str]]] = None,
+        reference_z_orders: Optional[Sequence[Optional[float]]] = None,
+        foreground_carveouts: Optional[Sequence[Any]] = None,
+        reference_labels: Optional[Sequence[Optional[str]]] = None,
+    ) -> Union[TransformerOutput, Tuple[torch.Tensor, ...]]:
+        t_val = (
+            float(timestep.detach().reshape(-1)[0].item())
+            if isinstance(timestep, torch.Tensor)
+            else float(timestep)
+        )
+        sigma = max(t_val / 1000.0, 0.04)
+        self.call_log.append(
+            {
+                "sigma": sigma,
+                "has_refs": bool(reference_latents),
+                "num_refs": len(reference_latents) if reference_latents else 0,
+                "ref_zero_t": bool(reference_zero_timestep),
+                "ref_iso_kv": bool(reference_isolated_kv),
+            }
+        )
+        tgt = self.target_latent.to(
+            device=hidden_states.device, dtype=torch.float32
+        )
+        vel = (hidden_states.float() - tgt) / sigma
+        return TransformerOutput(sample=vel) if return_dict else (vel,)
+
+
 class _Stage1UpgradeHarness(PipelineLifecycleMixin, PipelineStagesMixin):
     def __init__(
         self,
@@ -113,6 +190,7 @@ class _Stage1UpgradeHarness(PipelineLifecycleMixin, PipelineStagesMixin):
         vae: Flux2AutoencoderKL,
         text_encoder: Qwen3_5Model,
         vizinjector: VizInjectorClient,
+        transformer: Optional[Any] = None,
     ) -> None:
         self.model_variant = "sft"
         self.repo_id = "OpenMOSS-Team/MOSS-Image-SFT"
@@ -121,7 +199,7 @@ class _Stage1UpgradeHarness(PipelineLifecycleMixin, PipelineStagesMixin):
         self.vae_dtype = torch.float32
         self.tokenizer = None
         self.text_encoder = text_encoder
-        self.transformer = None
+        self.transformer = transformer
         self.vae = vae
         self.embed_cache = PromptEmbedCache(max_entries=4)
         self.ref_cache = ReferenceVisionCache(max_entries=4)
@@ -317,22 +395,70 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 and int(cut_arr[256, 256, 3]) == 255,
                 "ref_cutout_c.png must be a 512x512 RGBA cutout with transparent borders and opaque interior",
             )
+        with Image.open(staged_map["ref_b"]) as ref_b_img:
+            rb_arr = np.asarray(ref_b_img, dtype=np.float32)
+            citrus_chroma = np.maximum(0.0, (rb_arr[..., 0] - rb_arr[..., 2]) - 110.0)
+            tot_chroma = float(np.sum(citrus_chroma))
+            yy_b, xx_b = np.meshgrid(
+                np.linspace(-1.0, 1.0, rb_arr.shape[0], dtype=np.float32),
+                np.linspace(-1.0, 1.0, rb_arr.shape[1], dtype=np.float32),
+                indexing="ij",
+            )
+            cx_chroma = float(np.sum(xx_b * citrus_chroma)) / max(tot_chroma, 1e-6)
+            cy_chroma = float(np.sum(yy_b * citrus_chroma)) / max(tot_chroma, 1e-6)
+            _assert(
+                tot_chroma > 1000.0 and cx_chroma > 0.25 and cy_chroma > 0.15,
+                f"ref_style_b.png citrus bowl chromaticity centroid must lie in lower-right foreground quadrant: cx={cx_chroma:.3f}, cy={cy_chroma:.3f}",
+            )
 
         ref_512_p = Path(tmpdir) / "ref_512.png"
         test_bw = np.zeros((512, 512, 3), dtype=np.uint8)
         test_bw[256:, :, :] = 255
         Image.fromarray(test_bw, mode="RGB").save(ref_512_p)
-
         unboxed_2304 = _resolve_unboxed_reference_dims(
             ref_512_p, 1024, 1024, "ai_toolkit_isolated", max_vit_patches=2304
         )
         unboxed_576 = _resolve_unboxed_reference_dims(
             ref_512_p, 1024, 1024, "ai_toolkit_isolated", max_vit_patches=576
         )
-        _assert(
-            unboxed_2304 == (768, 768) and unboxed_576 == (512, 512),
-            f"_resolve_unboxed_reference_dims failed adaptive 4D-RoPE scaling: 2304->{unboxed_2304}, 576->{unboxed_576}",
+        unboxed_moss_edit = _resolve_unboxed_reference_dims(
+            ref_512_p, 1024, 1024, "moss_image_edit", max_vit_patches=2304
         )
+        unboxed_ctrl = _resolve_unboxed_reference_dims(
+            ref_512_p, 1024, 1024, "control_color_depth", max_vit_patches=2304
+        )
+        _assert(
+            unboxed_2304 == (768, 768)
+            and unboxed_576 == (512, 512)
+            and unboxed_moss_edit == (1024, 1024)
+            and unboxed_ctrl == (1024, 1024),
+            f"_resolve_unboxed_reference_dims failed full-canvas or adaptive 4D-RoPE scaling: 2304->{unboxed_2304}, 576->{unboxed_576}, edit->{unboxed_moss_edit}, ctrl->{unboxed_ctrl}",
+        )
+        for sw_h, sh_h in ((1920, 1080), (1080, 1920), (773, 519)):
+            hom_p = Path(tmpdir) / f"hom_{sw_h}x{sh_h}.png"
+            Image.fromarray(np.zeros((sh_h, sw_h, 3), dtype=np.uint8), mode="RGB").save(
+                hom_p
+            )
+            src_asp = float(sw_h) / float(sh_h)
+            for fmt_h in (
+                "standard",
+                "moss_image_edit",
+                "control_color_depth",
+                "ai_toolkit_isolated",
+            ):
+                rw_h, rh_h = _resolve_unboxed_reference_dims(
+                    hom_p, 1024, 1024, fmt_h, max_vit_patches=2304
+                )
+                out_asp = float(rw_h) / float(rh_h)
+                max_asp_bound = (16.0 / float(min(rw_h, rh_h))) * max(
+                    1.0, src_asp
+                ) + 1e-4
+                _assert(
+                    rw_h % 16 == 0
+                    and rh_h % 16 == 0
+                    and abs(out_asp - src_asp) <= max_asp_bound,
+                    f"Aspect-ratio homothety violated for {sw_h}x{sh_h} ({fmt_h}): got {rw_h}x{rh_h} (asp={out_asp:.4f} vs {src_asp:.4f})",
+                )
 
         fb_patches, fb_gthw, fb_llm = pack_vision_patches_32px(
             ref_512_p, max_patches=2304
@@ -345,7 +471,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(fb_patches.max().item()) - 1.0) < 1e-5,
             f"pack_vision_patches_32px failed full-budget upsampling or [-1, 1] sRGB normalization: shape={fb_patches.shape}, range=[{fb_patches.min().item()}, {fb_patches.max().item()}]",
         )
-
         if HAS_VIZINJECTOR and VizInjectorClient is not None:
             with torch.inference_mode(), VizInjectorClient(prefer_vulkan=True) as viz:
                 mini_vae = (
@@ -514,9 +639,257 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                         and upgraded_rec.vit_embeds.is_pinned(),
                         "Stage 1 upgraded CachedReferenceRecord tensors must be page-locked",
                     )
+
+                ref_img_1_p = Path(tmpdir) / "multiref_1.png"
+                ref_img_2_p = Path(tmpdir) / "multiref_2.png"
+                Image.fromarray(
+                    np.full((256, 256, 3), 40, dtype=np.uint8), mode="RGB"
+                ).save(ref_img_1_p)
+                Image.fromarray(
+                    np.full((256, 256, 3), 220, dtype=np.uint8), mode="RGB"
+                ).save(ref_img_2_p)
+                exported_t2_p = Path(tmpdir) / "exported_primary.vizj"
+                multiref_req = GenerationRequest(
+                    prompt="Multi-ref primary export & un-LoRAd routing test",
+                    width=256,
+                    height=256,
+                    max_vit_patches=576,
+                    edit_format="ai_toolkit_isolated",
+                    framing_mode="inscribed",
+                    reference_image_paths=[str(ref_img_1_p), str(ref_img_2_p)],
+                    export_vizj_path=str(exported_t2_p),
+                    export_vizj_tier=VIZJ_TIER_DUAL_LATENT,
+                    prefer_vulkan=True,
+                )
+                vis_multiref = stage_harness._execute_stage_1_visual_conditioning(
+                    request=multiref_req, cpu_offload=False
+                )
+                reloaded_primary = viz.load_vizj_bytes(exported_t2_p.read_bytes())
+                primary_lat_bf16 = vis_multiref.ref_latents_cpu_list[0].to(
+                    torch.bfloat16
+                ).float()
+                secondary_lat_bf16 = vis_multiref.ref_latents_cpu_list[1].to(
+                    torch.bfloat16
+                ).float()
+                _assert(
+                    exported_t2_p.is_file()
+                    and reloaded_primary.packed_latents is not None
+                    and len(vis_multiref.ref_latents_cpu_list) == 2
+                    and float(
+                        (reloaded_primary.packed_latents - primary_lat_bf16)
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                    == 0.0
+                    and float(
+                        (reloaded_primary.packed_latents - secondary_lat_bf16)
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                    > 1e-2,
+                    "Stage 1 multi-reference .vizj export failed projective lock onto Picture 1 (overwritten by Picture 2)",
+                )
+
+                unlorad_edit_req = GenerationRequest(
+                    prompt="Un-LoRA'd moss_image_edit semantic ViT fallback test",
+                    width=256,
+                    height=256,
+                    max_vit_patches=576,
+                    edit_format="moss_image_edit",
+                    framing_mode="never_crop",
+                    reference_image_paths=[str(ref_img_1_p)],
+                    prefer_vulkan=True,
+                )
+                vis_unlorad = stage_harness._execute_stage_1_visual_conditioning(
+                    request=unlorad_edit_req, cpu_offload=False
+                )
+                _assert(
+                    len(vis_unlorad.ref_records_for_prompt) == 1
+                    and vis_unlorad.ref_records_for_prompt[0].llm_tokens == 144
+                    and vis_unlorad.ref_keep_in_uncond_list == [False],
+                    f"Un-LoRA'd moss_image_edit failed to emit semantic ViT tokens or decouple unconditional copy: recs={len(vis_unlorad.ref_records_for_prompt)}, keep_uncond={vis_unlorad.ref_keep_in_uncond_list}",
+                )
+
+                gt_target = philox_randn(
+                    (1, 128, 16, 16), seed=909, stream_id=1, device=dev
+                )
+                bg_init_lat = philox_randn(
+                    (1, 128, 16, 16), seed=808, stream_id=2, device="cpu"
+                ) * (-1.5)
+                oracle_dit = _OracleFlowTransformer(
+                    target_latent=gt_target, latent_channels=128, num_layers=42
+                ).to(device=dev)
+                stage_harness.transformer = oracle_dit
+
+                ctx_dummy = ContextEncodingStageState(
+                    positive=torch.ones((1, 8, 64), device=dev, dtype=dtype),
+                    positive_mask=torch.ones((1, 8), device=dev, dtype=torch.bool),
+                    negative=torch.zeros((1, 8, 64), device=dev, dtype=dtype),
+                    negative_mask=torch.ones((1, 8), device=dev, dtype=torch.bool),
+                    effective_prompt="Oracle Stage 3 BVP test",
+                    cache_hit=False,
+                    common_prefix_len=0,
+                    spec_cot_tokens=0,
+                    early_cfg=3.2,
+                    late_cfg=2.8,
+                )
+                inp_mask_hi = torch.zeros((1, 1, 16, 16), dtype=torch.float32)
+                inp_mask_hi[:, :, 4:12, 4:12] = 1.0
+                vis_bvp_hi = VisualConditioningStageState(
+                    init_latents_cpu=bg_init_lat.clone(),
+                    inpaint_mask_cpu=inp_mask_hi.clone(),
+                    ref_latents_cpu_list=[t1_lat.clone()],
+                    ref_bboxes_list=[None],
+                    ref_box_iso_list=[0.0],
+                    ref_masks_cpu_list=[None],
+                    ref_roles_list=["photo_ref"],
+                    ref_labels_list=["object"],
+                    ref_z_orders_list=[0.0],
+                    ref_keep_in_uncond_list=[False],
+                    splat_entries=[],
+                    splatted_box_indices=set(),
+                    ref_records_for_prompt=[],
+                    conditioned_ref_telem_map={},
+                    any_ref_cache_hit=False,
+                    exported_vizj_str=None,
+                    has_init=True,
+                    is_ait_format=False,
+                )
+                bvp_hi_req = GenerationRequest(
+                    prompt="Oracle BVP high-denoise release",
+                    width=256,
+                    height=256,
+                    num_inference_steps=12,
+                    early_solver="heun",
+                    late_solver="ipndm",
+                    handoff_threshold=0.35,
+                    shift=5.0,
+                    early_cfg=3.2,
+                    late_cfg=2.8,
+                    denoise_strength=0.92,
+                    seed=42,
+                )
+                flow_hi = stage_harness._execute_stage_3_flow_matching(
+                    request=bvp_hi_req,
+                    explicit_seed=42,
+                    vis_state=vis_bvp_hi,
+                    ctx_state=ctx_dummy,
+                    cpu_offload=False,
+                    reporter=None,
+                    effective_cb=lambda s, c, t: None,
+                )
+                fg_mae_hi = float(
+                    (
+                        flow_hi.latents_cpu[:, :, 5:11, 5:11]
+                        - gt_target.cpu()[:, :, 5:11, 5:11]
+                    )
+                    .abs()
+                    .mean()
+                    .item()
+                )
+                fg_dist_from_bg = float(
+                    (
+                        flow_hi.latents_cpu[:, :, 5:11, 5:11]
+                        - bg_init_lat[:, :, 5:11, 5:11]
+                    )
+                    .abs()
+                    .mean()
+                    .item()
+                )
+                _assert(
+                    fg_mae_hi < 0.05
+                    and fg_dist_from_bg > 0.80
+                    and len(oracle_dit.call_log) >= 2
+                    and oracle_dit.call_log[0]["has_refs"] is True
+                    and oracle_dit.call_log[0]["ref_zero_t"] is False
+                    and oracle_dit.call_log[1]["has_refs"] is False
+                    and all(
+                        not entry["has_refs"] for entry in oracle_dit.call_log[2:]
+                    ),
+                    f"Stage 3 BVP high-denoise convergence or un-LoRAd step-0 reference gating failed: fg_mae={fg_mae_hi:.4f}, dist_bg={fg_dist_from_bg:.4f}",
+                )
+
+                oracle_dit.call_log.clear()
+                oracle_dit._lora_backups["dummy"] = torch.zeros(1)
+                vis_bvp_lo = VisualConditioningStageState(
+                    init_latents_cpu=bg_init_lat.clone(),
+                    inpaint_mask_cpu=inp_mask_hi.clone(),
+                    ref_latents_cpu_list=[t1_lat.clone()],
+                    ref_bboxes_list=[None],
+                    ref_box_iso_list=[0.0],
+                    ref_masks_cpu_list=[None],
+                    ref_roles_list=["photo_ref"],
+                    ref_labels_list=["object"],
+                    ref_z_orders_list=[0.0],
+                    ref_keep_in_uncond_list=[True],
+                    splat_entries=[],
+                    splatted_box_indices=set(),
+                    ref_records_for_prompt=[],
+                    conditioned_ref_telem_map={},
+                    any_ref_cache_hit=False,
+                    exported_vizj_str=None,
+                    has_init=True,
+                    is_ait_format=False,
+                )
+                bvp_lo_req = GenerationRequest(
+                    prompt="Oracle BVP low-denoise exterior lock & LoRA ref lock",
+                    width=256,
+                    height=256,
+                    num_inference_steps=12,
+                    early_solver="heun",
+                    late_solver="ipndm",
+                    handoff_threshold=0.35,
+                    shift=5.0,
+                    early_cfg=3.2,
+                    late_cfg=2.8,
+                    denoise_strength=0.45,
+                    edit_format="moss_image_edit",
+                    seed=42,
+                )
+                flow_lo = stage_harness._execute_stage_3_flow_matching(
+                    request=bvp_lo_req,
+                    explicit_seed=42,
+                    vis_state=vis_bvp_lo,
+                    ctx_state=ctx_dummy,
+                    cpu_offload=False,
+                    reporter=None,
+                    effective_cb=lambda s, c, t: None,
+                )
+                ext_lock_err = float(
+                    (
+                        flow_lo.latents_cpu[:, :, :2, :2]
+                        - bg_init_lat[:, :, :2, :2]
+                    )
+                    .abs()
+                    .max()
+                    .item()
+                )
+                int_mae_lo = float(
+                    (
+                        flow_lo.latents_cpu[:, :, 5:11, 5:11]
+                        - gt_target.cpu()[:, :, 5:11, 5:11]
+                    )
+                    .abs()
+                    .mean()
+                    .item()
+                )
+                _assert(
+                    ext_lock_err == 0.0
+                    and int_mae_lo < 0.05
+                    and all(
+                        entry["has_refs"] and entry["ref_zero_t"]
+                        for entry in oracle_dit.call_log
+                    ),
+                    f"Stage 3 BVP low-denoise exterior lock or LoRA all-step t_ref=0 routing failed: ext_err={ext_lock_err:.2e}, int_mae={int_mae_lo:.4f}",
+                )
+
+                stage_harness.transformer = None
                 stage_harness.prepare_for_exit()
                 del (
                     stage_harness,
+                    oracle_dit,
                     mini_vae,
                     mini_qwen,
                     dec_rgb_ref,
@@ -553,6 +926,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 in harness_def_req.compile_effective_prompt(),
                 "compile_effective_prompt() shadowed edited prompt in layout_json mode",
             )
+
             os.environ["SHADOWBOXER_DEFAULT_JSON"] = str(tmp_preset)
             custom_req = GenerationRequest(
                 prompt="Preset hot-reload test",
@@ -606,11 +980,29 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         f"_apply_box_denoise_spec failed to set per-box denoise overrides: {req_cli_dn.layout_items}",
     )
 
+    char_stale_txt = {
+        "label": "character",
+        "text": "stale text field that must not hijack character label",
+        "caption": "Portrait subject in studio rim lighting",
+        "bbox": [128, 128, 512, 512],
+        "denoise_strength": 0.12,
+    }
+    lbl_ex, txt_ex, cap_ex = extract_box_text_and_caption(char_stale_txt)
+    norm_boxes_list = normalize_layout_boxes([char_stale_txt], height=1024, width=1024)
+    _assert(
+        lbl_ex == "character"
+        and txt_ex == ""
+        and cap_ex == "Portrait subject in studio rim lighting"
+        and norm_boxes_list[0]["label"] == "character"
+        and "text" not in norm_boxes_list[0]
+        and abs(float(norm_boxes_list[0]["denoise_strength"]) - 0.12) < 1e-6,
+        f"normalize_layout_boxes failed to preserve explicit 'character' label or manual denoise_strength: {norm_boxes_list}",
+    )
+
     c_bbox = pixel_bbox_to_abs_centralized(0, 0, 1023, 1023, height=1024, width=1024)
     _assert(
         c_bbox == [-512, -512, 512, 512], f"Unexpected centralized bbox: {c_bbox}"
     )
-
     norm_b = bbox_to_normalized(
         [256, 512, 768, 1024], height=1024, width=1024, coords_are_pixels=True
     )
@@ -746,7 +1138,9 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
     _assert(
         ref_specs[0]["norm_bbox"] is None
+        and ref_specs[0]["box_label"] == "object"
         and ref_specs[1]["norm_bbox"] == (0.25, 0.25, 0.75, 0.75)
+        and ref_specs[1]["box_label"] == "character"
         and abs(float(ref_specs[1]["isolate_box_attn"]) - 0.9) < 1e-6
         and abs(float(ref_specs[1]["denoise_strength"]) - 0.03) < 1e-6
         and ref_specs[1]["paste_to_canvas"] is True,
@@ -754,15 +1148,19 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     )
     compiled_poly = req_poly.compile_effective_prompt()
     compiled_poly_rev = req_poly_rev.compile_effective_prompt()
+    parsed_poly = json.loads(compiled_poly)
     _assert(
         compiled_poly == compiled_poly_rev
-        and '"reference": "Picture 2"' in compiled_poly
+        and parsed_poly["items"][0]["label"] == "character"
+        and parsed_poly["items"][0]["caption"].startswith("Picture 2: ")
+        and '"reference":' not in compiled_poly
+        and all("reference" not in it for it in parsed_poly["items"])
         and "box_subject.png" not in compiled_poly
         and "isolate_box_attn" not in compiled_poly
         and "paste_to_canvas" not in compiled_poly
         and "denoise_strength" not in compiled_poly
         and "z_order" not in compiled_poly,
-        "Polymorphic layout compiler failed permutation invariance or leaked internal box routing keys",
+        "Polymorphic layout compiler failed upstream compile_prompt.py parity, in-caption Picture k binding, or leaked internal box routing keys",
     )
     _assert(
         req_poly.effective_reference_zero_timestep is True
@@ -855,6 +1253,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and mixed_specs[3]["emits_dit_latents"] is True
         and mixed_specs[3]["picture_index"] == 1
         and mixed_specs[3]["dit_ref_index"] == 3
+        and mixed_specs[3]["box_label"] == "character"
         and mixed_specs[3]["paste_to_canvas"] is True
         and mixed_specs[3]["framing_mode"] == "inscribed"
         and abs(float(mixed_specs[3]["isolate_box_attn"]) - DEFAULT_BOX_REF_ISOLATION)
@@ -870,11 +1269,18 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         f"Box 3 explicit isolate_box_attn=0.0 override was not respected: {mixed_specs[4]}",
     )
     compiled_mixed = req_mixed_roles.compile_effective_prompt()
+    parsed_mixed = json.loads(compiled_mixed)
+    mixed_trace = compile_spatial_thinking_trace(req_mixed_roles)
     _assert(
-        '"reference": "Picture 1"' in compiled_mixed
-        and '"reference": "Picture 2"' in compiled_mixed
-        and '"reference": "Picture 3"' not in compiled_mixed,
-        f"Mixed-role layout prompt desynchronized Picture index: {compiled_mixed}",
+        '"reference":' not in compiled_mixed
+        and all("reference" not in it for it in parsed_mixed["items"])
+        and "Picture 1: Foreground character reference" in compiled_mixed
+        and "Picture 2: Explicitly unisolated box reference" in compiled_mixed
+        and "Picture 3" not in compiled_mixed
+        and "ref=Picture 1" in mixed_trace
+        and "ref=Picture 2" in mixed_trace
+        and "ref=Picture 3" not in mixed_trace,
+        f"Mixed-role layout prompt or thinking trace desynchronized Picture index: json={compiled_mixed}, trace={mixed_trace}",
     )
 
     v11_norm_boxes = (
@@ -983,6 +1389,53 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         and abs(float(horizon_map[0, 0, 8, 56].item()) - 1.0) < 1e-5,
         "build_box_denoise_horizon_map failed per-box denoise horizon synthesis",
     )
+    char_img2img_horizon = build_box_denoise_horizon_map(
+        layout_items=[
+            {
+                "label": "character",
+                "caption": "Existing character pose in source image",
+                "bbox": [128, 128, 768, 768],
+                "inpaint_box": True,
+            }
+        ],
+        height=1024,
+        width=1024,
+        coords_are_pixels=True,
+        feather_radius_lat=1.0,
+        default_denoise_strength=0.35,
+        device=dev,
+        only_flagged_boxes=True,
+        return_none_if_uniform=True,
+    )
+    _assert(
+        char_img2img_horizon is None,
+        "Unreferenced 'character' box without manual denoise_strength must not force a high-noise floor in standard img2img",
+    )
+    manual_low_text_horizon = build_box_denoise_horizon_map(
+        layout_items=[
+            {
+                "label": "text",
+                "text": "MANUAL LOW HORIZON",
+                "bbox": [256, 256, 768, 768],
+                "denoise_strength": 0.22,
+            }
+        ],
+        height=1024,
+        width=1024,
+        coords_are_pixels=True,
+        feather_radius_lat=0.0,
+        default_denoise_strength=0.80,
+        device=dev,
+        only_flagged_boxes=True,
+        return_none_if_uniform=True,
+    )
+    _assert(
+        manual_low_text_horizon is not None
+        and abs(float(manual_low_text_horizon[0, 0, 32, 32].item()) - 0.22) < 1e-6
+        and abs(float(manual_low_text_horizon[0, 0, 4, 4].item()) - 0.80) < 1e-6,
+        "Manual low denoise_strength on 'text' box was blocked or clamped to automatic 0.65 floor",
+    )
+
     nested_horizon_map = build_box_denoise_horizon_map(
         layout_items=[
             {
@@ -1024,7 +1477,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
     m_paint = torch.zeros((1, 1, 64, 64), device=dev, dtype=torch.float32)
     m_paint[:, :, :32, :] = 1.0
     m_alpha = torch.full((1, 1, 64, 64), 0.5, device=dev, dtype=torch.float32)
-
     m_auto_union = compose_latent_inpaint_mask(
         paint_mask=m_paint,
         box_mask=aperture_mask,
@@ -1126,6 +1578,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             (boxed_w, boxed_h) == (512, 512),
             f"_resolve_boxed_reference_dims mismatch: {(boxed_w, boxed_h)}",
         )
+
         unpacked_ramp = (
             (torch.arange(16, device=dev, dtype=torch.float32) + 0.5)
             .view(1, 1, 1, 16)
@@ -1236,7 +1689,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(splat_dn_map[0, 0, 16, 16].item()) - 0.60) < 1e-5,
             "splat_box_latents_to_canvas failed interior/feather/exterior composite or denoise map values",
         )
-
         splat_bn_can, _ = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[
@@ -1274,6 +1726,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(cut_tnorm_alpha[0, 0, 9, 16].item()) - 0.5) < 1e-6,
             "Gate 5.C Single-authority Godel t-norm failed: VizInjector cutout mask was double-feathered against box ramp",
         )
+
         _, kronecker_alpha, kronecker_dn = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.45)],
@@ -1291,6 +1744,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(kronecker_dn[0, 0, 8, 8].item()) - 0.45) < 1e-5,
             "0.0-feather splat_box_latents_to_canvas failed exact Kronecker perimeter support",
         )
+
         _, low_dn_alpha = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[(box_lat_a, (0.25, 0.25, 0.75, 0.75), None, 0.05)],
@@ -1326,6 +1780,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             feather_rms > 0.94,
             f"Covariance-preserving sub-phase splatting suffered variance droop in feather zone: rms={feather_rms}",
         )
+
         no_base_canvas, no_base_alpha, no_base_dn = splat_box_latents_to_canvas(
             base_canvas=None,
             splat_entries=[(fg_gauss, (0.25, 0.25, 0.75, 0.75), None, 0.40)],
@@ -1440,6 +1895,25 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             "z_order Porter-Duff dominance in splat_box_latents_to_canvas failed to elevate foreground layer",
         )
 
+        sem_can, _, sem_dn = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[
+                (z_low_lat, (0.25, 0.25, 0.75, 0.75), None, 0.80, None, 2.0, "object"),
+                (z_high_lat, (0.25, 0.25, 0.75, 0.75), None, 0.20, None, 2.0, "character"),
+            ],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            return_denoise_map=True,
+        )
+        _assert(
+            float(sem_can[0, 0, 16, 16].item()) > 0.0
+            and float(sem_dn[0, 0, 16, 16].item()) < 0.50,
+            "Co-planar semantic splat priority failed to weight 'character' above 'object' at equal area and z_order",
+        )
+
         ovr_can, ovr_alpha, ovr_dn_map = splat_box_latents_to_canvas(
             base_canvas=base_canvas,
             splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.15)],
@@ -1457,6 +1931,114 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and float(ovr_alpha[0, 0, 16, 16].item()) == 0.0
             and float(ovr_alpha[0, 0, 6, 6].item()) == 1.0,
             "Gate 5.A aperture_overrides failed to carve union_alpha or elevate denoise temperature inside nested typography box",
+        )
+        _, char_ovr_alpha, char_ovr_dn = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.25)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            return_denoise_map=True,
+            aperture_overrides=[
+                ((0.25, 0.25, 0.75, 0.75), 0.75, 0.65, "character", False)
+            ],
+        )
+        _assert(
+            abs(float(char_ovr_alpha[0, 0, 16, 16].item()) - 0.35) < 1e-4
+            and abs(float(char_ovr_alpha[0, 0, 8, 8].item()) - 0.9025) < 1e-4
+            and abs(float(char_ovr_dn[0, 0, 16, 16].item()) - 0.75) < 1e-4
+            and abs(float(char_ovr_dn[0, 0, 8, 8].item()) - 0.325) < 1e-4,
+            "C1 Tukey-Hann character splat carve-out failed to preserve 85% peripheral background context at box corners",
+        )
+        mc_char_1 = ((0.125, 0.125, 0.875, 0.625), 0.90, 1.0, "character", True, 4.0)
+        mc_char_2 = ((0.125, 0.375, 0.875, 0.875), 0.96, 1.0, "character", True, 5.0)
+        mc_txt = ((0.25, 0.25, 0.50, 0.75), 0.98, 1.0, "text", True, 7.0)
+        _, mc_alp_a, mc_dn_a = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.25)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            return_denoise_map=True,
+            aperture_overrides=[mc_char_1, mc_char_2, mc_txt],
+        )
+        _, mc_alp_b, mc_dn_b = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.25)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            return_denoise_map=True,
+            aperture_overrides=[mc_txt, mc_char_2, mc_char_1],
+        )
+        _assert(
+            float((mc_alp_a - mc_alp_b).abs().max().item()) < 1e-6
+            and float((mc_dn_a - mc_dn_b).abs().max().item()) < 1e-6
+            and float(mc_alp_a[0, 0, 20, 16].item()) == 0.0
+            and abs(float(mc_dn_a[0, 0, 20, 16].item()) - 0.96) < 1e-5
+            and abs(float(mc_dn_a[0, 0, 12, 16].item()) - 0.98) < 1e-5,
+            "Multi-character Z-order & semantic hierarchy in splat_box_latents_to_canvas failed permutation invariance or depth dominance",
+        )
+        _, _, manual_low_ovr_dn = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.80)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            return_denoise_map=True,
+            aperture_overrides=[
+                ((0.375, 0.375, 0.625, 0.625), 0.20, 0.0, "character", True)
+            ],
+        )
+        _assert(
+            abs(float(manual_low_ovr_dn[0, 0, 16, 16].item()) - 0.20) < 1e-5
+            and abs(float(manual_low_ovr_dn[0, 0, 6, 6].item()) - 0.80) < 1e-5,
+            "Manual low denoise_strength on child aperture failed to override higher parent splat denoise_strength",
+        )
+        _, uncarved_init_splat_alpha = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.55)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            default_denoise_strength=0.30,
+            return_denoise_map=False,
+            aperture_overrides=None,
+        )
+        _, carved_init_splat_alpha, carved_init_splat_dn = splat_box_latents_to_canvas(
+            base_canvas=base_canvas,
+            splat_entries=[(parent_lat, (0.125, 0.125, 0.875, 0.875), None, 0.55)],
+            h_lat=32,
+            w_lat=32,
+            latent_channels=128,
+            feather_radius_lat=0.0,
+            device=dev,
+            default_denoise_strength=0.30,
+            return_denoise_map=True,
+            aperture_overrides=[((0.375, 0.375, 0.625, 0.625), 0.85, 1.0, "text", True)],
+        )
+        combined_init_alpha = (
+            carved_init_splat_alpha
+            + (1.0 - uncarved_init_splat_alpha).clamp(0.0, 1.0)
+        ).clamp(0.0, 1.0)
+        _assert(
+            float(combined_init_alpha[0, 0, 1, 1].item()) == 1.0
+            and abs(float(carved_init_splat_dn[0, 0, 1, 1].item()) - 0.30) < 1e-5
+            and float(combined_init_alpha[0, 0, 6, 6].item()) == 1.0
+            and abs(float(carved_init_splat_dn[0, 0, 6, 6].item()) - 0.55) < 1e-5
+            and float(combined_init_alpha[0, 0, 16, 16].item()) == 0.0
+            and abs(float(carved_init_splat_dn[0, 0, 16, 16].item()) - 0.85) < 1e-5,
+            "Combined has_init + splat + aperture_overrides failed to preserve carved aperture release (0.0 alpha, d=0.85) while locking init exterior (1.0 alpha, d=0.30)",
         )
         v_dit_fg = torch.full((1, 128, 32, 32), -0.75, device=dev, dtype=torch.float32)
         v_coupled_carved = couple_splat_velocity_prior(
@@ -1502,6 +2084,13 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 "z_order": 5,
                 "enabled": True,
             },
+            {
+                "label": "character",
+                "caption": "Foreground subject overlapping left panel",
+                "bbox": [512, 64, 960, 512],
+                "z_order": 4,
+                "enabled": True,
+            },
         ]
         v11_ovr, v11_attn_carve = resolve_foreground_aperture_carveouts(
             layout_items=v11_test_items,
@@ -1513,15 +2102,29 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             ref_bboxes=[(0.0, 0.0, 1.0, 0.5625), (0.0, 0.0, 1.0, 0.5625)],
             ref_z_orders=[1.0, 2.0],
             default_isolation=0.85,
+            splat_z_orders=[1.0],
         )
         _assert(
-            len(v11_ovr) == 1
+            len(v11_ovr) == 2
             and abs(float(v11_ovr[0][1]) - 0.65) < 1e-6
             and abs(float(v11_ovr[0][2]) - 1.0) < 1e-6
-            and len(v11_attn_carve) == 1
+            and v11_ovr[0][3] == "text"
+            and v11_ovr[0][4] is True
+            and v11_ovr[0][5] == 5.0
+            and abs(float(v11_ovr[1][1]) - 0.75) < 1e-6
+            and abs(float(v11_ovr[1][2]) - 0.65) < 1e-6
+            and v11_ovr[1][3] == "character"
+            and v11_ovr[1][4] is False
+            and v11_ovr[1][5] == 4.0
+            and len(v11_attn_carve) == 2
             and abs(float(v11_attn_carve[0][1]) - 0.85) < 1e-6
-            and v11_attn_carve[0][2] == 5.0,
-            f"Gate 5.A resolve_foreground_aperture_carveouts failed V11 synthesis: ovr={v11_ovr}, attn={v11_attn_carve}",
+            and v11_attn_carve[0][2] == 5.0
+            and v11_attn_carve[0][3] == "text"
+            and abs(float(v11_attn_carve[1][1]) - DEFAULT_CHARACTER_CARVE_ISOLATION)
+            < 1e-6
+            and v11_attn_carve[1][2] == 4.0
+            and v11_attn_carve[1][3] == "character",
+            f"Gate 5.A resolve_foreground_aperture_carveouts failed V11/Character synthesis: ovr={v11_ovr}, attn={v11_attn_carve}",
         )
         v11_scaled_512 = scale_layout_items_to_canvas(
             v11_test_items,
@@ -1634,6 +2237,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and actual_rim_v > naive_rim_v * 1.15,
             f"couple_splat_velocity_prior failed interior/perimeter/exterior coupling at sigma=0.90: interior={v_interior_hi}, rim={actual_rim_v} vs naive={naive_rim_v}",
         )
+
         v_dit_ones = torch.ones((1, 128, 32, 32), device=dev, dtype=torch.float32)
         v_coupled_lo = couple_splat_velocity_prior(
             v_dit=v_dit_ones,
@@ -1725,6 +2329,21 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             and abs(float(sig_rel_probe[0, 0, 0, 3].item()) - 0.50) < 1e-6,
             f"Gate 5.D Differential Diffusion temporal release gate failed continuous feather horizon mapping: {g_vals.tolist()}",
         )
+        hi_horizon_probe = torch.tensor(
+            [[[[0.25, 0.985]]]], device=dev, dtype=torch.float32
+        )
+        fg_gate_step0, sig_rel_step0 = compute_differential_inpaint_gate(
+            inpaint_mask=torch.ones_like(hi_horizon_probe),
+            next_sigma=0.9737,
+            sigma_0=1.0,
+            box_horizon_map=hi_horizon_probe,
+        )
+        _assert(
+            float(fg_gate_step0[0, 0, 0, 0].item()) == 0.0
+            and float(fg_gate_step0[0, 0, 0, 1].item()) == 1.0
+            and abs(float(sig_rel_step0[0, 0, 0, 1].item()) - 1.0) < 1e-6,
+            f"Hermite high-horizon release snap failed to unlock foreground synthesis on Step 0: gate={fg_gate_step0.tolist()}",
+        )
 
         loop_noise = philox_randn((1, 128, 32, 32), seed=303, stream_id=3, device=dev)
         text_target_gauss = philox_randn(
@@ -1765,6 +2384,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         assert loop_inpaint_mask is not None
         loop_dn_warped = warp_denoise_to_sigma_horizon(loop_dn, shift=5.0)
         assert isinstance(loop_dn_warped, torch.Tensor)
+
         loop_sched = BifurcatedFlowMatchScheduler(
             early_solver="heun",
             late_solver="ipndm",
@@ -1775,6 +2395,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         loop_sched.set_timesteps(12, device=dev)
         s0_loop = float(loop_sched.sigmas[0].item())
         lat_loop = (1.0 - s0_loop) * loop_can + s0_loop * loop_noise
+
         for p_idx, t_loop in enumerate(loop_sched.timesteps):
             cfg_l = loop_sched._step_configs[p_idx]
             s_eval = float(t_loop.item()) / float(loop_sched.num_train_timesteps)
@@ -1808,6 +2429,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
                 bool(torch.isfinite(lat_loop).all().item()),
                 f"Gate 5.D Non-finite latent state encountered at pass {p_idx}",
             )
+
         final_cell_rms = torch.sqrt(torch.mean(lat_loop[0] * lat_loop[0], dim=0))
         ext_rms = float(final_cell_rms[:2, :2].mean().item())
         box_int_rms = float(final_cell_rms[6:10, 6:10].mean().item())
@@ -1848,7 +2470,6 @@ def gate_5_refinery_schema_and_snapshots() -> None:
             req.effective_reference_isolated_kv is True,
             f"edit_format={fmt} must enable reference_isolated_kv",
         )
-
     req_ait = GenerationRequest(prompt="test", edit_format="ai_toolkit_isolated")
     _assert(
         req_ait.effective_uncond_uses_references is False,
@@ -1862,7 +2483,7 @@ def gate_5_refinery_schema_and_snapshots() -> None:
         "Explicit uncond_uses_references=True override was not respected",
     )
     print(
-        f"  [+] Spatio-Visual Graph      : PorterDuffOcclusion + NonTransitiveIsoKV + BN128SubPhase (err={bn_aware_err:.1e}) + ClosedLoopRMS (rim={rim_loop_rms:.3f}, txt={carved_txt_rms:.3f}) Verified"
+        f"  [+] Spatio-Visual Graph      : PorterDuff + C1TukeyDome + OracleStage3BVP (fg_mae={fg_mae_hi:.3f}) + ClosedLoopRMS (rim={rim_loop_rms:.3f}) Verified"
     )
 
     eng = MOSSImageEngine(device=dev, prefer_vulkan=True)

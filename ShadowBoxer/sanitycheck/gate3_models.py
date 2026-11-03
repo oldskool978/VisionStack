@@ -151,7 +151,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and len(dit._time_mod_cache) == cache_len_before,
             "View-slice device tensor timestep failed to hit _time_mod_cache",
         )
-
         lat = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
         lat2 = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
         ref1 = torch.randn((1, 128, 8, 8), device=dev, dtype=torch.float32)
@@ -175,7 +174,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             == 0.0,
             "_RoPE.get_text_rope diverged from get_expanded_rope text slice",
         )
-
         phase_l16 = dit.rope._compute_phase(
             8, 8, 16, dev, ref_shapes=[(8, 8), (6, 6)]
         )
@@ -199,6 +197,96 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             float((rot_3d - rot_4d).abs().max().item()) == 0.0,
             "Pre-expanded 4D RoPE diverged from 3D RoPE",
         )
+
+        phase_hom = dit.rope._compute_phase(
+            64,
+            64,
+            16,
+            dev,
+            ref_shapes=[(64, 64), (48, 48), (32, 32), (13, 37)],
+            ref_bboxes=[None, None, None, (0.125, 0.25, 0.625, 0.875)],
+        )
+        tgt_yx = phase_hom[:4096, 2:4, 0].view(64, 64, 2)
+        r64_yx = phase_hom[4096:8192, 2:4, 0].view(64, 64, 2)
+        r48_yx = phase_hom[8192:10496, 2:4, 0].view(48, 48, 2)
+        r32_yx = phase_hom[10496:11520, 2:4, 0].view(32, 32, 2)
+        r_prime_yx = phase_hom[11520:12001, 2:4, 0].view(13, 37, 2)
+
+        _assert(
+            float((r64_yx - tgt_yx).abs().max().item()) == 0.0,
+            "Unboxed 1:1 (64, 64) reference RoPE coordinates must match target lattice bit-for-bit",
+        )
+        tgt_blocks_4x4 = tgt_yx.view(16, 4, 16, 4, 2).mean(dim=(1, 3))
+        r48_blocks_3x3 = r48_yx.view(16, 3, 16, 3, 2).mean(dim=(1, 3))
+        colloc_48_err = float((r48_blocks_3x3 - tgt_blocks_4x4).abs().max().item())
+        _assert(
+            colloc_48_err < 1e-5
+            and abs(float(r48_yx[..., 0].min().item()) - (-31.333333)) < 1e-4
+            and abs(float(r48_yx[..., 0].max().item()) - 31.333333) < 1e-4,
+            f"Unboxed (48, 48) -> (64, 64) rational 3x3<->4x4 block collocation failed: err={colloc_48_err}",
+        )
+        tgt_blocks_2x2 = tgt_yx.view(32, 2, 32, 2, 2).mean(dim=(1, 3))
+        colloc_32_err = float((r32_yx - tgt_blocks_2x2).abs().max().item())
+        _assert(
+            colloc_32_err < 1e-5
+            and abs(float(r32_yx[..., 0].min().item()) - (-31.0)) < 1e-5
+            and abs(float(r32_yx[..., 0].max().item()) - 31.0) < 1e-5,
+            f"Unboxed (32, 32) -> (64, 64) diadic 1x1<->2x2 block collocation failed: err={colloc_32_err}",
+        )
+        tgt_subbox_centroid = tgt_yx[8:40, 16:56, :].mean(dim=(0, 1))
+        prime_box_centroid = r_prime_yx.mean(dim=(0, 1))
+        bary_prime_err = float(
+            (prime_box_centroid - tgt_subbox_centroid).abs().max().item()
+        )
+        _assert(
+            bary_prime_err < 1e-5,
+            f"Prime-grid (13, 37) boxed reference violated barycentric zero-moment collocation: err={bary_prime_err}",
+        )
+
+        so2_coords = phase_hom[:256, :, 0].clone()
+        shift_vec = torch.tensor([[3.0, -7.0, 11.25, -4.75]], device=dev, dtype=torch.float32)
+        phase_unshifted = so2_coords.unsqueeze(-1) * dit.rope.bands
+        phase_shifted = (so2_coords + shift_vec).unsqueeze(-1) * dit.rope.bands
+        rope_unshifted = torch.cat(
+            (phase_unshifted.sin(), phase_unshifted.cos()), dim=-2
+        ).flatten(-2).unsqueeze(0)
+        rope_shifted = torch.cat(
+            (phase_shifted.sin(), phase_shifted.cos()), dim=-2
+        ).flatten(-2).unsqueeze(0)
+        unit_mod_err = float(
+            (
+                (phase_shifted.sin().square() + phase_shifted.cos().square()) - 1.0
+            ).abs().max().item()
+        )
+        q_so2 = torch.randn((1, 256, 8, 32), device=dev, dtype=torch.float32)
+        k_so2 = torch.randn((1, 256, 8, 32), device=dev, dtype=torch.float32)
+        q_rot_0 = _rotate(q_so2, rope_unshifted).transpose(1, 2)
+        k_rot_0 = _rotate(k_so2, rope_unshifted).transpose(1, 2)
+        q_rot_s = _rotate(q_so2, rope_shifted).transpose(1, 2)
+        k_rot_s = _rotate(k_so2, rope_shifted).transpose(1, 2)
+        gram_0 = q_rot_0 @ k_rot_0.transpose(-1, -2)
+        gram_s = q_rot_s @ k_rot_s.transpose(-1, -2)
+        so2_shift_err = float((gram_0 - gram_s).abs().max().item())
+        _assert(
+            unit_mod_err < 1e-6 and so2_shift_err < 1e-4,
+            f"4D-RoPE SO(2) unit-modulus or shift-equivariance violated: mod_err={unit_mod_err}, shift_err={so2_shift_err}",
+        )
+
+        for ch_test, cw_test in ((48, 64), (64, 48)):
+            p_edge = dit.rope._compute_phase(
+                ch_test,
+                cw_test,
+                8,
+                dev,
+                ref_shapes=[(1, 1), (13, 37), (48, 32)],
+                ref_bboxes=[None, None, (0.0, 0.0, 0.5, 0.5)],
+            )
+            _assert(
+                bool(torch.isfinite(p_edge).all().item())
+                and abs(float(p_edge[ch_test * cw_test, 2, 0].item())) < 1e-6
+                and abs(float(p_edge[ch_test * cw_test, 3, 0].item())) < 1e-6,
+                f"Adversarial (1, 1) singleton or prime reference RoPE failed on {ch_test}x{cw_test} canvas",
+            )
 
         t_tok = 64
         r1_tok = 64
@@ -334,6 +422,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             float(bias_active[0, 0, :, t_tok + r1_tok :].abs().max().item()) == 0.0,
             "Unisolated Ref 2 and Text tokens must remain completely unattenuated (0.0)",
         )
+
         bias_kronecker = dit._get_box_aperture_bias(
             height=8,
             width=8,
@@ -395,6 +484,40 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             "Co-located multi-role cooperation or z_order hierarchy failed in _get_box_aperture_bias",
         )
 
+        bias_sem_tie = dit._get_box_aperture_bias(
+            height=8,
+            width=8,
+            ref_token_lengths=[16, 16],
+            text_tokens=16,
+            ref_shapes=[(4, 4), (4, 4)],
+            ref_bboxes=coloc_boxes,
+            reference_box_isolation=[0.85, 0.85],
+            feather_radius_lat=1.0,
+            device=dev,
+            dtype=torch.float32,
+            reference_roles=["photo_ref", "photo_ref"],
+            reference_z_orders=[2.0, 2.0],
+            reference_labels=["object", "character"],
+        )
+        obj_coplanar_logit = (
+            float(bias_sem_tie[0, 0, coloc_q_idx, t_tok + 2].item())
+            if bias_sem_tie is not None
+            else 0.0
+        )
+        char_coplanar_logit = (
+            float(bias_sem_tie[0, 0, coloc_q_idx, t_tok + 16 + 2].item())
+            if bias_sem_tie is not None
+            else 0.0
+        )
+        expected_sem_gap = 0.85 * 0.35
+        _assert(
+            bias_sem_tie is not None
+            and char_coplanar_logit > obj_coplanar_logit
+            and abs((char_coplanar_logit - obj_coplanar_logit) - expected_sem_gap)
+            < 1e-4,
+            f"Co-planar semantic priority (gamma_sem=0.35) failed to favor 'character' over 'object' by {expected_sem_gap}: got {char_coplanar_logit - obj_coplanar_logit}",
+        )
+
         parent_boxes = [(0.125, 0.125, 0.875, 0.875), (0.125, 0.125, 0.875, 0.875)]
         carve_spec = [((0.25, 0.25, 0.625, 0.625), 0.90, 5.0)]
         bias_carved = dit._get_box_aperture_bias(
@@ -425,6 +548,76 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and float(bias_carved[0, 0, :, t_tok + 72 :].abs().max().item()) == 0.0,
             "Gate 3.D Foreground child-aperture carve-out failed to attenuate parent photo_ref/depth_map KV inside text box",
         )
+
+        bias_char_ellip = dit._get_box_aperture_bias(
+            height=8,
+            width=8,
+            ref_token_lengths=[36],
+            text_tokens=16,
+            ref_shapes=[(6, 6)],
+            ref_bboxes=[(0.125, 0.125, 0.875, 0.875)],
+            reference_box_isolation=[0.85],
+            feather_radius_lat=0.0,
+            device=dev,
+            dtype=torch.float32,
+            reference_roles=["photo_ref"],
+            reference_z_orders=[1.0],
+            foreground_carveouts=[
+                ((0.25, 0.25, 0.75, 0.75), 0.55, 5.0, "character")
+            ],
+        )
+        bias_text_rect = dit._get_box_aperture_bias(
+            height=8,
+            width=8,
+            ref_token_lengths=[36],
+            text_tokens=16,
+            ref_shapes=[(6, 6)],
+            ref_bboxes=[(0.125, 0.125, 0.875, 0.875)],
+            reference_box_isolation=[0.85],
+            feather_radius_lat=0.0,
+            device=dev,
+            dtype=torch.float32,
+            reference_roles=["photo_ref"],
+            reference_z_orders=[1.0],
+            foreground_carveouts=[
+                ((0.25, 0.25, 0.75, 0.75), 0.85, 5.0, "text")
+            ],
+        )
+        char_core_q = 3 * 8 + 3
+        char_mid_q = 2 * 8 + 3
+        char_corner_q = 2 * 8 + 2
+        rho_mid = math.hypot(-0.75, -0.25)
+        tau_mid = max(0.0, min(1.0, (rho_mid - 0.45) / (1.05 - 0.45)))
+        expected_mid_env = 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * tau_mid))
+        expected_mid_bias = -20.0 * 0.55 * expected_mid_env
+        expected_corner_bias = -20.0 * 0.55 * 0.15
+        _assert(
+            bias_char_ellip is not None
+            and bias_text_rect is not None
+            and abs(float(bias_char_ellip[0, 0, char_core_q, t_tok + 2].item()) - (-11.0))
+            < 1e-4
+            and abs(
+                float(bias_char_ellip[0, 0, char_mid_q, t_tok + 2].item())
+                - expected_mid_bias
+            )
+            < 1e-4
+            and abs(
+                float(bias_char_ellip[0, 0, char_corner_q, t_tok + 2].item())
+                - expected_corner_bias
+            )
+            < 1e-4
+            and float(bias_char_ellip[0, 0, char_corner_q, t_tok + 2].item())
+            > float(bias_char_ellip[0, 0, char_mid_q, t_tok + 2].item())
+            > float(bias_char_ellip[0, 0, char_core_q, t_tok + 2].item())
+            and abs(float(bias_text_rect[0, 0, char_core_q, t_tok + 2].item()) - (-17.0))
+            < 1e-4
+            and abs(
+                float(bias_text_rect[0, 0, char_corner_q, t_tok + 2].item()) - (-17.0)
+            )
+            < 1e-4,
+            "C1 Tukey-Hann radial dome carve-out for 'character' vs rectangular carve-out for 'text' failed",
+        )
+
         bias_global_carved = dit._get_box_aperture_bias(
             height=8,
             width=8,
@@ -564,7 +757,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
         _assert(
             out1.shape == (1, 128, 8, 8), f"Unexpected DiT output shape: {out1.shape}"
         )
-
         out1_second = dit(
             lat2,
             t_step_1,
@@ -592,7 +784,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             b2_diff <= 0.03125 and b2_mae < 1e-3,
             f"Homogeneous B=2 vectorized DiT batch diverged from B=1 execution: max={b2_diff}, mae={b2_mae}",
         )
-
         mask_het = torch.ones((2, 16), device=dev, dtype=torch.bool)
         mask_het[1, 11:] = False
         out_het_1 = dit(
@@ -622,7 +813,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             het_diff == 0.0,
             f"Gate 3.C Heterogeneous B=2 DiT batch diverged from individual B=1 passes: max_diff={het_diff}",
         )
-
         out_box_iso = dit(
             lat,
             t_step_1,
@@ -637,6 +827,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             reference_masks=[cutout_mask, None],
             reference_roles=["photo_ref", "depth_map"],
             reference_z_orders=[1.0, 2.0],
+            reference_labels=["object", "character"],
         ).sample
         out_box_carved = dit(
             lat,
@@ -653,6 +844,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             reference_roles=["photo_ref", "depth_map"],
             reference_z_orders=[1.0, 2.0],
             foreground_carveouts=carve_spec,
+            reference_labels=["object", "character"],
         ).sample
         out_box_iso_non_isokv = dit(
             lat,
@@ -692,7 +884,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             len(dit._ref_proj_cache) == 2,
             "Reference latent projections were not cached",
         )
-
         txt_cache_len_before = len(dit._text_proj_cache)
         cached_txt_ptr = next(reversed(dit._text_proj_cache.values()))[2].data_ptr()
         txt_res_hit, _, _ = dit._get_or_compute_text_projection(
@@ -711,7 +902,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and len(dit._text_proj_cache) == txt_cache_len_before,
             "Tier-1A _TextProjection cache must be invariant to canvas resolution and ref_bboxes",
         )
-
         _ = dit(
             lat,
             t_step_1,
@@ -723,7 +913,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             reference_isolated_kv=True,
             reference_bboxes=ref_boxes,
         ).sample
-
         t_step_2 = torch.tensor([250.0], device=dev)
         _ = dit(
             lat,
@@ -756,7 +945,7 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             "clear_caches must flush _box_aperture_bias_cache",
         )
     print(
-        f"  [+] MOSSImageTransformer     : Meta-Init + InPlaceHotSwap + Tier1ATextRoPE + FgCarveOut4DRoPE + HetBatch (diff={het_diff:.1e}) + ModSeqBuf (0x{buf_ptr_2:X}) Verified"
+        f"  [+] MOSSImageTransformer     : 4DRoPEHomothety (colloc={colloc_48_err:.1e}, SO2={so2_shift_err:.1e}) + SemPriority + C1TukeyDome + HetBatch Verified"
     )
 
     orig_q_weight = dit.layers[0].proj["q"].weight.data.detach().float().clone()
@@ -906,7 +1095,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and float((v_sin[:, :8] - v_sin[:, 8:]).abs().max().item()) == 0.0,
             f"Gate 3.A Vision bilinear pos_embed or 2D axial RoPE failed: pe_err={pe_interp_err}",
         )
-
         g_thw_multi = torch.tensor([[1, 4, 4], [1, 4, 6]], dtype=torch.long, device=dev)
         pix_multi = torch.randn((40, 3, 2, 16, 16), device=dev, dtype=dtype)
         feat_splits = qwen.get_image_features(pix_multi, g_thw_multi)
@@ -916,7 +1104,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and feat_splits[1].shape == (6, 128),
             f"Multi-image cu_seqlens vision split failed: {[tuple(s.shape) for s in feat_splits]}",
         )
-
         ent_uniform = _shannon_entropy_bits(
             torch.zeros((1, 1024), device=dev, dtype=torch.float32)
         )
@@ -927,13 +1114,11 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             abs(ent_uniform - 10.0) < 1e-5 and abs(ent_dirac - 0.0) < 1e-6,
             f"_shannon_entropy_bits failed base-2 calibration: uniform={ent_uniform} (expected 10.0), dirac={ent_dirac} (expected 0.0)",
         )
-
         in_ids = torch.tensor(
             [[10, 20, 900, 900, 900, 900, 30, 40]], dtype=torch.long, device=dev
         )
         pix = torch.randn((16, 3, 2, 16, 16), device=dev, dtype=dtype)
         g_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=dev)
-
         vid_ids = torch.tensor(
             [[10, 901, 901, 901, 901, 25, 901, 901, 901, 901, 30]],
             dtype=torch.long,
@@ -958,7 +1143,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and int(q_vid_out.rope_deltas.item()) == -4,
             f"Video forward pass failed: shape={q_vid_out.last_hidden_state.shape}, delta={q_vid_out.rope_deltas}",
         )
-
         conv_x = torch.randn((1, 64, 16), device=dev, dtype=torch.float32)
         conv_w = torch.randn((64, 4), device=dev, dtype=torch.float32)
         conv_full, conv_final_full = _causal_conv1d_fn(
@@ -1255,7 +1439,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and spec_h_diff <= 0.03125,
             f"Dual-regime speculative decoding diverged from greedy decoding: hi={spec_ids_hi}, lo={spec_ids_lo}, greedy={greedy_ids}, h_diff={spec_h_diff}",
         )
-
         close_test_ids = [701, 702, 703]
         spec_closed_ids, spec_closed_hidden, spec_closed_cache = (
             qwen.reanchor_speculative_generate(
@@ -1327,7 +1510,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and isinstance(qwen_loaded.mtp, Qwen3_5MTPHead),
             "stream_safetensors_inplace failed to re-materialize lm_head and mtp when loading Domain 03 shards",
         )
-
     with torch.inference_mode():
         dummy_base_h = torch.randn((1, 1, 128), device=dev, dtype=dtype)
         dummy_retained = [
@@ -1363,7 +1545,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and shifted_mtp_cands[1][1][0] == 66,
             f"_propose_batched_shifted_mtp failed parallel shifted MTP drafting: base={base_mtp_cands}, shifted={shifted_mtp_cands}",
         )
-
         mtp_ids, mtp_hidden = qwen_d03.reanchor_speculative_generate(
             prompt_seq,
             max_new_tokens=6,
@@ -1390,7 +1571,6 @@ def gate_3_models_zero_alloc_and_lora() -> None:
             and qwen_d03.last_reanchor_telemetry.get("total_rounds", 0) >= 1,
             f"Domain 03 Qwen3_5MTPHead ReAnchor speculative decoding diverged from greedy target: mtp={mtp_ids}, loaded={loaded_ids}, greedy={greedy_ids}",
         )
-
         mm_greedy_cache = Qwen3_5HybridCache()
         mm_g_out = qwen(
             input_ids=in_ids,

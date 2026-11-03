@@ -1,4 +1,3 @@
-# ShadowBoxer/models/modeling_moss.py
 from __future__ import annotations
 
 from .moss import (
@@ -6,6 +5,7 @@ from .moss import (
     _FFN_TILE_TOKENS,
     _FP8_DTYPES,
     _HIERARCHICAL_AREA_GAMMA,
+    _HIERARCHICAL_SEMANTIC_GAMMA,
     _HIERARCHICAL_Z_GAMMA,
     _ISOKV_COLLAB_OVERLAP_MIN,
     CarveoutSpec,
@@ -35,11 +35,14 @@ from .moss import (
     _normalize_box_isolation,
     _normalize_foreground_carveouts,
     _normalize_ref_bboxes,
+    _normalize_ref_label,
+    _normalize_ref_labels,
     _normalize_ref_role_class,
     _normalize_ref_roles,
     _normalize_ref_z_orders,
     _resolve_compute_dtype,
     _rotate,
+    _semantic_label_rank,
     _situ,
     _situ_inplace,
     _slice_blhd_to_bhld,
@@ -53,6 +56,7 @@ __all__ = [
     "_BOX_ISOLATION_LOGIT_SCALE",
     "_HIERARCHICAL_AREA_GAMMA",
     "_HIERARCHICAL_Z_GAMMA",
+    "_HIERARCHICAL_SEMANTIC_GAMMA",
     "_ISOKV_COLLAB_OVERLAP_MIN",
     "CollabGroups",
     "IsoKVSpec",
@@ -69,6 +73,9 @@ __all__ = [
     "_situ",
     "_situ_inplace",
     "validate_skip_layers",
+    "_normalize_ref_label",
+    "_semantic_label_rank",
+    "_normalize_ref_labels",
     "_snap_box_to_latent_grid",
     "_normalize_ref_bboxes",
     "_normalize_foreground_carveouts",

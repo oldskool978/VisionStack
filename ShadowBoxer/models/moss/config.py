@@ -1,4 +1,3 @@
-# ShadowBoxer/models/moss/config.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ _FFN_TILE_TOKENS = 2048
 _BOX_ISOLATION_LOGIT_SCALE = -20.0
 _HIERARCHICAL_AREA_GAMMA = 4.0
 _HIERARCHICAL_Z_GAMMA = 2.5
+_HIERARCHICAL_SEMANTIC_GAMMA = 0.35
 _ISOKV_COLLAB_OVERLAP_MIN = 0.25
 
 CollabGroups = Tuple[Tuple[int, ...], ...]
@@ -34,8 +34,7 @@ IsoKVSpec = Union[
     Tuple[int, Tuple[int, ...], int, CollabGroups],
 ]
 NormBBox = Tuple[float, float, float, float]
-CarveoutSpec = Tuple[NormBBox, float, Optional[float]]
-
+CarveoutSpec = Tuple[NormBBox, float, Optional[float], str]
 ModTuple6 = Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -152,6 +151,7 @@ __all__ = [
     "_BOX_ISOLATION_LOGIT_SCALE",
     "_HIERARCHICAL_AREA_GAMMA",
     "_HIERARCHICAL_Z_GAMMA",
+    "_HIERARCHICAL_SEMANTIC_GAMMA",
     "_ISOKV_COLLAB_OVERLAP_MIN",
     "CollabGroups",
     "IsoKVSpec",

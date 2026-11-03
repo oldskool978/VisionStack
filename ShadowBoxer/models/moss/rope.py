@@ -77,6 +77,7 @@ class _RoPE(nn.Module):
         if cached is not None:
             self._text_rope_cache.move_to_end(cache_key)
             return cached
+
         if self.bands.dtype != torch.float32 or self.bands.device != device:
             self.bands = self._default_bands(device)
         text = torch.zeros(text_length, 4, device=device, dtype=torch.float32)
@@ -107,8 +108,10 @@ class _RoPE(nn.Module):
     ) -> torch.Tensor:
         if self.bands.dtype != torch.float32 or self.bands.device != device:
             self.bands = self._default_bands(device)
+
         cy = (height - 1) / 2.0
         cx = (width - 1) / 2.0
+
         h, w = torch.meshgrid(
             torch.arange(height, device=device),
             torch.arange(width, device=device),
@@ -123,8 +126,8 @@ class _RoPE(nn.Module):
         )
         image[:, 2] -= cy
         image[:, 3] -= cx
-        coord_parts = [image]
 
+        coord_parts = [image]
         if ref_shapes:
             norm_boxes = _normalize_ref_bboxes(
                 ref_shapes, ref_bboxes, height=height, width=width
@@ -138,59 +141,42 @@ class _RoPE(nn.Module):
                     x0 = max(0, min(width - 1, int(round(ux0 * width))))
                     y1 = max(y0 + 1, min(height, int(round(uy1 * height))))
                     x1 = max(x0 + 1, min(width, int(round(ux1 * width))))
-                    if rh == (y1 - y0) and rw == (x1 - x0):
-                        y_axis = (
-                            torch.arange(y0, y1, device=device, dtype=torch.float32)
-                            - cy
-                        )
-                        x_axis = (
-                            torch.arange(x0, x1, device=device, dtype=torch.float32)
-                            - cx
-                        )
-                    else:
-                        row_centers = (
-                            torch.arange(rh, device=device, dtype=torch.float32) + 0.5
-                        ) / float(max(1, rh))
-                        col_centers = (
-                            torch.arange(rw, device=device, dtype=torch.float32) + 0.5
-                        ) / float(max(1, rw))
-                        y_axis = (
-                            float(y0) + row_centers * float(y1 - y0)
-                        ) - 0.5 - cy
-                        x_axis = (
-                            float(x0) + col_centers * float(x1 - x0)
-                        ) - 0.5 - cx
-                    gh, gw = torch.meshgrid(y_axis, x_axis, indexing="ij")
-                    ref_coord = torch.stack(
-                        (
-                            torch.full_like(gh, float(r_idx)),
-                            torch.full_like(gh, float(text_length)),
-                            gh,
-                            gw,
-                        ),
-                        -1,
-                    ).flatten(0, 1)
                 else:
-                    gh, gw = torch.meshgrid(
-                        torch.arange(rh, device=device),
-                        torch.arange(rw, device=device),
-                        indexing="ij",
+                    y0, x0, y1, x1 = 0, 0, height, width
+
+                if rh == (y1 - y0) and rw == (x1 - x0):
+                    y_axis = (
+                        torch.arange(y0, y1, device=device, dtype=torch.float32)
+                        - cy
                     )
-                    ref_coord = (
-                        torch.stack(
-                            (
-                                torch.full_like(gh, r_idx),
-                                torch.full_like(gh, text_length),
-                                gh,
-                                gw,
-                            ),
-                            -1,
-                        )
-                        .flatten(0, 1)
-                        .float()
+                    x_axis = (
+                        torch.arange(x0, x1, device=device, dtype=torch.float32)
+                        - cx
                     )
-                    ref_coord[:, 2] -= (rh - 1) / 2.0
-                    ref_coord[:, 3] -= (rw - 1) / 2.0
+                else:
+                    row_centers = (
+                        torch.arange(rh, device=device, dtype=torch.float32) + 0.5
+                    ) / float(max(1, rh))
+                    col_centers = (
+                        torch.arange(rw, device=device, dtype=torch.float32) + 0.5
+                    ) / float(max(1, rw))
+                    y_axis = (
+                        float(y0) + row_centers * float(y1 - y0)
+                    ) - 0.5 - cy
+                    x_axis = (
+                        float(x0) + col_centers * float(x1 - x0)
+                    ) - 0.5 - cx
+
+                gh, gw = torch.meshgrid(y_axis, x_axis, indexing="ij")
+                ref_coord = torch.stack(
+                    (
+                        torch.full_like(gh, float(r_idx)),
+                        torch.full_like(gh, float(text_length)),
+                        gh,
+                        gw,
+                    ),
+                    -1,
+                ).flatten(0, 1)
                 coord_parts.append(ref_coord)
 
         text = torch.zeros(text_length, 4, device=device, dtype=torch.float32)
@@ -227,9 +213,11 @@ class _RoPE(nn.Module):
             torch.cat((-sin_half, sin_half), dim=-1)[None, :, None, :].contiguous()
         )
         cos_full = torch.cat((cos_half, cos_half), dim=-1)[None, :, None, :].contiguous()
+
         total_img_tokens = sin_signed.shape[1] - text_length
         sin_text = sin_signed[:, total_img_tokens:, :, :]
         cos_text = cos_full[:, total_img_tokens:, :, :]
+
         text_key = (int(text_length), str(device), dtype)
         if text_key not in self._text_rope_cache:
             self._text_rope_cache[text_key] = (
@@ -238,6 +226,7 @@ class _RoPE(nn.Module):
             )
             while len(self._text_rope_cache) > 16:
                 self._text_rope_cache.popitem(last=False)
+
         pair = ((sin_signed, cos_full), (sin_text, cos_text))
         self._expanded_cache[cache_key] = pair
         while len(self._expanded_cache) > 16:

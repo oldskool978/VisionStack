@@ -1,4 +1,3 @@
-# ShadowBoxer/models/moss/model.py
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -29,6 +28,7 @@ from .geometry import (
     _normalize_box_isolation,
     _normalize_foreground_carveouts,
     _normalize_ref_bboxes,
+    _normalize_ref_labels,
     _normalize_ref_roles,
     _normalize_ref_z_orders,
 )
@@ -62,6 +62,7 @@ class MOSSImageTransformer(nn.Module):
             freq_dim = config.freq_dim
             latent_channels = config.latent_channels
             rope_base = config.rope_base
+
         if dim % num_heads or (dim // num_heads) % 8 or freq_dim % 2:
             raise ValueError(
                 "Require dim divisible by heads, head_dim divisible by 8, and even freq_dim."
@@ -77,6 +78,7 @@ class MOSSImageTransformer(nn.Module):
             latent_channels=latent_channels,
             rope_base=rope_base,
         )
+
         self.video_embedder = nn.Linear(latent_channels, dim)
         self.text_embedder = _TextProjection(text_dim, dim, ffn_dim, num_heads)
         self.rope = _RoPE(dim // num_heads, rope_base)
@@ -339,21 +341,17 @@ class MOSSImageTransformer(nn.Module):
         eff_batch = 1 if single_time else batch
         if not single_time and times.numel() != batch:
             times = times.expand(batch)
-
         freq = self._get_time_freq(device)
         phase = times.double()[:, None] * freq
         embedding = torch.cat((phase.cos(), phase.sin()), -1).to(w_dtype)
-
         h_time = F.silu(_linear(self.time_embedding[0], embedding))
         time_vec = _linear(self.time_embedding[2], h_time).float()
-
         mod_in = time_vec.to(
             _resolve_compute_dtype(self.shared_block_modulation.weight, w_dtype)
         )
         head_in = time_vec.to(
             _resolve_compute_dtype(self.video_head_modulation.weight, w_dtype)
         )
-
         mod = _linear(self.shared_block_modulation, mod_in).view(eff_batch, 6, -1)
         head = (
             _linear(self.video_head_modulation, head_in)
@@ -576,6 +574,7 @@ class MOSSImageTransformer(nn.Module):
         reference_roles: Optional[Sequence[Optional[str]]] = None,
         reference_z_orders: Optional[Sequence[Optional[float]]] = None,
         foreground_carveouts: Optional[Sequence[Any]] = None,
+        reference_labels: Optional[Sequence[Optional[str]]] = None,
     ) -> Optional[torch.Tensor]:
         norm_boxes = _normalize_ref_bboxes(
             ref_shapes, ref_bboxes, height=height, width=width
@@ -590,6 +589,7 @@ class MOSSImageTransformer(nn.Module):
         num_refs = len(ref_token_lengths)
         role_tuple = _normalize_ref_roles(num_refs, reference_roles)
         z_order_tuple = _normalize_ref_z_orders(num_refs, reference_z_orders)
+        label_tuple = _normalize_ref_labels(num_refs, reference_labels)
 
         mask_key: Tuple[Any, ...] = ()
         mask_refs: Tuple[Optional[torch.Tensor], ...] = ()
@@ -617,6 +617,7 @@ class MOSSImageTransformer(nn.Module):
             iso_tuple,
             role_tuple,
             z_order_tuple,
+            label_tuple,
             carveout_tuple,
             round(float(feather_radius_lat), 4),
             mask_key,
@@ -649,6 +650,7 @@ class MOSSImageTransformer(nn.Module):
             role_tuple=role_tuple,
             z_order_tuple=z_order_tuple,
             carveout_tuple=carveout_tuple,
+            label_tuple=label_tuple,
         )
         self._box_aperture_bias_cache[key] = bias
         self._box_aperture_mask_refs[key] = mask_refs
@@ -675,6 +677,7 @@ class MOSSImageTransformer(nn.Module):
         reference_roles: Optional[Sequence[Optional[str]]] = None,
         reference_z_orders: Optional[Sequence[Optional[float]]] = None,
         foreground_carveouts: Optional[Sequence[Any]] = None,
+        reference_labels: Optional[Sequence[Optional[str]]] = None,
     ) -> Union[TransformerOutput, Tuple[torch.Tensor, ...]]:
         skip_set = validate_skip_layers(skip_layers, len(self.layers))
         if (
@@ -688,11 +691,12 @@ class MOSSImageTransformer(nn.Module):
             or encoder_hidden_states.shape[0] != batch
         ):
             raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
-        mask = encoder_attention_mask
 
+        mask = encoder_attention_mask
         mod, head = self._compute_time_modulation(
             timestep, batch, hidden_states.device
         )
+
         mod_zero: Optional[torch.Tensor] = None
         if reference_latents and reference_zero_timestep:
             mod_zero = self._get_cached_zero_modulation(hidden_states.device)
@@ -737,7 +741,6 @@ class MOSSImageTransformer(nn.Module):
                 need_full_rope=True,
             )
             assert full_rope_4d is not None
-
             if batch == 1:
                 text = text_0
             else:
@@ -875,6 +878,7 @@ class MOSSImageTransformer(nn.Module):
                     reference_roles=reference_roles,
                     reference_z_orders=reference_z_orders,
                     foreground_carveouts=foreground_carveouts,
+                    reference_labels=reference_labels,
                 )
 
             for layer_index, layer in enumerate(self.layers):
@@ -1013,6 +1017,7 @@ class MOSSImageTransformer(nn.Module):
                     reference_roles=reference_roles,
                     reference_z_orders=reference_z_orders,
                     foreground_carveouts=foreground_carveouts,
+                    reference_labels=reference_labels,
                 )
 
             for layer_index, layer in enumerate(self.layers):

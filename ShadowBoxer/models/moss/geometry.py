@@ -1,4 +1,3 @@
-# ShadowBoxer/models/moss/geometry.py
 from __future__ import annotations
 
 import math
@@ -10,12 +9,108 @@ from torch.nn import functional as F
 from .config import (
     _BOX_ISOLATION_LOGIT_SCALE,
     _HIERARCHICAL_AREA_GAMMA,
+    _HIERARCHICAL_SEMANTIC_GAMMA,
     _HIERARCHICAL_Z_GAMMA,
     _ISOKV_COLLAB_OVERLAP_MIN,
     CarveoutSpec,
     CollabGroups,
     NormBBox,
 )
+
+_CHARACTER_LABELS = {
+    "character",
+    "person",
+    "people",
+    "human",
+    "portrait",
+    "face",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "child",
+    "subject",
+    "figure",
+    "actor",
+    "model",
+    "hero",
+}
+
+_TEXT_LABELS = {
+    "text",
+    "typography",
+    "caption",
+    "title",
+    "sign",
+    "label",
+    "lettering",
+}
+
+_CHAR_DOME_R0 = 0.45
+_CHAR_DOME_R1 = 1.05
+_CHAR_DOME_EDGE_FLOOR = 0.15
+
+_CHAR_WIDE_DOME_R0 = 0.88
+_CHAR_WIDE_DOME_R1 = 1.18
+_CHAR_WIDE_DOME_EDGE_FLOOR = 0.82
+
+
+def _normalize_ref_label(label: Optional[str]) -> str:
+    s = str(label or "object").strip().lower()
+    if s in _TEXT_LABELS:
+        return "text"
+    if s in _CHARACTER_LABELS:
+        return "character"
+    return "object"
+
+
+def _semantic_label_rank(label: Optional[str]) -> float:
+    norm = _normalize_ref_label(label)
+    if norm == "text":
+        return 2.0
+    if norm == "character":
+        return 1.0
+    return 0.0
+
+
+def _normalize_ref_labels(
+    num_refs: int,
+    reference_labels: Optional[Sequence[Optional[str]]],
+) -> Tuple[str, ...]:
+    if num_refs <= 0:
+        return ()
+    if not reference_labels:
+        return tuple("object" for _ in range(num_refs))
+    out: List[str] = []
+    for idx in range(num_refs):
+        raw = reference_labels[idx] if idx < len(reference_labels) else None
+        out.append(_normalize_ref_label(raw))
+    return tuple(out)
+
+
+def _evaluate_character_tukey_dome(
+    yy: torch.Tensor,
+    xx: torch.Tensor,
+    y0_int: int,
+    x0_int: int,
+    y1_int: int,
+    x1_int: int,
+    wide_aperture: bool = False,
+) -> torch.Tensor:
+    r0 = _CHAR_WIDE_DOME_R0 if wide_aperture else _CHAR_DOME_R0
+    r1 = _CHAR_WIDE_DOME_R1 if wide_aperture else _CHAR_DOME_R1
+    edge_floor = (
+        _CHAR_WIDE_DOME_EDGE_FLOOR if wide_aperture else _CHAR_DOME_EDGE_FLOOR
+    )
+    cy_mid = 0.5 * float(y0_int + y1_int)
+    cx_mid = 0.5 * float(x0_int + x1_int)
+    ry = max(0.5, 0.5 * float(y1_int - y0_int))
+    rx = max(0.5, 0.5 * float(x1_int - x0_int))
+    rho = torch.hypot((yy - cy_mid) / ry, (xx - cx_mid) / rx)
+    tau = ((rho - r0) / (r1 - r0)).clamp(0.0, 1.0)
+    return edge_floor + (1.0 - edge_floor) * 0.5 * (
+        1.0 + torch.cos(math.pi * tau)
+    )
 
 
 def _snap_box_to_latent_grid(
@@ -88,6 +183,7 @@ def _normalize_foreground_carveouts(
         raw_box: Any = None
         strength: float = 1.0
         z_order: Optional[float] = None
+        c_label: str = "text"
         if isinstance(item, dict):
             raw_box = item.get("bbox")
             raw_s = (
@@ -100,6 +196,10 @@ def _normalize_foreground_carveouts(
             )
             raw_z = item.get("z_order")
             z_order = round(float(raw_z), 4) if raw_z is not None else None
+            if item.get("label") is not None or item.get("category") is not None:
+                c_label = _normalize_ref_label(
+                    item.get("label") or item.get("category")
+                )
         elif isinstance(item, (list, tuple)):
             if len(item) == 4 and all(isinstance(x, (int, float)) for x in item):
                 raw_box = item
@@ -109,6 +209,8 @@ def _normalize_foreground_carveouts(
                     strength = max(0.0, min(1.0, float(item[1])))
                 if len(item) >= 3 and item[2] is not None:
                     z_order = round(float(item[2]), 4)
+                if len(item) >= 4 and item[3] is not None:
+                    c_label = _normalize_ref_label(str(item[3]))
         if (
             raw_box is None
             or not isinstance(raw_box, (list, tuple))
@@ -124,7 +226,7 @@ def _normalize_foreground_carveouts(
             (y0, x0, y1, x1), height=height, width=width
         )
         if snapped is not None:
-            out.append((snapped, round(strength, 6), z_order))
+            out.append((snapped, round(strength, 6), z_order, c_label))
     return tuple(out)
 
 
@@ -293,7 +395,8 @@ def _build_box_aperture_bias(
     reference_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
     role_tuple: Optional[Tuple[str, ...]] = None,
     z_order_tuple: Optional[Tuple[float, ...]] = None,
-    carveout_tuple: Optional[Tuple[CarveoutSpec, ...]] = None,
+    carveout_tuple: Optional[Tuple[Any, ...]] = None,
+    label_tuple: Optional[Tuple[str, ...]] = None,
 ) -> torch.Tensor:
     target_tokens = height * width
     total_ref = sum(ref_token_lengths)
@@ -301,6 +404,7 @@ def _build_box_aperture_bias(
     bias = torch.zeros(
         (1, 1, target_tokens, total_seq), dtype=dtype, device=device
     )
+
     yy = torch.arange(height, device=device, dtype=torch.float32).unsqueeze(1) + 0.5
     xx = torch.arange(width, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
     y_idx_grid = torch.arange(height, device=device, dtype=torch.long)
@@ -308,10 +412,18 @@ def _build_box_aperture_bias(
     raw_feather = max(0.0, float(feather_radius_lat))
 
     precomputed_carveouts: List[
-        Tuple[NormBBox, float, float, Optional[float], torch.Tensor]
+        Tuple[NormBBox, float, float, Optional[float], str, torch.Tensor]
     ] = []
     if carveout_tuple:
-        for c_box, c_strength, c_z in carveout_tuple:
+        for c_entry in carveout_tuple:
+            c_box = c_entry[0]
+            c_strength = float(c_entry[1])
+            c_z = c_entry[2] if len(c_entry) > 2 else None
+            c_label = (
+                _normalize_ref_label(c_entry[3])
+                if len(c_entry) > 3 and c_entry[3] is not None
+                else "text"
+            )
             cy0, cx0, cy1, cx1 = c_box
             cy0_int = max(0, min(height - 1, int(round(cy0 * height))))
             cx0_int = max(0, min(width - 1, int(round(cx0 * width))))
@@ -338,9 +450,7 @@ def _build_box_aperture_bias(
                 else 0.0
             )
             if c_feather <= 1e-4:
-                w_c = (c_dist <= 1e-5).to(dtype=torch.float32) * float(
-                    c_strength
-                )
+                w_c = (c_dist <= 1e-5).to(dtype=torch.float32) * c_strength
             else:
                 w_c = (
                     0.5
@@ -350,10 +460,21 @@ def _build_box_aperture_bias(
                             math.pi * (c_dist / c_feather).clamp(0.0, 1.0)
                         )
                     )
-                    * float(c_strength)
+                    * c_strength
                 )
+            if c_label == "character":
+                core_env = _evaluate_character_tukey_dome(
+                    yy,
+                    xx,
+                    cy0_int,
+                    cx0_int,
+                    cy1_int,
+                    cx1_int,
+                    wide_aperture=(c_strength >= 0.80),
+                )
+                w_c = w_c * core_env
             precomputed_carveouts.append(
-                (c_box, c_area, float(c_strength), c_z, w_c)
+                (c_box, c_area, c_strength, c_z, c_label, w_c)
             )
 
     class_z_vals: Dict[str, List[float]] = {}
@@ -392,6 +513,7 @@ def _build_box_aperture_bias(
             float,
             float,
             str,
+            str,
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
@@ -406,6 +528,11 @@ def _build_box_aperture_bias(
             float(z_order_tuple[r_idx])
             if (z_order_tuple is not None and r_idx < len(z_order_tuple))
             else 0.0
+        )
+        r_label = (
+            _normalize_ref_label(label_tuple[r_idx])
+            if (label_tuple is not None and r_idx < len(label_tuple))
+            else "object"
         )
         if r_box is not None:
             uy0, ux0, uy1, ux1 = r_box
@@ -450,11 +577,12 @@ def _build_box_aperture_bias(
                 else "photo_ref"
             )
             z_mean = class_z_mean.get(r_class, 0.0)
+            sem_rank = _semantic_label_rank(r_label)
             priority = math.exp(
                 _HIERARCHICAL_AREA_GAMMA * (1.0 - area)
                 + _HIERARCHICAL_Z_GAMMA * math.tanh((z_val - z_mean) / 4.0)
+                + _HIERARCHICAL_SEMANTIC_GAMMA * sem_rank
             )
-
             box_iso = (
                 float(iso_val)
                 if (r_box is not None and iso_val > 1e-6)
@@ -486,7 +614,6 @@ def _build_box_aperture_bias(
                 box_iso,
                 max((c[2] for c in applicable_carveouts), default=0.0),
             )
-
             key_atten: Optional[torch.Tensor] = None
             raw_rmask = (
                 reference_masks[r_idx]
@@ -542,7 +669,7 @@ def _build_box_aperture_bias(
             supp_box = box_iso * (1.0 - w_box_sil)
             supp_carve = torch.zeros_like(w_box_sil)
             w_inside = w_box_sil
-            for _, _, _, _, w_c in applicable_carveouts:
+            for _, _, _, _, _, w_c in applicable_carveouts:
                 supp_carve = torch.maximum(supp_carve, w_c)
                 w_inside = w_inside * (1.0 - w_c).clamp(0.0, 1.0)
 
@@ -558,6 +685,7 @@ def _build_box_aperture_bias(
                     float(max_eff_iso),
                     priority,
                     r_class,
+                    r_label,
                     w_box_sil,
                     w_inside,
                     torch.maximum(supp_box, supp_carve),
@@ -595,6 +723,7 @@ def _build_box_aperture_bias(
         prio_i,
         r_class_i,
         _,
+        _,
         w_inside_i,
         supp_query_i,
         key_atten_i,
@@ -614,6 +743,7 @@ def _build_box_aperture_bias(
                 _,
                 _,
                 r_class_j,
+                _,
                 w_box_sil_j,
                 _,
                 _,
@@ -736,6 +866,10 @@ def _build_box_aperture_bias(
 
 
 __all__ = [
+    "_normalize_ref_label",
+    "_semantic_label_rank",
+    "_normalize_ref_labels",
+    "_evaluate_character_tukey_dome",
     "_snap_box_to_latent_grid",
     "_normalize_ref_bboxes",
     "_normalize_foreground_carveouts",

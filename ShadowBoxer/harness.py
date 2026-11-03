@@ -27,6 +27,7 @@ from schema import (
     DEFAULT_PRESET_FILENAME,
     GenerationRequest,
     GenerationResponse,
+    SUPPORTED_BOX_LABELS,
     SUPPORTED_EDIT_FORMATS,
     SUPPORTED_FRAMING_MODES,
     SUPPORTED_INPUT_ROLES,
@@ -45,6 +46,7 @@ ARTIFACTS_DIR = ROOT_DIR / "artifacts"
 TEST_INPUTS_DIR = ARTIFACTS_DIR / "test_inputs"
 PERMUTATIONS_OUT_DIR = ARTIFACTS_DIR / "permutations"
 SWEEPS_DIR = ARTIFACTS_DIR / "sweeps"
+_TEST_INPUTS_VERSION_TAG = "studio_photometric_v5"
 
 DEFAULT_POSITIVE_PROMPT = (
     "A wide view of a sleek brushed-steel refrigerator beside a warm walnut kitchen counter "
@@ -202,6 +204,7 @@ def load_or_create_initial_request(
             return req, f"ShadowBoxer/{target.name} (Active File)"
         except Exception as e:
             print(f"[!] Warning: Failed to parse {target}: {e}. Using baseline.")
+
     banner = (
         "ShadowBoxer/default.json (Active File)"
         if has_custom_default_preset()
@@ -258,7 +261,7 @@ def _apply_box_denoise_spec(req: GenerationRequest, spec_str: str) -> None:
             dn_val = (
                 None
                 if v_clean in ("auto", "none", "null", "default")
-                else max(0.01, min(1.0, float(v_clean)))
+                else max(0.0, min(1.0, float(v_clean)))
             )
             if k_clean in ("all", "*"):
                 for item in req.layout_items:
@@ -281,7 +284,7 @@ def _apply_box_denoise_spec(req: GenerationRequest, spec_str: str) -> None:
             dn_val = (
                 None
                 if v_clean in ("auto", "none", "null", "default")
-                else max(0.01, min(1.0, float(v_clean)))
+                else max(0.0, min(1.0, float(v_clean)))
             )
             for item in req.layout_items:
                 if isinstance(item, dict):
@@ -330,7 +333,7 @@ def _interactive_edit_boxes(req: GenerationRequest) -> None:
             dn_str = f"{float(dn_val):.2f}" if dn_val is not None else "auto"
             desc = (
                 f'"{raw_txt}"'
-                if has_txt
+                if (lbl == "text" and has_txt)
                 else _truncate(
                     str(item.get("caption") or item.get("description") or ""), 34
                 )
@@ -352,7 +355,7 @@ def _interactive_edit_boxes(req: GenerationRequest) -> None:
             return
         if sel == "a":
             all_dn = input(
-                "Enter Denoise Strength for ALL boxes [0.01-1.0] or 'auto': "
+                "Enter Denoise Strength for ALL boxes [0.0-1.0] or 'auto': "
             ).strip()
             if all_dn:
                 _apply_box_denoise_spec(req, f"all:{all_dn}")
@@ -367,13 +370,22 @@ def _interactive_edit_boxes(req: GenerationRequest) -> None:
         ).strip()
         if en_in:
             box["enabled"] = en_in.lower() not in ("n", "no", "0", "false")
+        lbl_in = input(
+            f"  Box [{idx}] Label ({'/'.join(SUPPORTED_BOX_LABELS)}) (Current: {box.get('label', 'object')}): "
+        ).strip()
+        if lbl_in:
+            norm_lbl = normalize_box_label(lbl_in, has_text=False)
+            box["label"] = norm_lbl
+            box.pop("category", None)
+            if norm_lbl != "text":
+                box.pop("text", None)
         dn_in = input(
-            f"  Box [{idx}] Denoise Strength [0.01-1.0] or 'auto' (Current: {box.get('denoise_strength', 'auto')}): "
+            f"  Box [{idx}] Denoise Strength [0.0-1.0] or 'auto' (Current: {box.get('denoise_strength', 'auto')}): "
         ).strip()
         if dn_in.lower() in ("auto", "none", "default"):
             box.pop("denoise_strength", None)
         elif dn_in:
-            box["denoise_strength"] = max(0.01, min(1.0, float(dn_in)))
+            box["denoise_strength"] = max(0.0, min(1.0, float(dn_in)))
         iso_in = input(
             f"  Box [{idx}] Attention Isolation [0.0-1.0] or 'auto' (Current: {box.get('isolate_box_attn', 'auto')}): "
         ).strip()
@@ -484,7 +496,7 @@ def render_menu(req: GenerationRequest, banner_tag: str) -> None:
     )
     print("-" * 92)
     print(
-        " [G]  Generate Master Image   [B]  Inspect/Edit Boxes   [TP] Run 12-Vector Permutation Suite"
+        " [G]  Generate Master Image   [B]  Inspect/Edit Boxes   [TP] Run 16-Vector Permutation Suite"
     )
     print(
         " [TI] Stage Test Input Files  [P]  Preview Prompt  [X] Sweep  [T] Reset  [L] Load  [S] Save  [D] Save default.json"
@@ -593,6 +605,7 @@ def stage_test_input_files(
     p_init = dest_dir / "init_canvas.png"
     p_mask = dest_dir / "inpaint_mask.png"
     p_ctrl = dest_dir / "control_map.png"
+    p_ver = dest_dir / ".test_inputs_version"
 
     out_map = {
         "ref_a": p_ref_a,
@@ -608,9 +621,17 @@ def stage_test_input_files(
         "inpaint_mask": p_mask,
         "control_color_map": p_ctrl,
     }
-    if not force and all(
-        p.is_file() and p.stat().st_size > 0
-        for p in (p_ref_a, p_ref_b, p_ref_c, p_init, p_mask, p_ctrl)
+    ver_ok = (
+        p_ver.is_file()
+        and p_ver.read_text(encoding="utf-8").strip() == _TEST_INPUTS_VERSION_TAG
+    )
+    if (
+        not force
+        and ver_ok
+        and all(
+            p.is_file() and p.stat().st_size > 0
+            for p in (p_ref_a, p_ref_b, p_ref_c, p_init, p_mask, p_ctrl)
+        )
     ):
         return out_map
 
@@ -622,36 +643,23 @@ def stage_test_input_files(
     )
     rad = np.sqrt(xx * xx + yy * yy)
 
-    steel_micro = 0.08 * np.sin(96.0 * xx + 2.5 * np.sin(6.0 * yy))
-    panel_seam = np.exp(-((xx + 0.12) ** 2) / 0.0008) * -0.35
-    note_mask = ((xx > -0.58) & (xx < -0.18) & (yy > -0.36) & (yy < 0.04)).astype(
-        np.float32
+    steel_brush = (
+        0.012 * np.sin(210.0 * yy + 0.35 * np.sin(14.0 * xx))
+        + 0.006 * np.cos(370.0 * yy)
     )
-    note_grain = note_mask * (0.015 * np.cos(24.0 * xx) * np.sin(24.0 * yy))
-    ref_a_r = (
-        0.54
-        + 0.28 * np.cos(3.2 * xx)
-        + steel_micro
-        + panel_seam
-        + note_mask * 0.42
-        + note_grain
+    spec_lobe = 0.22 * np.exp(-((xx + 0.26) ** 2) / 0.14) * (1.0 - 0.14 * (yy ** 2))
+    soft_shadow = -0.15 * np.exp(-((xx - 0.58) ** 2) / 0.24)
+    door_seam = -0.34 * np.exp(-((xx - 0.12) ** 2) / 0.00035)
+    handle_bar = (
+        ((xx > -0.02) & (xx < 0.03) & (yy > -0.58) & (yy < 0.52)).astype(np.float32)
+        * (0.15 * np.cos((xx - 0.005) * 65.0))
     )
-    ref_a_g = (
-        0.56
-        + 0.26 * np.sin(3.0 * yy)
-        + steel_micro
-        + panel_seam
-        + note_mask * 0.36
-        + note_grain
+    base_steel = (
+        0.63 - 0.05 * yy + spec_lobe + soft_shadow + steel_brush + door_seam + handle_bar
     )
-    ref_a_b = (
-        0.62
-        - 0.30 * rad
-        + steel_micro
-        + panel_seam
-        + note_mask * (-0.42)
-        + note_grain
-    )
+    ref_a_r = base_steel * 0.96
+    ref_a_g = base_steel * 0.98
+    ref_a_b = base_steel * 1.03 + 0.012
     ref_a = np.stack(
         [
             np.clip(ref_a_r * 255.0, 0, 255),
@@ -662,35 +670,53 @@ def stage_test_input_files(
     ).astype(np.uint8)
     Image.fromarray(ref_a, mode="RGB").save(p_ref_a)
 
-    bowl_r = np.sqrt((xx - 0.28) ** 2 + (yy - 0.26) ** 2)
-    bowl_shell = np.clip(1.0 - np.abs(bowl_r - 0.34) * 18.0, 0.0, 1.0)
-    citrus_1 = np.exp(-(((xx - 0.20) ** 2 + (yy - 0.22) ** 2) / 0.018))
-    citrus_2 = np.exp(-(((xx - 0.38) ** 2 + (yy - 0.30) ** 2) / 0.016))
-    walnut_grain = 0.10 * np.sin(
-        42.0 * (yy + 0.18 * np.sin(7.0 * xx))
-    ) + 0.04 * np.cos(110.0 * yy)
-    ref_b_r = (
-        0.58
-        - 0.24 * yy
-        + walnut_grain
-        + 0.32 * bowl_shell
-        + 0.38 * (citrus_1 + citrus_2)
+    is_counter = (yy > 0.16).astype(np.float32)
+    wall_grad = 0.78 - 0.10 * yy - 0.06 * (xx ** 2)
+    wood_wave = (
+        0.035 * np.sin(54.0 * (yy + 0.06 * np.sin(6.5 * xx)))
+        + 0.018 * np.cos(135.0 * yy)
     )
-    ref_b_g = (
-        0.38
-        + 0.22 * xx
-        + 0.65 * walnut_grain
-        + 0.32 * bowl_shell
-        + 0.24 * citrus_1
-        + 0.34 * citrus_2
+    walnut_r = 0.48 + 0.08 * (1.0 - yy) + wood_wave
+    walnut_g = 0.31 + 0.05 * (1.0 - yy) + 0.75 * wood_wave
+    walnut_b = 0.19 + 0.03 * (1.0 - yy) + 0.45 * wood_wave
+
+    ref_b_r = np.where(is_counter > 0.5, walnut_r, wall_grad * 0.98)
+    ref_b_g = np.where(is_counter > 0.5, walnut_g, wall_grad * 0.95)
+    ref_b_b = np.where(is_counter > 0.5, walnut_b, wall_grad * 0.90)
+
+    bowl_cx, bowl_cy = 0.46, 0.44
+    bowl_ellip = np.sqrt(((xx - bowl_cx) / 0.38) ** 2 + ((yy - bowl_cy) / 0.22) ** 2)
+    bowl_mask = np.clip((1.0 - bowl_ellip) * 14.0, 0.0, 1.0) * (yy > 0.20).astype(
+        np.float32
     )
-    ref_b_b = (
-        0.24
-        + 0.18 * np.sin(4.5 * (xx - yy))
-        + 0.30 * walnut_grain
-        + 0.34 * bowl_shell
-        - 0.18 * (citrus_1 + citrus_2)
-    )
+    bowl_shade = 0.88 - 0.22 * (xx - bowl_cx) - 0.18 * (yy - (bowl_cy - 0.04))
+    ref_b_r = ref_b_r * (1.0 - bowl_mask) + bowl_mask * (bowl_shade * 0.95)
+    ref_b_g = ref_b_g * (1.0 - bowl_mask) + bowl_mask * (bowl_shade * 0.93)
+    ref_b_b = ref_b_b * (1.0 - bowl_mask) + bowl_mask * (bowl_shade * 0.88)
+
+    for cx_f, cy_f, r_f, cr, cg, cb in (
+        (0.32, 0.30, 0.14, 0.95, 0.52, 0.12),
+        (0.56, 0.32, 0.13, 0.96, 0.58, 0.14),
+        (0.45, 0.24, 0.12, 0.96, 0.84, 0.18),
+    ):
+        d_f = np.sqrt((xx - cx_f) ** 2 + (yy - cy_f) ** 2)
+        f_mask = np.clip((r_f - d_f) * 28.0, 0.0, 1.0)
+        nz = np.sqrt(np.maximum(0.0, 1.0 - np.minimum(1.0, (d_f / r_f) ** 2)))
+        lambert = np.clip(
+            0.35
+            + 0.65
+            * (
+                -0.45 * ((xx - cx_f) / r_f)
+                - 0.50 * ((yy - cy_f) / r_f)
+                + 0.74 * nz
+            ),
+            0.25,
+            1.12,
+        )
+        ref_b_r = ref_b_r * (1.0 - f_mask) + f_mask * (cr * lambert)
+        ref_b_g = ref_b_g * (1.0 - f_mask) + f_mask * (cg * lambert)
+        ref_b_b = ref_b_b * (1.0 - f_mask) + f_mask * (cb * lambert)
+
     ref_b = np.stack(
         [
             np.clip(ref_b_r * 255.0, 0, 255),
@@ -701,11 +727,45 @@ def stage_test_input_files(
     ).astype(np.uint8)
     Image.fromarray(ref_b, mode="RGB").save(p_ref_b)
 
-    cutout_alpha = np.clip((0.68 - rad) * 12.0, 0.0, 1.0)
-    cutout_tex = 0.12 * np.cos(36.0 * xx) * np.sin(36.0 * yy)
-    cutout_r = np.where(cutout_alpha > 0.01, 0.86 - 0.22 * rad + cutout_tex, 0.0)
-    cutout_g = np.where(cutout_alpha > 0.01, 0.58 + 0.18 * xx + cutout_tex, 1.0)
-    cutout_b = np.where(cutout_alpha > 0.01, 0.22 + 0.20 * yy - cutout_tex, 0.0)
+    cutout_alpha = np.clip((0.68 - rad) * 14.0, 0.0, 1.0)
+    nz_cut = np.sqrt(np.maximum(0.0, 1.0 - np.minimum(1.0, (rad / 0.68) ** 2)))
+    ceramic_shade = np.clip(
+        0.78 - 0.18 * xx - 0.16 * yy + 0.14 * nz_cut, 0.42, 0.96
+    )
+    rim_ring = np.exp(-((rad - 0.58) ** 2) / 0.0025) * 0.10
+    cut_r = ceramic_shade * 0.94 + rim_ring
+    cut_g = ceramic_shade * 0.91 + rim_ring * 0.85
+    cut_b = ceramic_shade * 0.85 + rim_ring * 0.60
+
+    for cx_c, cy_c, r_c, fr, fg, fb in (
+        (-0.20, 0.06, 0.24, 0.96, 0.54, 0.12),
+        (0.22, 0.08, 0.22, 0.95, 0.48, 0.10),
+        (0.00, -0.18, 0.21, 0.96, 0.85, 0.18),
+        (-0.02, 0.22, 0.19, 0.94, 0.62, 0.14),
+    ):
+        d_c = np.sqrt((xx - cx_c) ** 2 + (yy - cy_c) ** 2)
+        m_c = np.clip((r_c - d_c) * 26.0, 0.0, 1.0)
+        nz_f = np.sqrt(np.maximum(0.0, 1.0 - np.minimum(1.0, (d_c / r_c) ** 2)))
+        pore_tex = 0.012 * np.cos(80.0 * xx) * np.sin(80.0 * yy)
+        lit = np.clip(
+            0.36
+            + 0.68
+            * (
+                -0.42 * ((xx - cx_c) / r_c)
+                - 0.48 * ((yy - cy_c) / r_c)
+                + 0.76 * nz_f
+            )
+            + pore_tex,
+            0.22,
+            1.10,
+        )
+        cut_r = cut_r * (1.0 - m_c) + m_c * (fr * lit)
+        cut_g = cut_g * (1.0 - m_c) + m_c * (fg * lit)
+        cut_b = cut_b * (1.0 - m_c) + m_c * (fb * lit)
+
+    cutout_r = np.where(cutout_alpha > 0.01, cut_r, walnut_r)
+    cutout_g = np.where(cutout_alpha > 0.01, cut_g, walnut_g)
+    cutout_b = np.where(cutout_alpha > 0.01, cut_b, walnut_b)
     ref_c = np.stack(
         [
             np.clip(cutout_r * 255.0, 0, 255),
@@ -717,29 +777,52 @@ def stage_test_input_files(
     ).astype(np.uint8)
     Image.fromarray(ref_c, mode="RGBA").save(p_ref_c)
 
-    init_img = np.zeros((h, w, 3), dtype=np.uint8)
-    init_img[..., 0] = np.clip(
-        (0.48 + 0.25 * xx + 0.05 * np.cos(24.0 * xx)) * 255.0, 0, 255
+    left_panel = (xx < 0.12).astype(np.float32)
+    right_panel = (1.0 - left_panel).astype(np.float32)
+    init_r = left_panel * (base_steel * 0.96) + right_panel * ref_b_r
+    init_g = left_panel * (base_steel * 0.98) + right_panel * ref_b_g
+    init_b = left_panel * (base_steel * 1.02) + right_panel * ref_b_b
+    init_img = np.stack(
+        [
+            np.clip(init_r * 255.0, 0, 255),
+            np.clip(init_g * 255.0, 0, 255),
+            np.clip(init_b * 255.0, 0, 255),
+        ],
+        axis=-1,
     ).astype(np.uint8)
-    init_img[..., 1] = np.clip(
-        (0.52 - 0.20 * yy + 0.05 * np.sin(24.0 * yy)) * 255.0, 0, 255
-    ).astype(np.uint8)
-    init_img[..., 2] = np.clip((0.56 + 0.15 * (xx * yy)) * 255.0, 0, 255).astype(
-        np.uint8
-    )
     Image.fromarray(init_img, mode="RGB").save(p_init)
 
-    mask = np.clip((0.55 - rad) * 4.0, 0.0, 1.0)
+    d_note_m = np.maximum(np.abs(xx + 0.44) - 0.30, np.abs(yy + 0.25) - 0.22)
+    m_note = np.clip(1.0 - np.maximum(0.0, d_note_m) / 0.12, 0.0, 1.0)
+    d_bowl_m = np.sqrt(((xx - 0.52) / 0.44) ** 2 + ((yy - 0.44) / 0.48) ** 2)
+    m_bowl = np.clip((1.0 - d_bowl_m) * 3.5, 0.0, 1.0)
+    mask = np.maximum(m_note, m_bowl)
     mask_u8 = (mask * 255.0).round().astype(np.uint8)
     Image.fromarray(mask_u8, mode="L").save(p_mask)
 
     ctrl = np.zeros((h, w, 3), dtype=np.uint8)
-    ctrl_val = np.clip((1.0 - np.minimum(rad, 1.0)) * 255.0, 0, 255).astype(np.uint8)
-    ctrl[..., 0] = ctrl_val
-    ctrl[..., 1] = np.clip((0.5 + 0.5 * xx) * 255.0, 0, 255).astype(np.uint8)
-    ctrl[..., 2] = np.clip((0.5 + 0.5 * yy) * 255.0, 0, 255).astype(np.uint8)
+    is_left = xx < 0.12
+    is_left_hi = xx < -0.22
+    is_cnt = (xx >= 0.12) & (yy > 0.16)
+    is_bwl = (xx >= 0.24) & (
+        ((xx - 0.52) / 0.32) ** 2 + ((yy - 0.42) / 0.20) ** 2 <= 1.0
+    )
+    is_note = (xx > -0.68) & (xx < -0.24) & (yy > -0.46) & (yy < -0.04)
+    ctrl[~is_left & ~is_cnt] = [194, 188, 178]
+    ctrl[is_left] = [152, 158, 166]
+    ctrl[is_left_hi] = [178, 184, 192]
+    ctrl[is_cnt] = [124, 82, 52]
+    ctrl[is_bwl] = [228, 186, 96]
+    ctrl[is_note] = [242, 224, 108]
     Image.fromarray(ctrl, mode="RGB").save(p_ctrl)
 
+    p_ver.write_text(f"{_TEST_INPUTS_VERSION_TAG}\n", encoding="utf-8")
+    stale_vizj = PERMUTATIONS_OUT_DIR / "v08_tier2_bundle.vizj"
+    if stale_vizj.is_file():
+        try:
+            stale_vizj.unlink()
+        except OSError:
+            pass
     print(f"[+] Staged 6 deterministic test input artifacts in: {dest_dir}")
     return out_map
 
@@ -776,6 +859,7 @@ def run_permutation_suite(
     staged = stage_test_input_files(force=False)
     PERMUTATIONS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     active_base = base_req if base_req is not None else build_default_request()
+
     w = max(256, min(2048, (int(width_override or active_base.width) // 16) * 16))
     h = max(256, min(2048, (int(height_override or active_base.height) // 16) * 16))
     eff_steps = (
@@ -840,6 +924,7 @@ def run_permutation_suite(
         edit_lora_path=None,
         edit_lora_scale=0.0,
         box_attn_isolation=0.0,
+        uncond_uses_references=None,
         composite_box_images_to_init=False,
         layout_items=base_layout_items,
     )
@@ -853,10 +938,21 @@ def run_permutation_suite(
         coords_are_pixels=True,
     )
     v06_horizon_boxes[0] = dict(
-        v06_horizon_boxes[0], inpaint_box=True, denoise_strength=0.45
+        v06_horizon_boxes[0],
+        label="object",
+        caption="A sleek brushed-steel refrigerator door with a small yellow sticky note",
+        inpaint_box=True,
+        denoise_strength=0.88,
     )
     v06_horizon_boxes[1] = dict(
-        v06_horizon_boxes[1], inpaint_box=True, denoise_strength=0.80
+        v06_horizon_boxes[1],
+        inpaint_box=True,
+        denoise_strength=0.96,
+    )
+    v06_horizon_boxes[2] = dict(
+        v06_horizon_boxes[2],
+        inpaint_box=True,
+        denoise_strength=0.94,
     )
 
     v11_canonical_1024_boxes: List[Dict[str, Any]] = [
@@ -868,7 +964,7 @@ def run_permutation_suite(
             "input_role": "photo_ref",
             "paste_to_canvas": True,
             "isolate_box_attn": 0.85,
-            "denoise_strength": 0.55,
+            "denoise_strength": 0.88,
             "z_order": 1,
             "enabled": True,
         },
@@ -884,13 +980,13 @@ def run_permutation_suite(
         },
         {
             "label": "object",
-            "caption": "A glowing citrus medallion cutout on a warm walnut counter",
+            "caption": "A sculpted ceramic bowl of fresh oranges and lemons resting on a warm walnut counter",
             "bbox": [448, 512, 1024, 1024],
             "image_path": str(staged["ref_c"]),
             "input_role": "photo_ref",
             "paste_to_canvas": True,
-            "isolate_box_attn": 0.90,
-            "denoise_strength": 0.45,
+            "isolate_box_attn": 0.82,
+            "denoise_strength": 0.90,
             "z_order": 3,
             "enabled": True,
         },
@@ -899,13 +995,249 @@ def run_permutation_suite(
             "caption": "Handwritten crisp black marker text on a small yellow sticky note",
             "text": "SOVEREIGN V11 CONVERGED",
             "bbox": [256, 112, 512, 464],
-            "denoise_strength": 0.95,
+            "denoise_strength": 0.96,
             "z_order": 5,
             "enabled": True,
         },
     ]
     v11_spatiovisual_boxes = scale_layout_items_to_canvas(
         v11_canonical_1024_boxes,
+        height=h,
+        width=w,
+        src_height=1024,
+        src_width=1024,
+        coords_are_pixels=True,
+    )
+
+    v12_prompt = (
+        "A cinematic culinary studio portrait of a smiling chef in a tailored white chef coat "
+        "and tall chef hat standing in front of a sleek brushed-steel kitchen backdrop beside a "
+        "warm walnut counter with a ceramic bowl of fresh citrus fruit and a chiseled silver "
+        'studio nameplate at the top reading: "CHARACTER SEMANTIC LOCK"'
+    )
+    v12_character_1024_boxes: List[Dict[str, Any]] = [
+        {
+            "label": "object",
+            "caption": "A sleek brushed-steel kitchen backdrop with soft studio lighting",
+            "bbox": [0, 0, 1024, 576],
+            "image_path": str(staged["ref_a"]),
+            "input_role": "photo_ref",
+            "paste_to_canvas": True,
+            "isolate_box_attn": 0.85,
+            "denoise_strength": 0.88,
+            "z_order": 1,
+            "enabled": True,
+        },
+        {
+            "label": "character",
+            "caption": "A smiling culinary chef portrait in crisp studio rim lighting wearing a tailored white double-breasted chef coat and tall white chef hat",
+            "bbox": [192, 160, 1024, 768],
+            "isolate_box_attn": 0.92,
+            "denoise_strength": 0.96,
+            "z_order": 4,
+            "enabled": True,
+        },
+        {
+            "label": "object",
+            "caption": "A sculpted ceramic bowl of fresh oranges and lemons resting on a warm walnut counter",
+            "bbox": [576, 640, 1024, 1024],
+            "image_path": str(staged["ref_c"]),
+            "input_role": "photo_ref",
+            "paste_to_canvas": True,
+            "isolate_box_attn": 0.82,
+            "denoise_strength": 0.90,
+            "z_order": 3,
+            "enabled": True,
+        },
+        {
+            "label": "text",
+            "caption": "Chiseled silver studio nameplate",
+            "text": "CHARACTER SEMANTIC LOCK",
+            "bbox": [48, 384, 192, 960],
+            "denoise_strength": 0.96,
+            "z_order": 6,
+            "enabled": True,
+        },
+    ]
+    v12_character_boxes = scale_layout_items_to_canvas(
+        v12_character_1024_boxes,
+        height=h,
+        width=w,
+        src_height=1024,
+        src_width=1024,
+        coords_are_pixels=True,
+    )
+
+    v13_prompt = (
+        "An expressive culinary chef in a tailored white chef jacket standing beside a sleek "
+        "brushed-steel refrigerator door in a warm walnut kitchen with a crisp black marker "
+        'yellow sticky note on the upper door reading: "ABM4 MULTITREE VERIFIED"'
+    )
+    v13_multitree_1024_boxes: List[Dict[str, Any]] = [
+        {
+            "label": "object",
+            "caption": "Sleek brushed-steel refrigerator door panel under warm kitchen studio lighting",
+            "bbox": [0, 0, 1024, 448],
+            "inpaint_box": True,
+            "denoise_strength": 0.88,
+            "z_order": 1,
+            "enabled": True,
+        },
+        {
+            "label": "character",
+            "caption": "Expressive culinary chef portrait in a tailored white chef jacket standing in the studio kitchen",
+            "bbox": [192, 384, 1024, 960],
+            "inpaint_box": True,
+            "denoise_strength": 0.96,
+            "z_order": 3,
+            "enabled": True,
+        },
+        {
+            "label": "text",
+            "caption": "Crisp black marker label on a yellow sticky note",
+            "text": "ABM4 MULTITREE VERIFIED",
+            "bbox": [64, 48, 256, 416],
+            "inpaint_box": True,
+            "denoise_strength": 0.96,
+            "z_order": 5,
+            "enabled": True,
+        },
+    ]
+    v13_multitree_boxes = scale_layout_items_to_canvas(
+        v13_multitree_1024_boxes,
+        height=h,
+        width=w,
+        src_height=1024,
+        src_width=1024,
+        coords_are_pixels=True,
+    )
+
+    v15_prompt = (
+        "A cinematic dual-portrait in a modern studio kitchen featuring a bearded executive chef "
+        "in a charcoal chef jacket on the left and a smiling pastry sous-chef wearing round glasses "
+        "and a white chef coat with a tall toque on the right, standing in front of a brushed-steel "
+        'kitchen backdrop beneath two studio nameplates reading "CHEF DE CUISINE" and "PATISSIER"'
+    )
+    v15_multichar_1024_boxes: List[Dict[str, Any]] = [
+        {
+            "label": "object",
+            "caption": "A wide brushed-steel studio kitchen backdrop with warm ambient illumination",
+            "bbox": [0, 0, 1024, 640],
+            "image_path": str(staged["ref_a"]),
+            "input_role": "photo_ref",
+            "paste_to_canvas": True,
+            "isolate_box_attn": 0.85,
+            "denoise_strength": 0.88,
+            "z_order": 1,
+            "enabled": True,
+        },
+        {
+            "label": "character",
+            "caption": "A bearded executive chef in a tailored charcoal double-breasted chef jacket with arms crossed in dramatic studio rim lighting",
+            "bbox": [192, 48, 1024, 560],
+            "isolate_box_attn": 0.92,
+            "denoise_strength": 0.95,
+            "z_order": 4,
+            "enabled": True,
+        },
+        {
+            "label": "character",
+            "caption": "A smiling pastry sous-chef wearing round eyeglasses, a crisp white chef coat, and a tall white toque holding a stainless steel whisk",
+            "bbox": [208, 464, 1024, 976],
+            "isolate_box_attn": 0.92,
+            "denoise_strength": 0.96,
+            "z_order": 5,
+            "enabled": True,
+        },
+        {
+            "label": "text",
+            "caption": "Brushed brass studio nameplate on the upper left",
+            "text": "CHEF DE CUISINE",
+            "bbox": [48, 48, 160, 480],
+            "denoise_strength": 0.96,
+            "z_order": 7,
+            "enabled": True,
+        },
+        {
+            "label": "text",
+            "caption": "Brushed silver studio nameplate on the upper right",
+            "text": "PATISSIER",
+            "bbox": [48, 544, 160, 960],
+            "denoise_strength": 0.96,
+            "z_order": 8,
+            "enabled": True,
+        },
+    ]
+    v15_multichar_boxes = scale_layout_items_to_canvas(
+        v15_multichar_1024_boxes,
+        height=h,
+        width=w,
+        src_height=1024,
+        src_width=1024,
+        coords_are_pixels=True,
+    )
+
+    v16_prompt = (
+        "An architectural studio kitchen scene with a sleek brushed-steel appliance panel on the "
+        "left, an executive culinary chef and an artisanal sommelier in a linen apron conversing "
+        "behind a warm walnut counter with a ceramic bowl of fresh citrus fruit, and a top studio "
+        'plaque reading: "DUAL CHARACTER CONVERGED"'
+    )
+    v16_hybrid_1024_boxes: List[Dict[str, Any]] = [
+        {
+            "label": "object",
+            "caption": "Sleek brushed-steel refrigerator appliance panel on the left",
+            "bbox": [0, 0, 1024, 288],
+            "inpaint_box": True,
+            "denoise_strength": 0.88,
+            "z_order": 1,
+            "enabled": True,
+        },
+        {
+            "label": "character",
+            "caption": "Executive culinary chef in a crisp white chef jacket gesturing in conversation",
+            "bbox": [208, 192, 1024, 624],
+            "inpaint_box": True,
+            "isolate_box_attn": 0.90,
+            "denoise_strength": 0.96,
+            "z_order": 4,
+            "enabled": True,
+        },
+        {
+            "label": "character",
+            "caption": "Artisanal sommelier and barista in a dark shirt and leather apron holding a tasting glass",
+            "bbox": [224, 544, 1024, 960],
+            "inpaint_box": True,
+            "isolate_box_attn": 0.90,
+            "denoise_strength": 0.96,
+            "z_order": 5,
+            "enabled": True,
+        },
+        {
+            "label": "object",
+            "caption": "A ceramic bowl of fresh citrus fruit on the foreground walnut counter",
+            "bbox": [640, 640, 1024, 1024],
+            "image_path": str(staged["ref_c"]),
+            "input_role": "photo_ref",
+            "paste_to_canvas": True,
+            "isolate_box_attn": 0.82,
+            "denoise_strength": 0.90,
+            "z_order": 6,
+            "enabled": True,
+        },
+        {
+            "label": "text",
+            "caption": "Crisp studio header plaque",
+            "text": "DUAL CHARACTER CONVERGED",
+            "bbox": [48, 256, 176, 912],
+            "inpaint_box": True,
+            "denoise_strength": 0.96,
+            "z_order": 8,
+            "enabled": True,
+        },
+    ]
+    v16_hybrid_boxes = scale_layout_items_to_canvas(
+        v16_hybrid_1024_boxes,
         height=h,
         width=w,
         src_height=1024,
@@ -983,11 +1315,15 @@ def run_permutation_suite(
             "V06_Img2Img_Horizon_And_MaskAlgebra",
             _clone_request(
                 base_clean,
+                prompt_mode="layout_json",
+                thinking_trace="auto",
                 early_solver="heun",
                 late_solver="ipndm",
+                early_cfg=3.2,
+                late_cfg=2.8,
                 init_image_path=str(staged["init"]),
                 inpaint_mask_path=str(staged["mask"]),
-                denoise_strength=0.75,
+                denoise_strength=0.92,
                 mask_blend_mode="union",
                 layout_items=v06_horizon_boxes,
                 output_path=str(PERMUTATIONS_OUT_DIR / "v06_img2img_inpaint.png"),
@@ -997,6 +1333,10 @@ def run_permutation_suite(
             "V07_MossImageEdit_ZeroTimestep",
             _clone_request(
                 base_clean,
+                early_solver="heun",
+                late_solver="ipndm",
+                early_cfg=3.2,
+                late_cfg=2.8,
                 reference_image_paths=[str(staged["ref_a"])],
                 edit_format="moss_image_edit",
                 framing_mode="never_crop",
@@ -1009,6 +1349,10 @@ def run_permutation_suite(
             "V08_AIToolkit_Isolated_MultiRef_4DRoPE",
             _clone_request(
                 base_clean,
+                early_solver="heun",
+                late_solver="ipndm",
+                early_cfg=3.2,
+                late_cfg=2.8,
                 reference_image_paths=[str(staged["ref_a"]), str(staged["ref_b"])],
                 edit_format="ai_toolkit_isolated",
                 framing_mode="inscribed",
@@ -1021,6 +1365,10 @@ def run_permutation_suite(
             "V09_Control_Color_Depth_Routing",
             _clone_request(
                 base_clean,
+                early_solver="heun",
+                late_solver="ipndm",
+                early_cfg=3.2,
+                late_cfg=2.8,
                 control_image_path=str(staged["control"]),
                 edit_format="control_color_depth",
                 input_role="color_map",
@@ -1032,6 +1380,10 @@ def run_permutation_suite(
             _clone_request(
                 base_clean,
                 model_variant="sft",
+                early_solver="heun",
+                late_solver="ipndm",
+                early_cfg=3.2,
+                late_cfg=2.8,
                 reference_image_paths=[
                     str(PERMUTATIONS_OUT_DIR / "v08_tier2_bundle.vizj")
                 ],
@@ -1061,9 +1413,55 @@ def run_permutation_suite(
             ),
         ),
         (
-            "V12_Base_HotSwap_Speculative_CoT"
+            "V12_Character_SemanticHierarchy_And_EllipticalCarve",
+            _clone_request(
+                base_clean,
+                model_variant="sft",
+                prompt=v12_prompt,
+                layout_summary=v12_prompt,
+                prompt_mode="layout_json",
+                thinking_trace="auto",
+                early_solver="heun",
+                late_solver="ipndm",
+                handoff_threshold=0.35,
+                early_cfg=3.2,
+                late_cfg=2.8,
+                box_attn_isolation=0.85,
+                composite_box_images_to_init=True,
+                layout_items=v12_character_boxes,
+                output_path=str(
+                    PERMUTATIONS_OUT_DIR / "v12_character_elliptical_carve.png"
+                ),
+            ),
+        ),
+        (
+            "V13_MultiTree_ABM4_And_ManualHorizonLock",
+            _clone_request(
+                base_clean,
+                model_variant="sft",
+                prompt=v13_prompt,
+                layout_summary=v13_prompt,
+                prompt_mode="layout_json",
+                thinking_trace="auto",
+                early_solver="multitree",
+                late_solver="multitree",
+                handoff_threshold=0.50,
+                early_cfg=3.1,
+                late_cfg=2.8,
+                init_image_path=str(staged["init"]),
+                denoise_strength=0.92,
+                mask_blend_mode="boxes_only",
+                preserve_canvas_outside_boxes=True,
+                layout_items=v13_multitree_boxes,
+                output_path=str(
+                    PERMUTATIONS_OUT_DIR / "v13_multitree_horizon_lock.png"
+                ),
+            ),
+        ),
+        (
+            "V14_Base_HotSwap_Speculative_CoT"
             if has_base
-            else "V12_Speculative_CoT_Reasoning",
+            else "V14_Speculative_CoT_Reasoning",
             _clone_request(
                 base_clean,
                 model_variant="base" if has_base else "sft",
@@ -1074,7 +1472,60 @@ def run_permutation_suite(
                 handoff_threshold=0.35,
                 early_cfg=3.2,
                 late_cfg=2.8,
-                output_path=str(PERMUTATIONS_OUT_DIR / "v12_speculative_cot.png"),
+                output_path=str(PERMUTATIONS_OUT_DIR / "v14_speculative_cot.png"),
+            ),
+        ),
+        (
+            "V15_MultiCharacter_DualSubject_DepthHierarchy",
+            _clone_request(
+                base_clean,
+                model_variant="sft",
+                prompt=v15_prompt,
+                layout_summary=v15_prompt,
+                prompt_mode="layout_json",
+                thinking_trace="auto",
+                early_solver="heun",
+                late_solver="ipndm",
+                handoff_threshold=0.35,
+                early_cfg=3.2,
+                late_cfg=2.8,
+                box_attn_isolation=0.88,
+                composite_box_images_to_init=True,
+                layout_items=v15_multichar_boxes,
+                output_path=str(
+                    PERMUTATIONS_OUT_DIR / "v15_multicharacter_dualsubject.png"
+                ),
+            ),
+        ),
+        (
+            "V16_MultiCharacter_Hybrid_Control_And_SpeculativeCoT",
+            _clone_request(
+                base_clean,
+                model_variant="sft",
+                prompt=v16_prompt,
+                layout_summary=v16_prompt,
+                prompt_mode="layout_json",
+                thinking_trace="speculative:24",
+                early_solver="sde_gpu_pp",
+                late_solver="ipndm",
+                handoff_threshold=0.35,
+                eta=0.10,
+                s_noise=1.0,
+                early_cfg=3.2,
+                late_cfg=2.8,
+                init_image_path=str(staged["init"]),
+                control_image_path=str(staged["control"]),
+                edit_format="control_color_depth",
+                input_role="depth_map",
+                denoise_strength=0.95,
+                mask_blend_mode="boxes_only",
+                preserve_canvas_outside_boxes=True,
+                box_attn_isolation=0.88,
+                composite_box_images_to_init=True,
+                layout_items=v16_hybrid_boxes,
+                output_path=str(
+                    PERMUTATIONS_OUT_DIR / "v16_multicharacter_hybrid_cot.png"
+                ),
             ),
         ),
     ]
@@ -1082,7 +1533,6 @@ def run_permutation_suite(
     total_vecs = len(vectors)
     results: List[Dict[str, Any]] = []
     t_suite = time.perf_counter()
-
     print("\n" + "=" * 92)
     print(
         f"     EXECUTING {total_vecs}-VECTOR ARCHITECTURAL PERMUTATION SUITE ({w}x{h} @ {eff_steps} steps)"
@@ -1103,6 +1553,21 @@ def run_permutation_suite(
                 f"luma={resp.mean_luminance:.4f}, contrast={resp.rms_contrast:.4f}, "
                 f"entropy={resp.shannon_entropy_bits:.3f}, sharpness={resp.laplacian_sharpness:.4f}"
             )
+        if vec_req.prompt_mode == "layout_json" or vec_req.has_box_images():
+            parsed_eff = json.loads(resp.effective_prompt)
+            for item_obj in parsed_eff.get("items", []):
+                extra_keys = set(item_obj.keys()) - {
+                    "label",
+                    "caption",
+                    "bbox",
+                    "text",
+                    "tags",
+                    "palette",
+                }
+                if extra_keys:
+                    raise RuntimeError(
+                        f"Out-of-distribution layout_json keys on {vec_name}: {extra_keys}"
+                    )
         hw = engine.memory_guard.poll()
         rec = {
             "index": idx,
@@ -1137,7 +1602,7 @@ def run_permutation_suite(
         }
         results.append(rec)
         print(
-            f"    [OK] {vec_name:<40} | {resp.generation_time_seconds:6.2f}s | "
+            f"    [OK] {vec_name:<52} | {resp.generation_time_seconds:6.2f}s | "
             f"VRAM={resp.peak_vram_gb:5.2f}GB (Contig={hw.contiguous_avail_gb:5.2f}GB, Spill=+{hw.shared_delta_gb:4.2f}GB) | "
             f"Entropy={resp.shannon_entropy_bits:5.2f}b | Pfx={resp.common_prefix_tokens}tok"
         )
@@ -1171,7 +1636,6 @@ def run_custom_sweep(engine: MOSSImageEngine, base_req: GenerationRequest) -> No
         if raw_cfgs
         else [2.5, 3.5]
     )
-
     SWEEPS_DIR.mkdir(parents=True, exist_ok=True)
     total = len(shifts) * len(cfgs)
     idx = 0
@@ -1672,9 +2136,9 @@ def main() -> None:
     cfg_path = Path(args.config) if args.config else None
     if cfg_path is not None and not cfg_path.is_absolute():
         cfg_path = ROOT_DIR / cfg_path
+
     req, banner_tag = load_or_create_initial_request(cfg_path)
     orig_w, orig_h = req.width, req.height
-
     if args.prompt is not None:
         req.prompt = args.prompt
     if args.system_prompt is not None:

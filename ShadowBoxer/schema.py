@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 SHADOWBOXER_ROOT = Path(__file__).resolve().parent
 DEFAULT_PRESET_FILENAME = "default.json"
 DEFAULT_BOX_REF_ISOLATION = 0.65
+DEFAULT_CHARACTER_CARVE_ISOLATION = 0.55
+DEFAULT_TEXT_CARVE_ISOLATION = 0.85
 DEFAULT_SPECULATIVE_COT_TOKENS = 64
 
 _LEGACY_DEFAULT_LAYOUT_SUMMARY = (
@@ -22,10 +24,12 @@ _LEGACY_DEFAULT_LAYOUT_SUMMARY = (
 )
 
 SUPPORTED_SOLVERS = ["euler", "heun", "ipndm", "sde_gpu_pp", "multitree"]
+
 SUPPORTED_MODELS = {
     "sft": "OpenMOSS-Team/MOSS-Image-SFT",
     "base": "OpenMOSS-Team/MOSS-Image-Base",
 }
+
 SUPPORTED_PROMPT_MODES = ["natural", "layout", "layout_json"]
 SUPPORTED_BOX_LABELS = ["object", "character", "text"]
 SUPPORTED_FRAMING_MODES = [
@@ -154,6 +158,20 @@ _INTERNAL_BOX_KEYS = {
     "id",
     "category",
     "enabled",
+    "reference",
+    "description",
+}
+
+_UPSTREAM_OPTIONAL_ITEM_KEYS = ("tags", "palette")
+
+_TEXT_SYNONYMS = {
+    "text",
+    "typography",
+    "caption",
+    "title",
+    "sign",
+    "label",
+    "lettering",
 }
 
 _CHARACTER_SYNONYMS = {
@@ -172,6 +190,7 @@ _CHARACTER_SYNONYMS = {
     "figure",
     "actor",
     "model",
+    "hero",
 }
 
 
@@ -180,13 +199,15 @@ def _snap_lattice_floor_half(val: float, mult: int) -> int:
 
 
 def normalize_box_label(raw_label: Any, has_text: bool = False) -> str:
-    if has_text:
-        return "text"
     s = str(raw_label or "").strip().lower()
-    if s in ("text", "typography", "caption", "title", "sign", "label", "lettering"):
+    if s in _TEXT_SYNONYMS:
         return "text"
     if s in _CHARACTER_SYNONYMS:
         return "character"
+    if s == "object":
+        return "object"
+    if has_text:
+        return "text"
     return "object"
 
 
@@ -204,9 +225,57 @@ def extract_box_text_and_caption(item: Dict[str, Any]) -> Tuple[str, str, str]:
             txt_val = cap_val
         if not cap_val or cap_val == txt_val:
             cap_val = "Crisp legible typography with clean kerning"
-    elif not cap_val:
-        cap_val = "Character subject" if label_val == "character" else "Scene object"
+    else:
+        txt_val = ""
+        if not cap_val:
+            cap_val = "Character subject" if label_val == "character" else "Scene object"
     return label_val, txt_val, cap_val
+
+
+def normalize_layout_boxes(
+    items: Sequence[Dict[str, Any]],
+    height: int = 1024,
+    width: int = 1024,
+    coords_are_pixels: bool = True,
+) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        d = dict(item)
+        label_val, txt_val, cap_val = extract_box_text_and_caption(d)
+        d["label"] = label_val
+        d["caption"] = cap_val
+        if label_val == "text":
+            d["text"] = txt_val
+        else:
+            d.pop("text", None)
+        raw_dn = d.get("denoise_strength")
+        if raw_dn is not None and str(raw_dn).strip() != "":
+            try:
+                d["denoise_strength"] = max(0.0, min(1.0, float(raw_dn)))
+            except (ValueError, TypeError):
+                d.pop("denoise_strength", None)
+        else:
+            d.pop("denoise_strength", None)
+        raw_iso = d.get("isolate_box_attn")
+        if raw_iso is not None and str(raw_iso).strip() != "":
+            try:
+                d["isolate_box_attn"] = max(0.0, min(1.0, float(raw_iso)))
+            except (ValueError, TypeError):
+                d.pop("isolate_box_attn", None)
+        else:
+            d.pop("isolate_box_attn", None)
+        bbox = d.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4 and coords_are_pixels:
+            py0, px0, py1, px1 = bbox_to_pixel_rect(
+                bbox, height=height, width=width, coords_are_pixels=True
+            )
+            d["bbox"] = [py0, px0, py1, px1]
+        out.append(d)
+    return out
 
 
 def pixel_bbox_to_abs_centralized(
@@ -376,6 +445,7 @@ def canonical_box_sort_key(
         )
     else:
         uy0, ux0, uy1, ux1 = 0.0, 0.0, 1.0, 1.0
+
     area = round((uy1 - uy0) * (ux1 - ux0), 6)
     uyc = round(0.5 * (uy0 + uy1), 6)
     uxc = round(0.5 * (ux0 + ux1), 6)
@@ -491,6 +561,7 @@ def compile_layout_prompt(
     active_texts = get_reading_order_texts(
         items, height=height, width=width, coords_are_pixels=coords_are_pixels
     )
+
     for idx in canonical_indices:
         item = items[idx]
         raw_entry = dict(item)
@@ -507,31 +578,33 @@ def compile_layout_prompt(
             )
 
         ref_val: Optional[str] = None
-        if isinstance(raw_entry.get("reference"), str) and raw_entry["reference"].strip():
-            ref_val = raw_entry["reference"].strip()
-        elif box_picture_map and idx in box_picture_map:
+        if box_picture_map and idx in box_picture_map:
             ref_val = f"Picture {box_picture_map[idx]}"
+        elif isinstance(raw_entry.get("reference"), str) and raw_entry["reference"].strip():
+            ref_val = raw_entry["reference"].strip()
+
+        if ref_val is not None:
+            if not cap_val:
+                cap_val = ref_val
+            elif ref_val.lower() not in cap_val.lower():
+                cap_val = f"{ref_val}: {cap_val}"
 
         clean_entry: Dict[str, Any] = {"label": label_val}
         if centralized_bbox is not None:
             clean_entry["bbox"] = centralized_bbox
-        if ref_val is not None:
-            clean_entry["reference"] = ref_val
         if cap_val:
             clean_entry["caption"] = cap_val
         if label_val == "text" and txt_val:
             clean_entry["text"] = txt_val
 
-        for k, v in raw_entry.items():
-            if (
-                k in _INTERNAL_BOX_KEYS
-                or k in ("label", "bbox", "reference", "caption", "description", "text")
-                or v is None
-            ):
-                continue
-            if isinstance(v, str) and not v.strip():
-                continue
-            clean_entry[k] = v
+        for k in _UPSTREAM_OPTIONAL_ITEM_KEYS:
+            if k in raw_entry and raw_entry[k] is not None:
+                v = raw_entry[k]
+                if isinstance(v, str) and not v.strip():
+                    continue
+                if isinstance(v, (list, tuple, dict)) and len(v) == 0:
+                    continue
+                clean_entry[k] = v
 
         normalized_items.append(clean_entry)
 
@@ -593,7 +666,6 @@ def compile_spatial_thinking_trace(
         width=w,
         coords_are_pixels=req.layout_coords_are_pixels,
     )
-
     clean_ls = (req.layout_summary or "").strip()
     clean_p = (req.prompt or "").strip()
     base_summary = (
@@ -682,10 +754,10 @@ def compile_spatial_thinking_trace(
                 c_b = [-cy, -cx, h - cy, w - cx]
                 area_pct = 100.0
             ref_tag = ""
-            if isinstance(item.get("reference"), str) and item["reference"].strip():
-                ref_tag = f", ref={item['reference'].strip()}"
-            elif idx in box_pic_map:
+            if idx in box_pic_map:
                 ref_tag = f", ref=Picture {box_pic_map[idx]}"
+            elif isinstance(item.get("reference"), str) and item["reference"].strip():
+                ref_tag = f", ref={item['reference'].strip()}"
             dn_raw = item.get("denoise_strength")
             dn_tag = (
                 f", d={float(dn_raw):.2f}"
@@ -972,6 +1044,7 @@ def has_custom_default_preset() -> bool:
 class GenerationRequest(BaseModel):
     model_variant: str = Field(default="sft")
     repo_id: Optional[str] = Field(default=None)
+
     prompt: str = Field(default="")
     negative_prompt: str = Field(default="")
     system_prompt: Optional[str] = Field(default=None)
@@ -984,26 +1057,33 @@ class GenerationRequest(BaseModel):
     preserve_canvas_outside_boxes: Optional[bool] = Field(default=None)
     box_attn_isolation: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     composite_box_images_to_init: Optional[bool] = Field(default=None)
+
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1024, ge=256, le=2048)
+
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     shift: Optional[float] = Field(default=None, ge=0.1, le=20.0)
     use_v2_grid: Optional[bool] = Field(default=None)
     early_solver: Optional[str] = Field(default=None)
     late_solver: Optional[str] = Field(default=None)
     handoff_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     early_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
     late_cfg: Optional[float] = Field(default=None, ge=0.0, le=30.0)
+
     uncond_skip_layers: Optional[List[int]] = Field(default=None)
     slg_layers: Optional[List[int]] = Field(default=None)
     slg_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     slg_start: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     slg_stop: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
     eta: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     s_noise: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+
     max_sequence_length: Optional[int] = Field(default=None, ge=64, le=32768)
     enable_thinking: Optional[bool] = Field(default=None)
+
     init_image_path: Optional[str] = Field(default=None)
     denoise_strength: float = Field(default=1.0, ge=0.01, le=1.0)
     inpaint_mask_path: Optional[str] = Field(default=None)
@@ -1011,6 +1091,7 @@ class GenerationRequest(BaseModel):
     invert_inpaint_mask: Optional[bool] = Field(default=None)
     control_image_path: Optional[str] = Field(default=None)
     reference_image_paths: List[str] = Field(default_factory=list)
+
     framing_mode: Optional[str] = Field(default=None)
     input_role: Optional[str] = Field(default=None)
     edit_format: Optional[str] = Field(default=None)
@@ -1023,13 +1104,17 @@ class GenerationRequest(BaseModel):
     latent_clamp_sigma: Optional[float] = Field(default=None, ge=2.0, le=12.0)
     apply_bayer_dither: Optional[bool] = Field(default=None)
     use_reference_cache: Optional[bool] = Field(default=None)
+
     reference_zero_timestep: Optional[bool] = Field(default=None)
     reference_isolated_kv: Optional[bool] = Field(default=None)
     uncond_uses_references: Optional[bool] = Field(default=None)
+
     edit_lora_path: Optional[str] = Field(default=None)
     edit_lora_scale: float = Field(default=1.0, ge=0.0, le=4.0)
+
     export_vizj_path: Optional[str] = Field(default=None)
     export_vizj_tier: int = Field(default=2, ge=0, le=2)
+
     num_images_per_prompt: int = Field(default=1, ge=1, le=8)
     seed: Optional[int] = Field(default=42)
     output_path: str = Field(default="output_moss_master.png")
@@ -1070,23 +1155,28 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]
         ):
             self.num_inference_steps = int(active["num_inference_steps"])
+
         if self.shift is None or (
             use_custom and self.shift == BASELINE_ENGINE_DEFAULTS["shift"]
         ):
             self.shift = float(active["shift"])
+
         if self.use_v2_grid is None or (
             use_custom and self.use_v2_grid == BASELINE_ENGINE_DEFAULTS["use_v2_grid"]
         ):
             self.use_v2_grid = bool(active["use_v2_grid"])
+
         if self.early_solver is None or (
             use_custom
             and self.early_solver == BASELINE_ENGINE_DEFAULTS["early_solver"]
         ):
             self.early_solver = str(active["early_solver"])
+
         if self.late_solver is None or (
             use_custom and self.late_solver == BASELINE_ENGINE_DEFAULTS["late_solver"]
         ):
             self.late_solver = str(active["late_solver"])
+
         if self.handoff_threshold is None or (
             use_custom
             and self.handoff_threshold
@@ -1120,36 +1210,44 @@ class GenerationRequest(BaseModel):
             == BASELINE_ENGINE_DEFAULTS["uncond_skip_layers"]
         ):
             self.uncond_skip_layers = list(active["uncond_skip_layers"])
+
         if self.slg_layers is None or (
             use_custom and self.slg_layers == BASELINE_ENGINE_DEFAULTS["slg_layers"]
         ):
             self.slg_layers = list(active["slg_layers"])
+
         if self.slg_scale is None or (
             use_custom and self.slg_scale == BASELINE_ENGINE_DEFAULTS["slg_scale"]
         ):
             self.slg_scale = float(active["slg_scale"])
+
         if self.slg_start is None or (
             use_custom and self.slg_start == BASELINE_ENGINE_DEFAULTS["slg_start"]
         ):
             self.slg_start = float(active["slg_start"])
+
         if self.slg_stop is None or (
             use_custom and self.slg_stop == BASELINE_ENGINE_DEFAULTS["slg_stop"]
         ):
             self.slg_stop = float(active["slg_stop"])
+
         if self.eta is None or (
             use_custom and self.eta == BASELINE_ENGINE_DEFAULTS["eta"]
         ):
             self.eta = float(active["eta"])
+
         if self.s_noise is None or (
             use_custom and self.s_noise == BASELINE_ENGINE_DEFAULTS["s_noise"]
         ):
             self.s_noise = float(active["s_noise"])
+
         if self.max_sequence_length is None or (
             use_custom
             and self.max_sequence_length
             == BASELINE_ENGINE_DEFAULTS["max_sequence_length"]
         ):
             self.max_sequence_length = int(active["max_sequence_length"])
+
         if self.enable_thinking is None or (
             use_custom
             and self.enable_thinking == BASELINE_ENGINE_DEFAULTS["enable_thinking"]
@@ -1161,19 +1259,23 @@ class GenerationRequest(BaseModel):
             and self.framing_mode == BASELINE_ENGINE_DEFAULTS["framing_mode"]
         ):
             self.framing_mode = str(active["framing_mode"])
+
         if self.input_role is None or (
             use_custom and self.input_role == BASELINE_ENGINE_DEFAULTS["input_role"]
         ):
             self.input_role = str(active["input_role"])
+
         if self.edit_format is None or (
             use_custom and self.edit_format == BASELINE_ENGINE_DEFAULTS["edit_format"]
         ):
             self.edit_format = str(active["edit_format"])
+
         if self.mask_blend_mode is None or (
             use_custom
             and self.mask_blend_mode == BASELINE_ENGINE_DEFAULTS["mask_blend_mode"]
         ):
             self.mask_blend_mode = str(active.get("mask_blend_mode", "auto"))
+
         if self.invert_inpaint_mask is None or (
             use_custom
             and self.invert_inpaint_mask
@@ -1182,47 +1284,56 @@ class GenerationRequest(BaseModel):
             self.invert_inpaint_mask = bool(
                 active.get("invert_inpaint_mask", False)
             )
+
         if self.max_vit_patches is None or (
             use_custom
             and self.max_vit_patches == BASELINE_ENGINE_DEFAULTS["max_vit_patches"]
         ):
             self.max_vit_patches = int(active["max_vit_patches"])
+
         if self.deband_8bit is None or (
             use_custom and self.deband_8bit == BASELINE_ENGINE_DEFAULTS["deband_8bit"]
         ):
             self.deband_8bit = bool(active["deband_8bit"])
+
         if self.prefer_vulkan is None or (
             use_custom
             and self.prefer_vulkan == BASELINE_ENGINE_DEFAULTS["prefer_vulkan"]
         ):
             self.prefer_vulkan = bool(active["prefer_vulkan"])
+
         if self.mtf_boost is None or (
             use_custom and self.mtf_boost == BASELINE_ENGINE_DEFAULTS["mtf_boost"]
         ):
             self.mtf_boost = float(active["mtf_boost"])
+
         if self.soft_knee_tau is None or (
             use_custom
             and self.soft_knee_tau == BASELINE_ENGINE_DEFAULTS["soft_knee_tau"]
         ):
             self.soft_knee_tau = float(active["soft_knee_tau"])
+
         if self.mask_feather_radius is None or (
             use_custom
             and self.mask_feather_radius
             == BASELINE_ENGINE_DEFAULTS["mask_feather_radius"]
         ):
             self.mask_feather_radius = float(active["mask_feather_radius"])
+
         if self.latent_clamp_sigma is None or (
             use_custom
             and self.latent_clamp_sigma
             == BASELINE_ENGINE_DEFAULTS["latent_clamp_sigma"]
         ):
             self.latent_clamp_sigma = float(active["latent_clamp_sigma"])
+
         if self.apply_bayer_dither is None or (
             use_custom
             and self.apply_bayer_dither
             == BASELINE_ENGINE_DEFAULTS["apply_bayer_dither"]
         ):
             self.apply_bayer_dither = bool(active["apply_bayer_dither"])
+
         if self.use_reference_cache is None or (
             use_custom
             and self.use_reference_cache
@@ -1238,12 +1349,14 @@ class GenerationRequest(BaseModel):
             self.preserve_canvas_outside_boxes = bool(
                 active.get("preserve_canvas_outside_boxes", False)
             )
+
         if self.box_attn_isolation is None or (
             use_custom
             and self.box_attn_isolation
             == BASELINE_ENGINE_DEFAULTS["box_attn_isolation"]
         ):
             self.box_attn_isolation = float(active.get("box_attn_isolation", 0.0))
+
         if self.composite_box_images_to_init is None or (
             use_custom
             and self.composite_box_images_to_init
@@ -1252,6 +1365,7 @@ class GenerationRequest(BaseModel):
             self.composite_box_images_to_init = bool(
                 active.get("composite_box_images_to_init", False)
             )
+
         if (
             self.uncond_uses_references is None
             and active.get("uncond_uses_references") is not None
@@ -1262,11 +1376,13 @@ class GenerationRequest(BaseModel):
             use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]
         ):
             self.cpu_offload = bool(active["cpu_offload"])
+
         if self.prepass_warmup is None or (
             use_custom
             and self.prepass_warmup == BASELINE_ENGINE_DEFAULTS["prepass_warmup"]
         ):
             self.prepass_warmup = bool(active["prepass_warmup"])
+
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1326,6 +1442,7 @@ class GenerationRequest(BaseModel):
                         "pixel_bbox": None,
                         "framing_mode": global_framing,
                         "input_role": global_role,
+                        "box_label": "object",
                         "box_index": None,
                         "picture_index": pic_idx,
                         "dit_ref_index": dit_idx,
@@ -1345,6 +1462,7 @@ class GenerationRequest(BaseModel):
             width=self.width,
             coords_are_pixels=self.layout_coords_are_pixels,
         )
+
         for idx in canonical_indices:
             item = self.layout_items[idx]
             img_p = (
@@ -1355,6 +1473,7 @@ class GenerationRequest(BaseModel):
             if not isinstance(img_p, str) or not img_p.strip():
                 continue
             clean_p = img_p.strip()
+            label_val, _, _ = extract_box_text_and_caption(item)
             bbox = item.get("bbox")
             norm_box: Optional[Tuple[float, float, float, float]] = None
             px_box: Optional[Tuple[int, int, int, int]] = None
@@ -1396,6 +1515,7 @@ class GenerationRequest(BaseModel):
             if emits_dit:
                 dit_ref_counter += 1
                 dit_idx = dit_ref_counter
+
             pic_idx = None
             if emits_vit:
                 vit_pic_counter += 1
@@ -1436,7 +1556,7 @@ class GenerationRequest(BaseModel):
 
             raw_dn = item.get("denoise_strength")
             box_dn = (
-                max(0.01, min(1.0, float(raw_dn)))
+                max(0.0, min(1.0, float(raw_dn)))
                 if (raw_dn is not None and str(raw_dn).strip() != "")
                 else None
             )
@@ -1450,6 +1570,7 @@ class GenerationRequest(BaseModel):
                     "pixel_bbox": px_box,
                     "framing_mode": fm,
                     "input_role": role,
+                    "box_label": label_val,
                     "box_index": idx,
                     "picture_index": pic_idx,
                     "dit_ref_index": dit_idx,

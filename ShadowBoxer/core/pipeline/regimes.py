@@ -1,4 +1,3 @@
-# ShadowBoxer/core/pipeline/regimes.py
 from __future__ import annotations
 
 import math
@@ -9,6 +8,8 @@ import torch
 from models.modeling_moss import validate_skip_layers
 from schema import (
     DEFAULT_BOX_REF_ISOLATION,
+    DEFAULT_CHARACTER_CARVE_ISOLATION,
+    DEFAULT_TEXT_CARVE_ISOLATION,
     bbox_to_normalized,
     extract_box_text_and_caption,
 )
@@ -52,17 +53,27 @@ def compute_differential_inpaint_gate(
     m = inpaint_mask.to(dtype=torch.float32).clamp(0.0, 1.0)
     s0 = max(1e-4, float(sigma_0))
     s_next = max(0.0, float(next_sigma))
-
     if box_horizon_map is not None:
+        raw_h = box_horizon_map.to(dtype=torch.float32).clamp(0.0, 1.0)
+        lo_snap = 0.955 * s0
+        hi_snap = 0.980 * s0
+        snap_span = max(1e-4, hi_snap - lo_snap)
+        snap_t = ((raw_h - lo_snap) / snap_span).clamp(0.0, 1.0)
+        snap_w = snap_t * snap_t * (3.0 - 2.0 * snap_t)
+        snapped_h = raw_h + snap_w * (s0 - raw_h)
         eff_sigma_0 = torch.minimum(
-            box_horizon_map.to(dtype=torch.float32),
+            snapped_h,
             torch.full_like(m, s0),
         ).clamp(0.0, 1.0)
     else:
         eff_sigma_0 = torch.full_like(m, s0)
 
     sigma_release = (m * eff_sigma_0).clamp(0.0, 1.0)
-    band = (0.15 * sigma_release).clamp(min=1e-4, max=0.12)
+    headroom = (s0 - sigma_release).clamp(min=1e-4)
+    band = torch.minimum(
+        (0.15 * sigma_release).clamp(min=1e-4, max=0.12),
+        headroom,
+    )
     tau = ((sigma_release - s_next) / band).clamp(0.0, 1.0)
     temporal_ramp = 0.5 * (1.0 - torch.cos(math.pi * tau))
 
@@ -86,16 +97,13 @@ def resolve_foreground_aperture_carveouts(
     ref_bboxes: Sequence[Optional[Tuple[float, float, float, float]]],
     ref_z_orders: Sequence[float],
     default_isolation: float = DEFAULT_BOX_REF_ISOLATION,
+    splat_z_orders: Optional[Sequence[float]] = None,
 ) -> Tuple[
-    List[Tuple[Tuple[float, float, float, float], float, float]],
-    List[Tuple[Tuple[float, float, float, float], float, Optional[float]]],
+    List[Tuple[Any, ...]],
+    List[Tuple[Any, ...]],
 ]:
-    aperture_overrides: List[
-        Tuple[Tuple[float, float, float, float], float, float]
-    ] = []
-    attn_carveouts: List[
-        Tuple[Tuple[float, float, float, float], float, Optional[float]]
-    ] = []
+    aperture_overrides: List[Tuple[Any, ...]] = []
+    attn_carveouts: List[Tuple[Any, ...]] = []
     if not layout_items:
         return aperture_overrides, attn_carveouts
 
@@ -137,9 +145,11 @@ def resolve_foreground_aperture_carveouts(
             or item.get("vizj_path")
         )
         has_ref = isinstance(img_p, str) and bool(img_p.strip())
+        raw_z = item.get("z_order")
+        child_z: Optional[float] = float(raw_z) if raw_z is not None else None
 
         is_canvas_aperture = (
-            (not has_ref and (lbl == "text" or is_inp or has_exp_dn))
+            (not has_ref and (lbl in ("text", "character") or is_inp or has_exp_dn))
             or is_inp
             or (has_exp_dn and not is_control_role)
         )
@@ -147,7 +157,7 @@ def resolve_foreground_aperture_carveouts(
             continue
 
         if has_exp_dn:
-            child_dn = max(0.01, min(1.0, float(raw_dn)))
+            child_dn = max(0.0, min(1.0, float(raw_dn)))
         elif is_inp:
             child_dn = 1.0
         elif lbl == "text":
@@ -155,37 +165,60 @@ def resolve_foreground_aperture_carveouts(
         else:
             child_dn = 0.75
 
-        splat_carve = (
-            1.0
-            if (not has_ref and (lbl == "text" or is_inp or child_dn >= 0.55))
-            else 0.0
-        )
+        if has_ref and not is_inp:
+            splat_carve = 0.0
+        elif lbl == "text" or is_inp:
+            splat_carve = 1.0
+        elif lbl == "character":
+            if has_exp_dn and child_dn >= 0.85:
+                splat_carve = 1.0
+            elif not has_exp_dn or child_dn >= 0.35:
+                splat_carve = 0.65
+            else:
+                splat_carve = 0.0
+        else:
+            splat_carve = 1.0 if child_dn >= 0.55 else 0.0
 
         if splat_boxes:
-            overlaps_splat = any(
-                _boxes_overlap_2d(ovr_box, sb)
-                and (
+            overlaps_splat = False
+            max_overlapping_splat_z = 0.0
+            for s_idx, sb in enumerate(splat_boxes):
+                if not _boxes_overlap_2d(ovr_box, sb):
+                    continue
+                sb_area = (sb[2] - sb[0]) * (sb[3] - sb[1])
+                sb_z = (
+                    float(splat_z_orders[s_idx])
+                    if (splat_z_orders is not None and s_idx < len(splat_z_orders))
+                    else 0.0
+                )
+                if (
                     lbl == "text"
                     or is_inp
                     or has_exp_dn
-                    or ((sb[2] - sb[0]) * (sb[3] - sb[1]) > ovr_area + 1e-5)
-                )
-                for sb in splat_boxes
-            )
+                    or (child_z is not None and child_z > sb_z + 1e-4)
+                    or (sb_area > ovr_area + 1e-5)
+                ):
+                    overlaps_splat = True
+                    if sb_z > max_overlapping_splat_z:
+                        max_overlapping_splat_z = sb_z
             if overlaps_splat:
-                aperture_overrides.append((ovr_box, child_dn, splat_carve))
+                eff_ovr_z = (
+                    child_z
+                    if child_z is not None
+                    else (max_overlapping_splat_z + 1.0)
+                )
+                aperture_overrides.append(
+                    (ovr_box, child_dn, splat_carve, lbl, has_exp_dn, eff_ovr_z)
+                )
 
-        if not has_ref and (lbl == "text" or is_inp) and ref_bboxes:
-            raw_z = item.get("z_order")
-            child_z: Optional[float] = (
-                float(raw_z) if raw_z is not None else None
-            )
+        if not has_ref and (lbl in ("text", "character") or is_inp) and ref_bboxes:
             raw_iso = item.get("isolate_box_attn")
             if raw_iso is not None and str(raw_iso).strip() != "":
                 carve_iso = max(0.0, min(1.0, float(raw_iso)))
+            elif lbl == "character" and not is_inp:
+                carve_iso = DEFAULT_CHARACTER_CARVE_ISOLATION
             else:
-                carve_iso = max(0.85, eff_default_iso)
-
+                carve_iso = max(DEFAULT_TEXT_CARVE_ISOLATION, eff_default_iso)
             if carve_iso > 1e-6:
                 overlaps_ref = False
                 max_overlapping_ref_z = 0.0
@@ -215,7 +248,7 @@ def resolve_foreground_aperture_carveouts(
                             if r_z > max_overlapping_ref_z:
                                 max_overlapping_ref_z = r_z
                 if overlaps_ref:
-                    if lbl == "text":
+                    if lbl in ("text", "character"):
                         eff_child_z: Optional[float] = (
                             child_z
                             if (
@@ -226,7 +259,9 @@ def resolve_foreground_aperture_carveouts(
                         )
                     else:
                         eff_child_z = child_z
-                    attn_carveouts.append((ovr_box, carve_iso, eff_child_z))
+                    attn_carveouts.append(
+                        (ovr_box, carve_iso, eff_child_z, lbl)
+                    )
 
     return aperture_overrides, attn_carveouts
 

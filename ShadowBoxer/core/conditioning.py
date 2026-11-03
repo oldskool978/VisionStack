@@ -15,7 +15,9 @@ from schema import (
     SUPPORTED_MASK_BLEND_MODES,
     bbox_to_normalized,
     extract_box_text_and_caption,
+    normalize_box_label,
 )
+
 from .env import (
     HAS_VIZINJECTOR,
     ROOT_DIR,
@@ -28,10 +30,51 @@ from .env import (
 _AI_TOOLKIT_MAX_REF_DIM = 768
 _HIERARCHICAL_SPLAT_GAMMA = 4.0
 _HIERARCHICAL_SPLAT_Z_GAMMA = 2.5
+_HIERARCHICAL_SPLAT_SEMANTIC_GAMMA = 0.35
+_CHAR_DOME_R0 = 0.45
+_CHAR_DOME_R1 = 1.05
+_CHAR_DOME_EDGE_FLOOR = 0.15
+_CHAR_WIDE_DOME_R0 = 0.88
+_CHAR_WIDE_DOME_R1 = 1.18
+_CHAR_WIDE_DOME_EDGE_FLOOR = 0.82
 _CFL_SIGMA_FLOOR = 0.12
 _CFL_STEP_MULTIPLIER = 1.85
 
 _FALLBACK_VIZ_CLIENT: Optional[Any] = None
+
+
+def _semantic_splat_rank(label: Optional[str]) -> float:
+    norm = normalize_box_label(label, has_text=False)
+    if norm == "text":
+        return 2.0
+    if norm == "character":
+        return 1.0
+    return 0.0
+
+
+def _evaluate_character_tukey_dome_2d(
+    yy_lat: torch.Tensor,
+    xx_lat: torch.Tensor,
+    oy0: int,
+    ox0: int,
+    oy1: int,
+    ox1: int,
+    wide_aperture: bool = False,
+) -> torch.Tensor:
+    r0 = _CHAR_WIDE_DOME_R0 if wide_aperture else _CHAR_DOME_R0
+    r1 = _CHAR_WIDE_DOME_R1 if wide_aperture else _CHAR_DOME_R1
+    edge_floor = (
+        _CHAR_WIDE_DOME_EDGE_FLOOR if wide_aperture else _CHAR_DOME_EDGE_FLOOR
+    )
+    cy_mid = 0.5 * float(oy0 + oy1)
+    cx_mid = 0.5 * float(ox0 + ox1)
+    ry = max(0.5, 0.5 * float(oy1 - oy0))
+    rx = max(0.5, 0.5 * float(ox1 - ox0))
+    rho = torch.hypot((yy_lat - cy_mid) / ry, (xx_lat - cx_mid) / rx)
+    tau = ((rho - r0) / (r1 - r0)).clamp(0.0, 1.0)
+    return edge_floor + (1.0 - edge_floor) * 0.5 * (
+        1.0 + torch.cos(math.pi * tau)
+    )
 
 
 def _get_shared_viz_client() -> Optional[Any]:
@@ -93,8 +136,8 @@ def _resolve_unboxed_reference_dims(
 ) -> Tuple[int, int]:
     fmt = str(edit_format or "standard").strip().lower()
     is_ait = fmt in ("ai_toolkit_isolated", "ai_toolkit_full")
+    eff_patches = max(64, int(max_vit_patches or 2304))
     if is_ait:
-        eff_patches = max(64, int(max_vit_patches or 2304))
         vit_side = max(512, int(math.isqrt(eff_patches)) * 16)
         ref_cap = (
             min(_AI_TOOLKIT_MAX_REF_DIM, vit_side)
@@ -113,9 +156,9 @@ def _resolve_unboxed_reference_dims(
         src_area = float(src_w * src_h)
         raw_scale = math.sqrt(max_area / src_area)
         scale = (
-            raw_scale
-            if (is_ait and int(max_vit_patches or 2304) >= 2304)
-            else min(1.0, raw_scale)
+            min(1.0, raw_scale)
+            if (is_ait and eff_patches < 2304)
+            else raw_scale
         )
         out_w = max(64, int(round((src_w * scale) / 16.0)) * 16)
         out_h = max(64, int(round((src_h * scale) / 16.0)) * 16)
@@ -311,6 +354,7 @@ def splat_box_masks_to_canvas(
     target_dev = _canonicalize_device(device)
     eff_h = max(1, int(h_lat))
     eff_w = max(1, int(w_lat))
+
     if base_mask is not None:
         canvas_mask = base_mask.to(device=target_dev, dtype=torch.float32).clone()
         if canvas_mask.ndim == 2:
@@ -363,6 +407,7 @@ def splat_box_masks_to_canvas(
             m_dev = F.interpolate(
                 m_dev, size=(bh, bw), mode="bilinear", align_corners=False
             )
+
         if feather_box_edges and feather > 1e-4:
             yy = (
                 torch.arange(bh, device=target_dev, dtype=torch.float32).unsqueeze(1)
@@ -403,10 +448,10 @@ def build_box_denoise_horizon_map(
     target_dev = _canonicalize_device(device)
     h_lat = max(1, int(height) // 16)
     w_lat = max(1, int(width) // 16)
-    fallback_dn = max(0.01, min(1.0, float(default_denoise_strength)))
+    fallback_dn = max(0.0, min(1.0, float(default_denoise_strength)))
     total_cells = float(max(1, h_lat * w_lat))
 
-    parsed_boxes: List[Tuple[int, int, int, int, float, float, bool]] = []
+    parsed_boxes: List[Tuple[int, int, int, int, float, float, bool, str]] = []
     deferred_text_boxes: List[Tuple[int, int, int, int, float, bool]] = []
     for item in layout_items:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
@@ -448,7 +493,7 @@ def build_box_denoise_horizon_map(
         x1 = max(x0 + 1, min(w_lat, int(round(ux1 * w_lat))))
         if is_unreferenced_text:
             text_dn = (
-                max(0.01, min(1.0, float(raw_dn)))
+                max(0.0, min(1.0, float(raw_dn)))
                 if has_explicit_dn
                 else max(fallback_dn, 0.65)
             )
@@ -457,21 +502,25 @@ def build_box_denoise_horizon_map(
             )
             continue
         box_dn = (
-            max(0.01, min(1.0, float(raw_dn))) if has_explicit_dn else fallback_dn
+            max(0.0, min(1.0, float(raw_dn))) if has_explicit_dn else fallback_dn
         )
         raw_z = item.get("z_order")
         z_val = float(raw_z) if raw_z is not None else 0.0
-        parsed_boxes.append((y0, x0, y1, x1, box_dn, z_val, has_explicit_dn))
+        parsed_boxes.append(
+            (y0, x0, y1, x1, box_dn, z_val, has_explicit_dn, lbl)
+        )
 
     if not parsed_boxes and not deferred_text_boxes:
         return None
 
     has_non_uniform_base = any(
         has_exp and abs(dn - fallback_dn) > 1e-5
-        for _, _, _, _, dn, _, has_exp in parsed_boxes
+        for _, _, _, _, dn, _, has_exp, _ in parsed_boxes
     )
     has_non_uniform_text = any(
-        (has_exp and abs(dn - fallback_dn) > 1e-5) or has_non_uniform_base
+        (has_exp and abs(dn - fallback_dn) > 1e-5)
+        or (not has_exp and abs(dn - fallback_dn) > 1e-5)
+        or has_non_uniform_base
         for _, _, _, _, dn, has_exp in deferred_text_boxes
     )
     if return_none_if_uniform and not (has_non_uniform_base or has_non_uniform_text):
@@ -490,16 +539,18 @@ def build_box_denoise_horizon_map(
         )
 
         box_records: List[Tuple[float, float, float, float, torch.Tensor]] = []
-        for y0, x0, y1, x1, box_dn, z_val, _ in parsed_boxes:
+        for y0, x0, y1, x1, box_dn, z_val, _, lbl in parsed_boxes:
             area_frac = max(
                 1e-4, min(1.0, float((y1 - y0) * (x1 - x0)) / total_cells)
             )
+            sem_rank = _semantic_splat_rank(lbl)
             priority = (
                 1.0
                 if len(parsed_boxes) == 1
                 else math.exp(
                     _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
                     + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((z_val - z_mean) / 4.0)
+                    + _HIERARCHICAL_SPLAT_SEMANTIC_GAMMA * sem_rank
                 )
             )
             dy = torch.maximum(
@@ -532,7 +583,7 @@ def build_box_denoise_horizon_map(
         safe_w = accum_w.clamp(min=1e-12)
         fg_dn = torch.where(
             accum_w > 1e-6,
-            (accum_dn / safe_w).clamp(0.01, 1.0),
+            (accum_dn / safe_w).clamp(0.0, 1.0),
             torch.full_like(accum_w, fallback_dn),
         )
         horizon_map_2d = union_alpha * fg_dn + (1.0 - union_alpha) * fallback_dn
@@ -567,7 +618,7 @@ def build_box_denoise_horizon_map(
                 text_peak = torch.maximum(text_peak, cand_dn)
         horizon_map_2d = text_peak
 
-    return horizon_map_2d.unsqueeze(0).unsqueeze(0).clamp(0.01, 1.0)
+    return horizon_map_2d.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)
 
 
 def compose_latent_inpaint_mask(
@@ -657,14 +708,7 @@ def splat_box_latents_to_canvas(
     device: torch.device,
     default_denoise_strength: float = 0.75,
     return_denoise_map: bool = False,
-    aperture_overrides: Optional[
-        Sequence[
-            Union[
-                Tuple[Tuple[float, float, float, float], float],
-                Tuple[Tuple[float, float, float, float], float, float],
-            ]
-        ]
-    ] = None,
+    aperture_overrides: Optional[Sequence[Tuple[Any, ...]]] = None,
     bn_mean: Optional[torch.Tensor] = None,
     bn_std: Optional[torch.Tensor] = None,
 ) -> Union[
@@ -702,7 +746,6 @@ def splat_box_latents_to_canvas(
     w_work = w_lat * sub_scale
 
     canvas_work = _unpack_latents_2x2(canvas) if use_subphase else canvas
-
     accum_lat = torch.zeros(
         (1, c_work, h_work, w_work), device=device, dtype=torch.float32
     )
@@ -721,6 +764,7 @@ def splat_box_latents_to_canvas(
     union_alpha_work = torch.zeros(
         (1, 1, h_work, w_work), device=device, dtype=torch.float32
     )
+
     raw_feather = max(0.0, float(feather_radius_lat))
     total_cells = float(max(1, h_lat * w_lat))
     num_entries = len(splat_entries)
@@ -752,6 +796,11 @@ def splat_box_latents_to_canvas(
         box_dn = entry[3] if len(entry) > 3 else None
         box_sharpness = entry[4] if len(entry) > 4 else None
         box_z = float(entry[5]) if (len(entry) > 5 and entry[5] is not None) else 0.0
+        box_label = (
+            str(entry[6] or "object")
+            if (len(entry) > 6 and entry[6] is not None)
+            else "object"
+        )
 
         uy0, ux0, uy1, ux1 = norm_bbox
         y0 = max(0, min(h_lat - 1, int(round(uy0 * h_lat))))
@@ -762,16 +811,18 @@ def splat_box_latents_to_canvas(
         bw = x1 - x0
 
         area_frac = max(1e-4, min(1.0, float(bh * bw) / total_cells))
+        sem_rank = _semantic_splat_rank(box_label)
         priority = (
             1.0
             if num_entries == 1
             else math.exp(
                 _HIERARCHICAL_SPLAT_GAMMA * (1.0 - area_frac)
                 + _HIERARCHICAL_SPLAT_Z_GAMMA * math.tanh((box_z - z_mean) / 4.0)
+                + _HIERARCHICAL_SPLAT_SEMANTIC_GAMMA * sem_rank
             )
         )
         eff_dn = (
-            max(0.01, min(1.0, float(box_dn)))
+            max(0.0, min(1.0, float(box_dn)))
             if box_dn is not None
             else fallback_dn
         )
@@ -906,7 +957,6 @@ def splat_box_latents_to_canvas(
             torch.mean(b_work_i * b_work_i, dim=1, keepdim=True) + 1e-12
         )
         w_rms = w_hier * b_rms
-
         accum_lat[:, :, sy0_i:sy1_i, sx0_i:sx1_i] = (
             accum_lat[:, :, sy0_i:sy1_i, sx0_i:sx1_i] + w_hier * b_work_i
         )
@@ -1005,13 +1055,11 @@ def splat_box_latents_to_canvas(
     dn_map: Optional[torch.Tensor] = None
     if return_denoise_map:
         ext_dn_target = fallback_dn if has_base_canvas else 1.0
+        ext_dn_tensor = torch.full_like(accum_weight, ext_dn_target)
         dn_work = torch.where(
             accum_weight > 1e-6,
-            (accum_dn / safe_weight).clamp(0.01, 1.0),
-            torch.full_like(accum_weight, ext_dn_target),
-        )
-        ambient_dn = torch.maximum(
-            dn_work, torch.full_like(dn_work, ext_dn_target)
+            (accum_dn / safe_weight).clamp(0.0, 1.0),
+            ext_dn_tensor,
         )
         t_rim = (union_alpha_work / 0.20).clamp(0.0, 1.0)
         rim_keep = torch.where(
@@ -1019,15 +1067,15 @@ def splat_box_latents_to_canvas(
             torch.pow(t_rim.clamp(min=1e-8), 0.20),
             torch.zeros_like(t_rim),
         )
-        dn_work = rim_keep * dn_work + (1.0 - rim_keep) * ambient_dn
+        dn_work = rim_keep * dn_work + (1.0 - rim_keep) * ext_dn_tensor
         if use_subphase:
             dn_map = (
                 dn_work.reshape(1, 1, h_lat, 2, w_lat, 2)
                 .mean(dim=(3, 5))
-                .clamp(0.01, 1.0)
+                .clamp(0.0, 1.0)
             )
         else:
-            dn_map = dn_work.clamp(0.01, 1.0)
+            dn_map = dn_work.clamp(0.0, 1.0)
 
     if aperture_overrides:
         yy_lat = (
@@ -1039,7 +1087,34 @@ def splat_box_latents_to_canvas(
             + 0.5
         )
         ovr_peak = dn_map.clone() if dn_map is not None else None
-        for ovr_entry in aperture_overrides:
+
+        def _ovr_sort_key(
+            idx_and_entry: Tuple[int, Tuple[Any, ...]]
+        ) -> Tuple[float, float, float, int]:
+            e_idx, ovr_e = idx_and_entry
+            ob = ovr_e[0] if len(ovr_e) > 0 else (0.0, 0.0, 1.0, 1.0)
+            o_area = (
+                (float(ob[2]) - float(ob[0])) * (float(ob[3]) - float(ob[1]))
+                if isinstance(ob, (list, tuple)) and len(ob) == 4
+                else 1.0
+            )
+            o_lbl = (
+                normalize_box_label(ovr_e[3], has_text=False)
+                if (len(ovr_e) > 3 and ovr_e[3] is not None)
+                else "text"
+            )
+            o_z = (
+                float(ovr_e[5])
+                if (len(ovr_e) > 5 and ovr_e[5] is not None)
+                else 0.0
+            )
+            return (o_z, _semantic_splat_rank(o_lbl), -o_area, e_idx)
+
+        sorted_overrides = [
+            pair[1] for pair in sorted(enumerate(aperture_overrides), key=_ovr_sort_key)
+        ]
+
+        for ovr_entry in sorted_overrides:
             if len(ovr_entry) < 2:
                 continue
             ovr_bbox = ovr_entry[0]
@@ -1048,6 +1123,16 @@ def splat_box_latents_to_canvas(
                 max(0.0, min(1.0, float(ovr_entry[2])))
                 if (len(ovr_entry) > 2 and ovr_entry[2] is not None)
                 else 1.0
+            )
+            ovr_label = (
+                normalize_box_label(ovr_entry[3], has_text=False)
+                if (len(ovr_entry) > 3 and ovr_entry[3] is not None)
+                else "text"
+            )
+            has_exp_ovr_dn = (
+                bool(ovr_entry[4])
+                if (len(ovr_entry) > 4 and ovr_entry[4] is not None)
+                else False
             )
             if len(ovr_bbox) != 4:
                 continue
@@ -1065,33 +1150,62 @@ def splat_box_latents_to_canvas(
             )
             dist = torch.sqrt(dy * dy + dx * dx)
             if raw_feather <= 1e-4:
-                ovr_alpha = (
-                    (dist <= 1e-5)
-                    .to(dtype=torch.float32)
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                )
+                ovr_alpha_2d = (dist <= 1e-5).to(dtype=torch.float32)
             else:
-                ovr_alpha = (
-                    0.5
-                    * (
-                        1.0
-                        + torch.cos(
-                            math.pi * (dist / raw_feather).clamp(0.0, 1.0)
-                        )
+                ovr_alpha_2d = 0.5 * (
+                    1.0
+                    + torch.cos(
+                        math.pi * (dist / raw_feather).clamp(0.0, 1.0)
                     )
-                ).unsqueeze(0).unsqueeze(0)
+                )
+
+            eff_ovr_dn_val = (
+                max(0.0, min(1.0, float(ovr_dn))) if ovr_dn is not None else 0.75
+            )
+            wide_char_carve = (
+                ovr_label == "character"
+                and has_exp_ovr_dn
+                and eff_ovr_dn_val >= 0.85
+                and carve_strength >= 0.95
+            )
+            if ovr_label == "character":
+                core_env = _evaluate_character_tukey_dome_2d(
+                    yy_lat,
+                    xx_lat,
+                    oy0,
+                    ox0,
+                    oy1,
+                    ox1,
+                    wide_aperture=wide_char_carve,
+                )
+                carve_alpha_2d = ovr_alpha_2d * core_env
+            else:
+                carve_alpha_2d = ovr_alpha_2d
+
+            ovr_alpha = ovr_alpha_2d.unsqueeze(0).unsqueeze(0)
+            carve_alpha = carve_alpha_2d.unsqueeze(0).unsqueeze(0)
             if carve_strength > 1e-6:
                 union_alpha = torch.minimum(
                     union_alpha,
-                    (1.0 - ovr_alpha * carve_strength).clamp(0.0, 1.0),
+                    (1.0 - carve_alpha * carve_strength).clamp(0.0, 1.0),
                 )
             if ovr_peak is not None and dn_map is not None and ovr_dn is not None:
-                eff_ovr_dn = max(0.01, min(1.0, float(ovr_dn)))
-                cand_dn = ovr_alpha * eff_ovr_dn + (1.0 - ovr_alpha) * dn_map
-                ovr_peak = torch.maximum(ovr_peak, cand_dn)
+                if has_exp_ovr_dn:
+                    dn_blend_alpha = (
+                        carve_alpha if wide_char_carve else ovr_alpha
+                    )
+                    ovr_peak = (
+                        dn_blend_alpha * eff_ovr_dn_val
+                        + (1.0 - dn_blend_alpha) * ovr_peak
+                    )
+                else:
+                    cand_dn = (
+                        carve_alpha * eff_ovr_dn_val
+                        + (1.0 - carve_alpha) * dn_map
+                    )
+                    ovr_peak = torch.maximum(ovr_peak, cand_dn)
         if ovr_peak is not None:
-            dn_map = ovr_peak.clamp(0.01, 1.0)
+            dn_map = ovr_peak.clamp(0.0, 1.0)
 
     if return_denoise_map:
         assert dn_map is not None
@@ -1132,19 +1246,19 @@ def couple_splat_velocity_prior(
         torch.zeros_like(alpha_f32),
     )
     kappa = (alpha_eff * g_max * psi).clamp(0.0, 1.0)
-
     dt_abs = abs(float(step_dt))
     sigma_eff = max(s_val, _CFL_SIGMA_FLOOR, _CFL_STEP_MULTIPLIER * dt_abs)
     lat_f32 = latents.float()
     splat_f32 = splat_canvas.float()
-
     if noise is not None and noise.shape == lat_f32.shape:
         noise_f32 = noise.float()
         z_bridge = (1.0 - s_val) * splat_f32 + s_val * noise_f32
-        v_splat = (noise_f32 - splat_f32) + (lat_f32 - z_bridge) / sigma_eff
+        g_restore = ((1.0 - d_clamped) / 0.65).clamp(0.0, 1.0) * alpha_f32
+        v_splat = (noise_f32 - splat_f32) + g_restore * (
+            (lat_f32 - z_bridge) / sigma_eff
+        )
     else:
         v_splat = (lat_f32 - splat_f32) / max(s_val, 0.05)
-
     coupled = ((1.0 - kappa) * v_dit.float() + kappa * v_splat).to(dtype=v_dit.dtype)
     return torch.where(kappa > 1e-6, coupled, v_dit)
 
@@ -1193,7 +1307,6 @@ def _source_to_srgb_01_chw(
         if v_mode in ("0_to_1", "unit", "[0,1]") and float(t.min().item()) >= -1e-3:
             return t.clamp(0.0, 1.0).contiguous()
         return (t * 0.5 + 0.5).clamp(0.0, 1.0).contiguous()
-
     if isinstance(source, np.ndarray):
         arr = source
         if arr.ndim == 2:
@@ -1214,7 +1327,6 @@ def _source_to_srgb_01_chw(
             .clamp(0.0, 1.0)
             .contiguous()
         )
-
     if isinstance(source, Image.Image):
         img = source.convert("RGB")
     else:
@@ -1332,6 +1444,7 @@ def pack_vision_patches_32px(
             w_vis -= 32
         else:
             h_vis -= 32
+
     chw = _linear_resample_srgb_chw(srgb_chw, h_vis, w_vis)[0]
     grid_h = h_vis // 16
     grid_w = w_vis // 16
@@ -1357,6 +1470,7 @@ def pack_vision_patches_32px(
 
 __all__ = [
     "_AI_TOOLKIT_MAX_REF_DIM",
+    "_evaluate_character_tukey_dome_2d",
     "_probe_image_dimensions",
     "_resolve_unboxed_reference_dims",
     "_resolve_boxed_reference_dims",
